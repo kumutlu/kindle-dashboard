@@ -2,6 +2,9 @@
 
 Transform an old Kindle Paperwhite into a remotely managed e-ink smart display.
 
+<img width="705" height="858" alt="image" src="https://github.com/user-attachments/assets/9b4ffe17-b565-44b9-b9a4-215d12921c65" />
+
+
 ## Overview
 
 Kindle Dashboard is a self-hosted dashboard platform designed for jailbroken Kindle Paperwhite devices.

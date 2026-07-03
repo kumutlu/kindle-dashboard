@@ -713,6 +713,54 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("Current saved default: <strong>8</strong>", body.decode("utf-8"))
 
+    def test_refresh_interval_minutes_saving_and_ui(self):
+        # 1. Default refresh interval is 10
+        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config.get("refresh_interval_minutes"), 10)
+
+        # 2. UI select presence
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertIn('name="refresh_interval_minutes"', text)
+        self.assertIn('Auto refresh interval', text)
+
+        # 3. Save valid value via form submit
+        token = self.csrf_token()
+        payload = {
+            "csrf_token": token,
+            "title": "TEST REFRESH",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "home_dashboard",
+            "location_label": "Nottingham, UK",
+            "refresh_interval_minutes": "60",
+        }
+        status, _, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(payload),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303) # redirect
+        
+        # Verify it was saved to config
+        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config.get("refresh_interval_minutes"), 60)
+
+        # 4. Reject invalid values (returns 400 or falls back to redirect error)
+        # In validate_config we raise ValueError for invalid value
+        # handle_form_post redirects with the error message in the status query param
+        payload["refresh_interval_minutes"] = "25"
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(payload),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        location = headers["Location"]
+        self.assertIn("invalid%20value%20for%20refresh_interval_minutes", location)
+
 
 if __name__ == "__main__":
     unittest.main()

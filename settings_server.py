@@ -123,8 +123,8 @@ def update_config(config_path, candidate, regenerate):
     previous_exists = config_path.exists()
     previous_data = config_path.read_bytes() if previous_exists else None
 
-    # Preserve custom Maarif fields from existing config if not in candidate
-    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment"):
+    # Preserve custom Maarif and Display fields from existing config if not in candidate
+    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes"):
         if previous_exists and field not in candidate:
             try:
                 prev_config = json.loads(previous_data.decode("utf-8"))
@@ -492,6 +492,18 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
     <label class="toggle"><input type="checkbox" name="show_server"{checked('show_server')}> <span>Server status</span></label>
     <label class="toggle"><input type="checkbox" name="show_pihole"{checked('show_pihole')}> <span>Pi-hole</span></label>
     <label class="toggle"><input type="checkbox" name="show_tailscale"{checked('show_tailscale')}> <span>Tailscale</span></label>
+  </div>
+  <div style="margin-top: 24px; border-top: 1px solid var(--line); padding-top: 20px;">
+    <label class="field"><span>Auto refresh interval</span>
+      <select name="refresh_interval_minutes">
+        <option value="5"{selected_opt('refresh_interval_minutes', 5)}>5 minutes</option>
+        <option value="10"{selected_opt('refresh_interval_minutes', 10)}>10 minutes</option>
+        <option value="15"{selected_opt('refresh_interval_minutes', 15)}>15 minutes</option>
+        <option value="30"{selected_opt('refresh_interval_minutes', 30)}>30 minutes</option>
+        <option value="60"{selected_opt('refresh_interval_minutes', 60)}>60 minutes</option>
+      </select>
+    </label>
+    <p class="section-note" style="margin-top: -10px;">How often the Kindle dashboard image should refresh automatically. For Maarif Calendar, 60 minutes is usually enough.</p>
   </div>
 </section>
 
@@ -1086,7 +1098,7 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 for key in ("show_weather", "show_forecast", "show_server",
                             "show_pihole", "show_tailscale"):
                     candidate[key] = key in form
-                for key in ("prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment"):
+                for key in ("prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes"):
                     if key in form:
                         try:
                             candidate[key] = int(form[key][0])

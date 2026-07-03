@@ -87,7 +87,8 @@ log "=== Daemon started (PID=$$) ==="
 sleep 90
 
 # Fetch and apply saved brightness before dashboard display starts
-BRIGHTNESS=$(wget -q -O- "http://${PI_IP}:8767/api/config" | grep -o '"kindle_frontlight":\s*[0-9]*' | grep -o '[0-9]*')
+CONFIG_JSON=$(wget -q -O- "http://${PI_IP}:8767/api/config")
+BRIGHTNESS=$(echo "$CONFIG_JSON" | grep -o '"kindle_frontlight":\s*[0-9]*' | grep -o '[0-9]*')
 if [ -n "$BRIGHTNESS" ]; then
     log "Reapplying persistent front light level: $BRIGHTNESS"
     lipc-set-prop com.lab126.powerd flIntensity "$BRIGHTNESS" 2>/dev/null
@@ -100,6 +101,18 @@ $LIPC com.lab126.powerd preventScreenSaver 1 2>/dev/null
 # To make changes, reboot and grab the short window after boot before the first suspend.
 while true; do
     update_screen
+    
+    # Query configuration for the next sleep interval (fallback to 10 mins if error/missing)
+    CONFIG_JSON=$(wget -q -O- "http://${PI_IP}:8767/api/config")
+    REFRESH_MINS=$(echo "$CONFIG_JSON" | grep -o '"refresh_interval_minutes":\s*[0-9]*' | grep -o '[0-9]*')
+    if [ -n "$REFRESH_MINS" ]; then
+        INTERVAL=$((REFRESH_MINS * 60))
+        log "Configured refresh interval: ${REFRESH_MINS}m (${INTERVAL}s)"
+    else
+        INTERVAL=600
+        log "Using default refresh interval: 10m (600s)"
+    fi
+    
     suspend_for "$INTERVAL"
     # Brief settle time after resume
     sleep 3

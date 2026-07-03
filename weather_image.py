@@ -48,6 +48,7 @@ DEFAULT_CONFIG = {
     "prayer_school": 0,
     "prayer_high_latitude": 3,
     "hijri_adjustment": 0,
+    "refresh_interval_minutes": 10,
 }
 
 STRING_LIMITS = {
@@ -71,6 +72,7 @@ OPTIONAL_LOCATION_FIELDS = {
     "prayer_school",
     "prayer_high_latitude",
     "hijri_adjustment",
+    "refresh_interval_minutes",
 }
 BOOLEAN_FIELDS = {
     "show_weather",
@@ -156,6 +158,7 @@ def validate_config(value):
         ("prayer_school", 0, lambda x: isinstance(x, int) and x in (0, 1)),
         ("prayer_high_latitude", 3, lambda x: isinstance(x, int) and x in (1, 2, 3)),
         ("hijri_adjustment", 0, lambda x: isinstance(x, int) and -2 <= x <= 2),
+        ("refresh_interval_minutes", 10, lambda x: isinstance(x, int) and x in (5, 10, 15, 30, 60)),
     ):
         val = value.get(field)
         if val is not None:

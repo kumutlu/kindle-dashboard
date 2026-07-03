@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     "show_server": True,
     "show_pihole": True,
     "show_tailscale": True,
+    "kindle_frontlight": 8,
 }
 
 STRING_LIMITS = {
@@ -61,6 +62,7 @@ OPTIONAL_LOCATION_FIELDS = {
     "latitude",
     "longitude",
     "location_display",
+    "kindle_frontlight",
 }
 BOOLEAN_FIELDS = {
     "show_weather",
@@ -130,6 +132,16 @@ def validate_config(value):
         if not isinstance(item, bool):
             raise ValueError(f"{key} must be true or false")
         config[key] = item
+
+    kindle_frontlight = value.get("kindle_frontlight")
+    if kindle_frontlight is not None:
+        if isinstance(kindle_frontlight, bool) or not isinstance(kindle_frontlight, int):
+            raise ValueError("kindle_frontlight must be an integer")
+        if kindle_frontlight not in (0, 1, 4, 8, 12, 18):
+            raise ValueError("kindle_frontlight must be one of: 0, 1, 4, 8, 12, 18")
+        config["kindle_frontlight"] = kindle_frontlight
+    else:
+        config["kindle_frontlight"] = 8
 
     return config
 

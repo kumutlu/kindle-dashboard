@@ -61,6 +61,20 @@ STATUS_GET = (
 )
 
 
+def get_saved_brightness():
+    try:
+        import json
+        config_file = Path(__file__).resolve().parent / "dashboard_config.json"
+        if config_file.exists():
+            raw = json.loads(config_file.read_text(encoding="utf-8"))
+            val = raw.get("kindle_frontlight", 8)
+            if val in (0, 1, 4, 8, 12, 18):
+                return val
+    except Exception as e:
+        print(f"Warning: Failed to load kindle_frontlight from config: {e}")
+    return 8
+
+
 class DeviceError(RuntimeError):
     """A safe device-control failure suitable for API responses."""
 
@@ -93,6 +107,11 @@ class KindleDevice:
             raise ValueError("unsupported device action")
         command, message, timeout = definition
         self._run_remote(command, timeout)
+        if action in ("start", "refresh"):
+            try:
+                self.set_light(get_saved_brightness())
+            except Exception as e:
+                print(f"Warning: Failed to reapply brightness on {action}: {e}")
         return message
 
     def push(self):
@@ -105,6 +124,10 @@ class KindleDevice:
             ACTION_COMMANDS["refresh"][0],
             ACTION_COMMANDS["refresh"][2],
         )
+        try:
+            self.set_light(get_saved_brightness())
+        except Exception as e:
+            print(f"Warning: Failed to reapply brightness on push: {e}")
         return "Dashboard generated and pushed"
 
     def set_light(self, level):

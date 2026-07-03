@@ -122,6 +122,16 @@ def update_config(config_path, candidate, regenerate):
     config_path = Path(config_path)
     previous_exists = config_path.exists()
     previous_data = config_path.read_bytes() if previous_exists else None
+
+    # Preserve kindle_frontlight from existing config if not in candidate
+    if previous_exists and "kindle_frontlight" not in candidate:
+        try:
+            prev_config = json.loads(previous_data.decode("utf-8"))
+            if "kindle_frontlight" in prev_config:
+                candidate["kindle_frontlight"] = prev_config["kindle_frontlight"]
+        except Exception:
+            pass
+
     validated = validate_config(candidate)
     atomic_write_config(config_path, validated)
     try:
@@ -178,6 +188,7 @@ def render_settings(config, csrf_token, status_message=""):
             (8, "Light 8"), (12, "Light 12"), (18, "Light 18"),
         )
     )
+    saved_brightness = str(config.get("kindle_frontlight", 8))
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -423,7 +434,9 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   </div>
   <p class="device-message" id="device-message" role="status">Ready</p>
   <div class="button-grid">{device_buttons}</div>
-  <h3 style="margin-top:20px;font-size:1.1rem;font-weight:700">Front light</h3>
+  <h3 style="margin-top:20px;font-size:1.1rem;font-weight:700">Default front light level</h3>
+  <p class="section-note" style="margin-bottom:10px">Selected level will be persistently saved to configuration and reapplied automatically.</p>
+  <p class="device-message" style="margin-bottom:14px;background:var(--soft);border:1px solid var(--line)" id="persistent-light-display">Current saved default: <strong>{saved_brightness}</strong></p>
   <div class="light-grid">{light_buttons}</div>
   <button type="button" id="restart-kindle" style="width:100%;border-color:#e53e3e;color:#e53e3e;background:#fff5f5">Restart Kindle</button>
 </section>
@@ -628,7 +641,11 @@ async function runDeviceAction(button,path,body){{
     }}
     const result=await deviceApi(path,options);
     deviceMessage.textContent=result.message||"Completed";
-    if(result.brightness!==undefined) brightnessValue.textContent=result.brightness;
+    if(result.brightness!==undefined){{
+      brightnessValue.textContent=result.brightness;
+      const persistentDisplay=document.getElementById("persistent-light-display");
+      if(persistentDisplay) persistentDisplay.querySelector("strong").textContent=result.brightness;
+    }}
     await loadDeviceState();
     return result;
   }}catch(error){{
@@ -899,7 +916,20 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                     payload = {"ok": True, "message": device.push()}
                 elif path == "/api/device/light":
                     candidate = self.read_json()
-                    brightness = device.set_light(candidate.get("level"))
+                    level = candidate.get("level")
+                    if level is None or isinstance(level, bool) or not isinstance(level, int) or level not in (0, 1, 4, 8, 12, 18):
+                        self.send_json(
+                            400,
+                            {"ok": False, "error": "invalid brightness level"},
+                        )
+                        return
+                    try:
+                        current_config = load_config(config_path)
+                        current_config["kindle_frontlight"] = level
+                        atomic_write_config(config_path, current_config)
+                    except Exception as e:
+                        print(f"Warning: Failed to save kindle_frontlight to config: {e}")
+                    brightness = device.set_light(level)
                     payload = {
                         "ok": True,
                         "message": f"Brightness set to {brightness}",

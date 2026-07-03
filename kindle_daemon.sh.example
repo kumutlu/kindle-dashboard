@@ -82,6 +82,17 @@ echo $$ > "$PIDFILE"
 trap 'rm -f "$PIDFILE"' EXIT
 
 log "=== Daemon started (PID=$$) ==="
+
+# Startup delay on boot
+sleep 90
+
+# Fetch and apply saved brightness before dashboard display starts
+BRIGHTNESS=$(wget -q -O- "http://${PI_IP}:8767/api/config" | grep -o '"kindle_frontlight":\s*[0-9]*' | grep -o '[0-9]*')
+if [ -n "$BRIGHTNESS" ]; then
+    log "Reapplying persistent front light level: $BRIGHTNESS"
+    lipc-set-prop com.lab126.powerd flIntensity "$BRIGHTNESS" 2>/dev/null
+fi
+
 # Stop the Kindle UI from drawing its own screensaver/suspend; we take control
 $LIPC com.lab126.powerd preventScreenSaver 1 2>/dev/null
 

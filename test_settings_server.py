@@ -675,6 +675,43 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn('id="restart-settings-server"', text)
         self.assertIn('id="restart-kindle"', text)
 
+    def test_persistent_frontlight_levels(self):
+        # 1. Test POST /api/device/light with valid levels
+        token = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/device/light",
+            body=json.dumps({"level": 12}),
+            headers={"X-CSRF-Token": token, "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["brightness"], 12)
+
+        # Verify it was saved to config
+        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config.get("kindle_frontlight"), 12)
+
+        # Verify device set_light call
+        self.assertIn(("set_light", 12), self.device_calls)
+
+        # 2. Test POST with invalid levels (rejected with 400)
+        for invalid_level in (5, "8", None, True, 25):
+            status, _, _ = self.request(
+                "POST",
+                "/api/device/light",
+                body=json.dumps({"level": invalid_level}),
+                headers={"X-CSRF-Token": token, "Content-Type": "application/json"},
+            )
+            self.assertEqual(status, 400)
+
+        # 3. Test missing config does not crash and uses default 8
+        self.config_path.unlink(missing_ok=True)
+        status, _, body = self.request("GET", "/settings")
+        self.assertEqual(status, 200)
+        self.assertIn("Current saved default: <strong>8</strong>", body.decode("utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

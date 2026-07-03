@@ -17,7 +17,7 @@ class KindleDeviceTests(unittest.TestCase):
         with mock.patch(
             "kindle_device.subprocess.run",
             return_value=self.completed(),
-        ) as run:
+        ) as run, mock.patch.object(self.device, "set_light"):
             message = self.device.run_action("refresh")
 
         args, kwargs = run.call_args
@@ -68,7 +68,7 @@ class KindleDeviceTests(unittest.TestCase):
         with mock.patch(
             "kindle_device.subprocess.run",
             side_effect=[self.completed(), self.completed()],
-        ) as run:
+        ) as run, mock.patch.object(self.device, "set_light"):
             message = self.device.push()
 
         self.assertEqual(run.call_count, 2)
@@ -100,6 +100,26 @@ class KindleDeviceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         self.device.restart(value)
         run.assert_not_called()
+
+    def test_saved_brightness_applied_on_start_and_refresh(self):
+        with mock.patch(
+            "kindle_device.get_saved_brightness",
+            return_value=12,
+        ), mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=self.completed(),
+        ):
+            with mock.patch.object(self.device, "set_light") as mock_set_light:
+                self.device.run_action("start")
+                mock_set_light.assert_called_once_with(12)
+
+            with mock.patch.object(self.device, "set_light") as mock_set_light:
+                self.device.run_action("refresh")
+                mock_set_light.assert_called_once_with(12)
+
+            with mock.patch.object(self.device, "set_light") as mock_set_light:
+                self.device.push()
+                mock_set_light.assert_called_once_with(12)
 
 
 if __name__ == "__main__":

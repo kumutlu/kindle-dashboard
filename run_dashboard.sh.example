@@ -1,0 +1,3 @@
+#!/bin/bash
+export PIHOLE_PASSWORD="your-pihole-password-here"
+python3 weather_image.py

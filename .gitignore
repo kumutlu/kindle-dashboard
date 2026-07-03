@@ -1,38 +1,46 @@
-# Private notes with personal IPs/passwords/serials — NEVER publish
-CLAUDE.md
-.claude/
-
-# Jailbreak/USBNetwork community packages (download from MobileRead, see README)
-jailbreak/
-
-# Personal/runtime versions of the Kindle scripts (copy from *.example and edit)
-kindle_daemon.sh
-kindle_watchdog.sh
-
-# Generated images
-kindle_weather.png
-kindle_news.png
-
-# Logs
-*.log
-
-# Fonts downloaded at setup (see README)
-weathericons.ttf
-
 # Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 
-# OS junk
-.DS_Store
+# Runtime config - do not publish live device settings
+dashboard_config.json
+dashboard_config.json.*
 
-# Old experiments (not part of the documented build)
-kindle_button.sh
-kindle_display.sh
-news_image.py
+# Backups / old files
+*.backup
+*.backup-*
+*.bak
+*.bak.*
+*.old
+*.before-*
+*_backup_*.py
+*_old.py
 
+<<<<<<< HEAD
 # Runtime battery value written by serve_image.py
 battery.txt
 
 # Local data cache
 cache/
+=======
+# Logs / cache / generated files
+*.log
+cache/
+*.tmp
+
+# Local/private files
+.env
+*.pem
+*.key
+known_hosts
+authorized_keys
+
+# Generated dashboard output
+kindle_weather.png
+>>>>>>> 607ac11 (Remove local config and backup files from repository)
+
+# Local run scripts with private env values
+run_dashboard.sh
+*.ttf

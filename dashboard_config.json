@@ -1,0 +1,12 @@
+{
+  "title": "NOTTINGHAM HOME",
+  "location_label": "Nottingham, UK",
+  "weather_query": "Nottingham",
+  "timezone": "Europe/London",
+  "theme": "home_dashboard",
+  "show_server": true,
+  "show_weather": true,
+  "show_forecast": true,
+  "show_tailscale": true,
+  "show_pihole": true
+}

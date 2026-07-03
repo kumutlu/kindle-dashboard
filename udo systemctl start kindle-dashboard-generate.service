@@ -1,0 +1,7 @@
+[0;1;32m●[0m kindle-dashboard-generate.timer - Generate Kindle Dashboard Image Every Minute
+     Loaded: loaded (]8;;file://user-ZBOX-CI320NANO-series/etc/systemd/system/kindle-dashboard-generate.timer/etc/systemd/system/kindle-dashboard-generate.timer]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (waiting)[0m since Wed 2026-07-01 01:17:54 BST; 4s ago
+    Trigger: Wed 2026-07-01 01:18:54 BST; 55s left
+   Triggers: ● kindle-dashboard-generate.service
+
+Jul 01 01:17:54 user-ZBOX-CI320NANO-series systemd[1]: Started kindle-dashboard-generate.timer - Generate Kindle Dashboard Image Every Minute.

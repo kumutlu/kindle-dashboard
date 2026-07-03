@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+# Kindle PW1 framebuffer
+KINDLE_W = 758
+KINDLE_H = 1024
+
+LOCATION_LABEL = "Nottingham, UK"
+WTTR_URL = "https://wttr.in/Nottingham?format=j1"
+
+# Eğer Pi-hole başka makinedeyse bunu değiştir:
+PIHOLE_API = "http://127.0.0.1/admin/api.php"
+
+OUTPUT_PATH = str(Path.home() / "kindle4-weather-display/kindle_weather.png")
+
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+
+def font(path, size):
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def run(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True, timeout=5).strip()
+    except Exception:
+        return ""
+
+
+def fetch_weather():
+    with urllib.request.urlopen(WTTR_URL, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def cpu_percent():
+    out = run("top -bn1 | grep 'Cpu(s)'")
+    try:
+        idle = float(out.split("id,")[0].split(",")[-1].strip())
+        return int(round(100 - idle))
+    except Exception:
+        return "-"
+
+
+def ram_percent():
+    out = run("free | awk '/Mem:/ {print int($3/$2*100)}'")
+    return out if out else "-"
+
+
+def disk_percent():
+    out = run("df / | awk 'NR==2 {gsub(\"%\", \"\", $5); print $5}'")
+    return out if out else "-"
+
+
+def tailscale_count():
+    out = run("tailscale status 2>/dev/null | grep -v '^$' | wc -l")
+    return out if out else "-"
+
+
+def pihole_stats():
+    try:
+        with urllib.request.urlopen(PIHOLE_API, timeout=3) as r:
+            d = json.loads(r.read().decode())
+        return {
+            "queries": int(d.get("dns_queries_today", 0)),
+            "blocked": int(d.get("ads_blocked_today", 0)),
+            "clients": int(d.get("unique_clients", 0)),
+        }
+    except Exception:
+        return {"queries": 0, "blocked": 0, "clients": 0}
+
+
+def fmt(n):
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+
+def text(draw, xy, value, fnt, anchor=None):
+    draw.text(xy, str(value), fill=0, font=fnt, anchor=anchor)
+
+
+def box(draw, xy, radius=12, width=2):
+    draw.rounded_rectangle(xy, radius=radius, outline=0, width=width)
+
+
+def weather_icon(draw, kind, x, y, s):
+    # Simple clean line icons for e-ink
+    if kind == "sun":
+        r = s // 3
+        draw.ellipse((x-r, y-r, x+r, y+r), outline=0, width=4)
+        for dx, dy in [(-s//2,0),(s//2,0),(0,-s//2),(0,s//2),(-s//3,-s//3),(s//3,s//3),(-s//3,s//3),(s//3,-s//3)]:
+            draw.line((x, y, x+dx, y+dy), fill=0, width=3)
+    elif kind == "rain":
+        weather_icon(draw, "cloud", x, y-10, s)
+        for dx in [-22, 0, 22]:
+            draw.line((x+dx, y+30, x+dx-8, y+52), fill=0, width=3)
+    elif kind == "cloud":
+        draw.arc((x-s//2, y-s//4, x, y+s//3), 180, 360, fill=0, width=4)
+        draw.arc((x-s//5, y-s//2, x+s//2, y+s//3), 180, 360, fill=0, width=4)
+        draw.line((x-s//2, y+s//3, x+s//2, y+s//3), fill=0, width=4)
+    else:
+        # sun + cloud
+        weather_icon(draw, "sun", x-18, y-18, s//2)
+        weather_icon(draw, "cloud", x+8, y+8, s)
+
+
+def icon_type(code):
+    code = int(code)
+    if code == 113:
+        return "sun"
+    if code in [116]:
+        return "partly"
+    if code in [119, 122, 143, 248, 260]:
+        return "cloud"
+    if code in [176, 263, 266, 293, 296, 299, 302, 305, 308, 353, 356, 359]:
+        return "rain"
+    return "partly"
+
+
+def generate_image(data):
+    img = Image.new("L", (KINDLE_W, KINDLE_H), 255)
+    draw = ImageDraw.Draw(img)
+
+    fb72 = font(FONT_BOLD, 72)
+    fb54 = font(FONT_BOLD, 54)
+    fb38 = font(FONT_BOLD, 38)
+    fb32 = font(FONT_BOLD, 32)
+    fb28 = font(FONT_BOLD, 28)
+    fb24 = font(FONT_BOLD, 24)
+    fb22 = font(FONT_BOLD, 22)
+    fb20 = font(FONT_BOLD, 20)
+    fr20 = font(FONT_REG, 20)
+    fr18 = font(FONT_REG, 18)
+    fr16 = font(FONT_REG, 16)
+    fr14 = font(FONT_REG, 14)
+
+    now = datetime.now()
+    cur = data["current_condition"][0]
+    days = data["weather"]
+
+    temp = int(cur["temp_C"])
+    feels = int(cur["FeelsLikeC"])
+    humidity = cur["humidity"]
+    wind = cur["windspeedMiles"]
+    wind_dir = cur["winddir16Point"]
+    pressure = cur["pressure"]
+    desc = cur["weatherDesc"][0]["value"]
+
+    hi = days[0]["maxtempC"]
+    lo = days[0]["mintempC"]
+    sunrise = days[0]["astronomy"][0]["sunrise"][:5]
+    sunset = days[0]["astronomy"][0]["sunset"][:5]
+
+    ph = pihole_stats()
+
+    # Outer full screen
+    box(draw, (4, 4, 754, 1020), radius=14, width=3)
+
+    # Header
+    text(draw, (28, 30), "NOTTINGHAM HOME", fb32)
+    text(draw, (30, 70), now.strftime("%A, %d %B %Y"), fr18)
+    text(draw, (728, 68), now.strftime("%H:%M"), fb54, anchor="ra")
+    draw.line((24, 115, 734, 115), fill=0, width=3)
+
+    # Weather box
+    box(draw, (24, 140, 734, 380), radius=16, width=3)
+    weather_icon(draw, icon_type(cur["weatherCode"]), 110, 245, 95)
+    text(draw, (220, 195), f"{temp}°", fb72)
+    text(draw, (224, 268), desc, fb32)
+    text(draw, (226, 315), f"Feels {feels}°C", fr20)
+
+    text(draw, (520, 178), "High / Low", fr20)
+    text(draw, (520, 212), f"{hi}° / {lo}°", fb24)
+    text(draw, (520, 258), f"Humidity {humidity}%", fr20)
+    text(draw, (520, 298), f"Wind {wind} mph {wind_dir}", fr20)
+    text(draw, (520, 338), f"{sunrise} - {sunset}", fr18)
+
+    # Forecast
+    text(draw, (28, 424), "FORECAST", fb28)
+    names = ["Today", "Tomorrow"]
+    try:
+        names.append(datetime.strptime(days[2]["date"], "%Y-%m-%d").strftime("%A"))
+    except Exception:
+        names.append("Day 3")
+
+    top = 465
+    w = 216
+    gap = 21
+    for i, day in enumerate(days[:3]):
+        x = 28 + i * (w + gap)
+        box(draw, (x, top, x+w, top+165), radius=12, width=3)
+        dmax = day["maxtempC"]
+        dmin = day["mintempC"]
+        rain = day["hourly"][4]["chanceofrain"]
+        code = day["hourly"][4]["weatherCode"]
+
+        text(draw, (x+w//2, top+31), names[i], fb22, anchor="mm")
+        weather_icon(draw, icon_type(code), x+w//2, top+82, 46)
+        text(draw, (x+w//2, top+122), f"{dmax}° / {dmin}°", fb24, anchor="mm")
+        text(draw, (x+w//2, top+150), f"{rain}% rain", fr16, anchor="mm")
+
+    draw.line((24, 670, 734, 670), fill=0, width=3)
+
+    # Server
+    text(draw, (28, 715), "SERVER", fb28)
+
+    stats = [
+        ("CPU", f"{cpu_percent()}%"),
+        ("RAM", f"{ram_percent()}%"),
+        ("DISK", f"{disk_percent()}%"),
+        ("PI-HOLE", fmt(ph["blocked"])),
+        ("QUERIES", fmt(ph["queries"])),
+        ("TAILSCALE", tailscale_count()),
+    ]
+
+    card_w = 335
+    card_h = 64
+    for i, (label, value) in enumerate(stats):
+        row = i // 2
+        col = i % 2
+        x = 28 + col * 365
+        y = 755 + row * 78
+        box(draw, (x, y, x+card_w, y+card_h), radius=10, width=3)
+        text(draw, (x+18, y+23), label, fb20)
+        text(draw, (x+card_w-18, y+38), value, fb32, anchor="rm")
+
+    # Footer
+    draw.line((24, 970, 734, 970), fill=0, width=2)
+    footer = f"Updated {now.strftime('%H:%M')}  |  Pressure {pressure} hPa  |  Clients {fmt(ph['clients'])}"
+    text(draw, (28, 993), footer, fr14)
+
+    img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+    img.save(OUTPUT_PATH)
+    print(f"Saved: {OUTPUT_PATH}")
+
+
+def main():
+    print(f"Fetching weather for {LOCATION_LABEL}...")
+    data = fetch_weather()
+    print("Generating dashboard...")
+    generate_image(data)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+
+W, H = 758, 1024
+OUT = str(Path.home() / "kindle4-weather-display/kindle_weather.png")
+
+WTTR = "https://wttr.in/Nottingham?format=j1"
+PIHOLE_BASE = os.environ.get("PIHOLE_BASE", "http://192.168.68.167").rstrip("/")
+PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
+
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+
+def font(path, size):
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def sh(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True, timeout=7).strip()
+    except Exception:
+        return ""
+
+
+def http_json(url, timeout=8, data=None, headers=None):
+    req_headers = {"User-Agent": "KindleDashboard/1.0"}
+    if headers:
+        req_headers.update(headers)
+
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=body, headers=req_headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def txt(d, x, y, value, fnt, anchor=None):
+    d.text((x, y), str(value), fill=0, font=fnt, anchor=anchor)
+
+
+def box(d, xy, radius=8, width=2):
+    d.rounded_rectangle(xy, radius=radius, outline=0, width=width)
+
+
+def fmt(value):
+    try:
+        return f"{int(value):,}"
+    except Exception:
+        return str(value)
+
+
+def fetch_weather():
+    return http_json(WTTR, timeout=20)
+
+
+def get_cpu():
+    out = sh("top -bn1 | grep 'Cpu(s)'")
+    try:
+        idle = float(out.split("id,")[0].split(",")[-1].strip())
+        return int(round(100 - idle))
+    except Exception:
+        return 0
+
+
+def get_ram():
+    out = sh("free | awk '/Mem:/ {print int($3/$2*100)}'")
+    try:
+        return int(out)
+    except Exception:
+        return 0
+
+
+def get_disk():
+    out = sh("df / | awk 'NR==2 {gsub(\"%\",\"\",$5); print $5}'")
+    try:
+        return int(out)
+    except Exception:
+        return 0
+
+
+def get_tailscale():
+    devices = []
+    raw = sh("tailscale status --json 2>/dev/null")
+
+    if raw:
+        try:
+            data = json.loads(raw)
+
+            self_node = data.get("Self", {})
+            if self_node.get("TailscaleIPs"):
+                devices.append({
+                    "name": self_node.get("HostName", "this-device"),
+                    "online": True,
+                })
+
+            for peer in data.get("Peer", {}).values():
+                devices.append({
+                    "name": peer.get("HostName", "device"),
+                    "online": bool(peer.get("Online", False)),
+                })
+        except Exception:
+            pass
+
+    if not devices:
+        raw = sh("tailscale status 2>/dev/null")
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("100."):
+                devices.append({
+                    "name": parts[1],
+                    "online": "offline" not in line.lower(),
+                })
+
+    online = [d for d in devices if d.get("online")]
+    return {
+        "total": len(devices),
+        "online": len(online),
+    }
+
+
+def pihole_v6_sid():
+    if not PIHOLE_PASSWORD:
+        return None
+
+    try:
+        data = http_json(
+            f"{PIHOLE_BASE}/api/auth",
+            timeout=8,
+            data={"password": PIHOLE_PASSWORD},
+        )
+        session = data.get("session", {})
+        return session.get("sid") or data.get("sid")
+    except Exception:
+        return None
+
+
+def get_pihole():
+    # Pi-hole v5
+    try:
+        data = http_json(f"{PIHOLE_BASE}/admin/api.php", timeout=5)
+        if isinstance(data, dict) and "dns_queries_today" in data:
+            return {
+                "queries": int(data.get("dns_queries_today", 0)),
+                "blocked": int(data.get("ads_blocked_today", 0)),
+                "clients": int(data.get("unique_clients", 0)),
+                "ok": True,
+                "version": "v5",
+            }
+    except Exception:
+        pass
+
+    # Pi-hole v6
+    sid = pihole_v6_sid()
+    if sid:
+        try:
+            data = http_json(
+                f"{PIHOLE_BASE}/api/stats/summary",
+                timeout=8,
+                headers={"X-FTL-SID": sid},
+            )
+
+            queries = 0
+            blocked = 0
+            clients = 0
+
+            if isinstance(data.get("queries"), dict):
+                queries = data["queries"].get("total", 0)
+                blocked = data["queries"].get("blocked", 0)
+
+            if isinstance(data.get("clients"), dict):
+                clients = data["clients"].get("active", 0)
+
+            return {
+                "queries": int(queries or 0),
+                "blocked": int(blocked or 0),
+                "clients": int(clients or 0),
+                "ok": True,
+                "version": "v6",
+            }
+        except Exception:
+            pass
+
+    return {
+        "queries": 0,
+        "blocked": 0,
+        "clients": 0,
+        "ok": False,
+        "version": "none",
+    }
+
+
+def progress(d, x, y, width, pct):
+    pct = max(0, min(100, int(pct)))
+    d.rectangle((x, y, x + width, y + 9), outline=0, width=1)
+    if pct > 0:
+        d.rectangle((x, y, x + int(width * pct / 100), y + 9), fill=0)
+
+
+# ---------- Clean weather icons ----------
+# Bunlar bilinçli olarak çok basit. E-ink üzerinde karışmasın diye az çizgi kullanıyor.
+
+def draw_sun(d, cx, cy, size):
+    r = size // 4
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=0, width=4)
+
+    ray = size // 2
+    small = size // 3
+    for x1, y1, x2, y2 in [
+        (cx, cy - r - 6, cx, cy - ray),
+        (cx, cy + r + 6, cx, cy + ray),
+        (cx - r - 6, cy, cx - ray, cy),
+        (cx + r + 6, cy, cx + ray, cy),
+        (cx - small, cy - small, cx - ray + 8, cy - ray + 8),
+        (cx + small, cy - small, cx + ray - 8, cy - ray + 8),
+        (cx - small, cy + small, cx - ray + 8, cy + ray - 8),
+        (cx + small, cy + small, cx + ray - 8, cy + ray - 8),
+    ]:
+        d.line((x1, y1, x2, y2), fill=0, width=3)
+
+
+def draw_cloud(d, cx, cy, size):
+    # Single clean cloud outline
+    left = cx - size // 2
+    right = cx + size // 2
+    bottom = cy + size // 4
+
+    d.arc((left, cy - size // 5, cx - 2, bottom), 180, 360, fill=0, width=4)
+    d.arc((cx - size // 4, cy - size // 2, cx + size // 4, bottom), 180, 360, fill=0, width=4)
+    d.arc((cx, cy - size // 3, right, bottom), 180, 360, fill=0, width=4)
+    d.line((left, bottom, right, bottom), fill=0, width=4)
+
+
+def draw_partly_cloudy(d, cx, cy, size):
+    draw_sun(d, cx - size // 4, cy - size // 5, size // 2)
+    draw_cloud(d, cx + size // 10, cy + size // 8, size)
+
+
+def draw_rain(d, cx, cy, size):
+    draw_cloud(d, cx, cy - 8, size)
+    for dx in [-24, 0, 24]:
+        d.line((cx + dx, cy + 35, cx + dx - 8, cy + 55), fill=0, width=3)
+
+
+def weather_kind(code):
+    try:
+        code = int(code)
+    except Exception:
+        return "partly"
+
+    if code == 113:
+        return "sun"
+    if code in [119, 122, 143, 248, 260]:
+        return "cloud"
+    if code in [176, 263, 266, 293, 296, 299, 302, 305, 308, 353, 356, 359]:
+        return "rain"
+    return "partly"
+
+
+def draw_weather_icon(d, kind, cx, cy, size):
+    if kind == "sun":
+        draw_sun(d, cx, cy, size)
+    elif kind == "cloud":
+        draw_cloud(d, cx, cy, size)
+    elif kind == "rain":
+        draw_rain(d, cx, cy, size)
+    else:
+        draw_partly_cloudy(d, cx, cy, size)
+
+
+def main():
+    weather = fetch_weather()
+    current = weather["current_condition"][0]
+    days = weather["weather"]
+
+    now = datetime.now()
+
+    temp = int(current["temp_C"])
+    feels = int(current["FeelsLikeC"])
+    desc = current["weatherDesc"][0]["value"]
+    humidity = current["humidity"]
+    wind = current["windspeedMiles"]
+    wind_dir = current["winddir16Point"]
+    pressure = current["pressure"]
+
+    hi = days[0]["maxtempC"]
+    lo = days[0]["mintempC"]
+    sunrise = days[0]["astronomy"][0]["sunrise"][:5]
+    sunset = days[0]["astronomy"][0]["sunset"][:5]
+
+    cpu = get_cpu()
+    ram = get_ram()
+    disk = get_disk()
+    ph = get_pihole()
+    ts = get_tailscale()
+
+    FB50 = font(FONT_BOLD, 50)
+    FB42 = font(FONT_BOLD, 42)
+    FB28 = font(FONT_BOLD, 28)
+    FB24 = font(FONT_BOLD, 24)
+    FB22 = font(FONT_BOLD, 22)
+    FB20 = font(FONT_BOLD, 20)
+    FB18 = font(FONT_BOLD, 18)
+
+    FR18 = font(FONT_REG, 18)
+    FR16 = font(FONT_REG, 16)
+    FR14 = font(FONT_REG, 14)
+
+    img = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(img)
+
+    box(d, (10, 10, 748, 1014), 10, 2)
+
+    # Header - no large clock, use large date instead
+    txt(d, 34, 28, "NOTTINGHAM HOME", FB28)
+    txt(d, 720, 30, now.strftime("%A").upper(), FB24, anchor="ra")
+    txt(d, 720, 68, now.strftime("%d %B %Y"), FB24, anchor="ra")
+    d.line((24, 112, 734, 112), fill=0, width=2)
+
+    # Weather panel
+    box(d, (24, 140, 734, 375), 8, 2)
+
+    # Main weather text - no icons, clean layout
+    txt(d, 48, 172, "CURRENT WEATHER", FB18)
+    txt(d, 48, 215, desc.upper(), FB22)
+    txt(d, 48, 258, f"Feels like {feels}°C", FR18)
+
+    # Bigger temperature
+    txt(d, 320, 188, f"{temp}°C", FB50)
+
+    # Right side info: deliberately small fonts and wide spacing
+    label_x = 515
+    value_x = 710
+    y = 162
+    step = 39
+
+    rows = [
+        ("High / Low", f"{hi}° / {lo}°"),
+        ("Humidity", f"{humidity}%"),
+        ("Wind", f"{wind} mph {wind_dir}"),
+        ("Sunrise", sunrise),
+        ("Sunset", sunset),
+    ]
+
+    for label, value in rows:
+        txt(d, label_x, y, label, FR14)
+        txt(d, value_x, y, value, FB18, anchor="ra")
+        y += step
+
+    # Forecast
+    txt(d, 34, 415, "FORECAST", FB22)
+
+    names = ["TODAY", "TOMORROW"]
+    try:
+        names.append(datetime.strptime(days[2]["date"], "%Y-%m-%d").strftime("%A").upper())
+    except Exception:
+        names.append("DAY 3")
+
+    for i, day in enumerate(days[:3]):
+        x = 34 + i * 236
+        y = 455
+        box(d, (x, y, x + 210, y + 140), 8, 2)
+
+        txt(d, x + 105, y + 28, names[i], FB18, anchor="mm")
+        txt(d, x + 105, y + 78, f"{day['maxtempC']}° / {day['mintempC']}°", FB22, anchor="mm")
+        txt(d, x + 105, y + 112, f"{day['hourly'][4]['chanceofrain']}% rain", FR14, anchor="mm")
+
+    d.line((24, 630, 734, 630), fill=0, width=2)
+
+    # Server
+    txt(d, 34, 668, "SERVER STATUS", FB22)
+
+    cards = [
+        ("CPU", f"{cpu}%", cpu, ""),
+        ("RAM", f"{ram}%", ram, ""),
+        ("DISK", f"{disk}%", disk, ""),
+        ("PI-HOLE", fmt(ph["blocked"]), None, "blocked today"),
+        ("QUERIES", fmt(ph["queries"]), None, "dns today"),
+        ("TAILSCALE", ts["online"], None, "online devices"),
+    ]
+
+    for i, (label, value, pct, sub) in enumerate(cards):
+        row = i // 3
+        col = i % 3
+        x = 34 + col * 236
+        y = 708 + row * 112
+
+        box(d, (x, y, x + 210, y + 94), 8, 2)
+        txt(d, x + 18, y + 18, label, FB18)
+        txt(d, x + 190, y + 42, value, FB22, anchor="ra")
+
+        if pct is not None:
+            progress(d, x + 22, y + 72, 166, pct)
+        else:
+            txt(d, x + 18, y + 70, sub, FR14)
+
+    # No long Tailscale line anymore
+
+    d.line((24, 960, 734, 960), fill=0, width=2)
+    txt(d, 34, 988, f"Updated {now.strftime('%H:%M')}", FR14)
+    txt(d, 300, 988, f"Pressure {pressure} hPa", FR14)
+    txt(d, 585, 988, f"Clients {ph['clients']}", FR14)
+
+    img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+    img.save(OUT)
+
+    print(f"Saved: {OUT}")
+    print(f"Pi-hole: {ph}")
+    print(f"Tailscale: online={ts['online']} total={ts['total']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+import http.client
+import json
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import settings_server
+import weather_image
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_config_uses_nottingham_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = weather_image.load_config(Path(directory) / "missing.json")
+        self.assertEqual(config, weather_image.DEFAULT_CONFIG)
+
+    def test_invalid_config_uses_nottingham_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dashboard_config.json"
+            path.write_text('{"timezone":"Not/AZone"}', encoding="utf-8")
+            config = weather_image.load_config(path)
+        self.assertEqual(config, weather_image.DEFAULT_CONFIG)
+
+    def test_weather_query_is_url_encoded(self):
+        self.assertEqual(
+            weather_image.weather_url("Istanbul Türkiye"),
+            "https://wttr.in/Istanbul%20T%C3%BCrkiye?format=j1",
+        )
+
+    def test_unknown_config_field_is_rejected(self):
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["secret"] = "not allowed"
+        with self.assertRaises(ValueError):
+            weather_image.validate_config(config)
+
+
+class PiholeSessionTests(unittest.TestCase):
+    def test_close_session_uses_delete_with_sid_header(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 204
+        with mock.patch(
+            "weather_image.urllib.request.urlopen",
+            return_value=response,
+        ) as urlopen:
+            weather_image.close_pihole_v6_sid("test-session-id")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.method, "DELETE")
+        self.assertEqual(
+            request.get_header("X-ftl-sid"),
+            "test-session-id",
+        )
+
+    def test_successful_v6_fetch_always_closes_session(self):
+        summary = {
+            "queries": {"total": 123, "blocked": 45},
+            "clients": {"active": 6},
+        }
+        with (
+            mock.patch("weather_image.pihole_v6_sid", return_value="sid"),
+            mock.patch("weather_image.http_json", side_effect=[{}, summary]),
+            mock.patch("weather_image.close_pihole_v6_sid") as close,
+        ):
+            result = weather_image.get_pihole()
+
+        self.assertEqual(result["queries"], 123)
+        self.assertTrue(result["ok"])
+        close.assert_called_once_with("sid")
+
+    def test_failed_v6_fetch_still_closes_session(self):
+        with (
+            mock.patch("weather_image.pihole_v6_sid", return_value="sid"),
+            mock.patch(
+                "weather_image.http_json",
+                side_effect=[{}, RuntimeError("controlled failure")],
+            ),
+            mock.patch("weather_image.close_pihole_v6_sid") as close,
+        ):
+            result = weather_image.get_pihole()
+
+        self.assertFalse(result["ok"])
+        close.assert_called_once_with("sid")
+
+
+class SettingsServerTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.tempdir.name) / "dashboard_config.json"
+        settings_server.atomic_write_config(
+            self.config_path,
+            weather_image.DEFAULT_CONFIG,
+        )
+        self.regeneration_calls = 0
+        self.fail_regeneration = False
+
+        def regenerate():
+            self.regeneration_calls += 1
+            if self.fail_regeneration:
+                raise RuntimeError("controlled regeneration failure")
+
+        self.server = settings_server.make_server(
+            host="127.0.0.1",
+            port=0,
+            config_path=self.config_path,
+            regenerate=regenerate,
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.tempdir.cleanup()
+
+    def request(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        data = response.read()
+        response_headers = dict(response.getheaders())
+        connection.close()
+        return response.status, response_headers, data
+
+    def test_binding_is_home_lan_only(self):
+        self.assertEqual(settings_server.BIND_HOST, "192.168.68.167")
+        self.assertEqual(settings_server.PORT, 8767)
+
+    def test_health_and_unknown_route(self):
+        status, _, body = self.request("GET", "/health")
+        self.assertEqual((status, body), (200, b"OK\n"))
+        status, _, _ = self.request("GET", "/not-a-route")
+        self.assertEqual(status, 404)
+
+    def test_settings_form_contains_fields_and_presets(self):
+        status, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn('name="title"', text)
+        self.assertIn('name="weather_query"', text)
+        self.assertIn("Nottingham", text)
+        self.assertIn("Istanbul", text)
+
+    def test_settings_page_has_mobile_app_metadata_and_navigation(self):
+        status, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn(
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+            text,
+        )
+        self.assertIn(
+            '<meta name="apple-mobile-web-app-capable" content="yes">',
+            text,
+        )
+        self.assertIn(
+            '<meta name="apple-mobile-web-app-title" content="Kindle Dash">',
+            text,
+        )
+        self.assertIn('<meta name="theme-color" content="#111111">', text)
+        for label in ("Settings", "Theme", "Device", "Status"):
+            self.assertIn(f">{label}</a>", text)
+
+    def test_settings_page_has_required_cards_and_safe_status(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        for section_id in (
+            "location",
+            "display",
+            "theme",
+            "device",
+            "status",
+        ):
+            self.assertIn(f'id="{section_id}"', text)
+        self.assertIn("NOTTINGHAM HOME", text)
+        self.assertIn("Nottingham", text)
+        self.assertIn("home_dashboard", text)
+        self.assertNotIn("PIHOLE_PASSWORD", text)
+        self.assertNotIn("public-token", text)
+
+    def test_device_buttons_are_disabled_and_have_no_command_payload(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        for label in (
+            "Start Dashboard",
+            "Return Home",
+            "Refresh Now",
+            "Restart Kindle",
+            "Light Off",
+            "Light 1",
+            "Light 4",
+            "Light 8",
+            "Light 12",
+            "Light 18",
+        ):
+            self.assertIn(f'<button type="button" disabled>{label}</button>', text)
+        self.assertNotIn("lipc-", text)
+        self.assertNotIn("ssh ", text)
+
+    def test_display_flags_render_as_large_toggle_cards(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        for name in (
+            "show_weather",
+            "show_forecast",
+            "show_server",
+            "show_pihole",
+            "show_tailscale",
+        ):
+            self.assertIn(f'class="toggle"><input type="checkbox" name="{name}"', text)
+        self.assertIn("@media (min-width: 760px)", text)
+
+    def test_theme_selector_lists_implemented_and_disabled_placeholder(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        for value in (
+            "home_dashboard",
+            "minimal_weather",
+            "server_monitor",
+            "travel_weather",
+        ):
+            self.assertIn(f'<option value="{value}"', text)
+        self.assertIn(
+            '<option value="maarif_calendar" disabled>'
+            'Maarif Calendar — Coming Soon</option>',
+            text,
+        )
+
+    def test_api_accepts_implemented_theme_and_rejects_placeholder(self):
+        minimal = dict(weather_image.DEFAULT_CONFIG)
+        minimal["theme"] = "minimal_weather"
+        status, _, body = self.request(
+            "POST",
+            "/api/config",
+            body=json.dumps(minimal),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, body)
+
+        placeholder = dict(weather_image.DEFAULT_CONFIG)
+        placeholder["theme"] = "maarif_calendar"
+        status, _, _ = self.request(
+            "POST",
+            "/api/config",
+            body=json.dumps(placeholder),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+
+    def test_get_api_returns_only_config(self):
+        status, _, body = self.request("GET", "/api/config")
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, weather_image.DEFAULT_CONFIG)
+        self.assertNotIn("password", body.decode("utf-8").lower())
+        self.assertNotIn("token", body.decode("utf-8").lower())
+
+    def test_post_api_saves_and_regenerates(self):
+        london = dict(weather_image.DEFAULT_CONFIG)
+        london.update({
+            "title": "LONDON DASHBOARD",
+            "location_label": "London, UK",
+            "weather_query": "London",
+        })
+        status, _, body = self.request(
+            "POST",
+            "/api/config",
+            body=json.dumps(london),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.regeneration_calls, 1)
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8")),
+            london,
+        )
+
+    def test_failed_regeneration_restores_previous_config(self):
+        before = self.config_path.read_text(encoding="utf-8")
+        self.fail_regeneration = True
+        london = dict(weather_image.DEFAULT_CONFIG)
+        london["weather_query"] = "London"
+        status, _, _ = self.request(
+            "POST",
+            "/api/config",
+            body=json.dumps(london),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(
+            self.config_path.read_text(encoding="utf-8"),
+            before,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

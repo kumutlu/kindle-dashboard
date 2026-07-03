@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+import json, subprocess, urllib.request
+from datetime import datetime
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+
+W, H = 758, 1024
+OUT = str(Path.home() / "kindle4-weather-display/kindle_weather.png")
+WTTR = "https://wttr.in/Nottingham?format=j1"
+PIHOLE_API = "http://127.0.0.1/admin/api.php"
+
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+def f(path, size):
+    try: return ImageFont.truetype(path, size)
+    except: return ImageFont.load_default()
+
+def sh(cmd):
+    try: return subprocess.check_output(cmd, shell=True, text=True, timeout=5).strip()
+    except: return ""
+
+def txt(d, xy, t, font, anchor=None):
+    d.text(xy, str(t), fill=0, font=font, anchor=anchor)
+
+def box(d, xy, r=12, w=2):
+    d.rounded_rectangle(xy, radius=r, outline=0, width=w)
+
+def line(d, xy, w=2):
+    d.line(xy, fill=0, width=w)
+
+def fmt(n):
+    try: return f"{int(n):,}"
+    except: return str(n)
+
+def weather():
+    with urllib.request.urlopen(WTTR, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+def cpu():
+    out = sh("top -bn1 | grep 'Cpu(s)'")
+    try:
+        idle = float(out.split("id,")[0].split(",")[-1].strip())
+        return int(round(100 - idle))
+    except: return 0
+
+def ram():
+    out = sh("free | awk '/Mem:/ {print int($3/$2*100)}'")
+    return int(out) if out else 0
+
+def disk():
+    out = sh("df / | awk 'NR==2 {gsub(\"%\",\"\",$5); print $5}'")
+    return int(out) if out else 0
+
+def pihole():
+    try:
+        with urllib.request.urlopen(PIHOLE_API, timeout=3) as r:
+            j = json.loads(r.read().decode())
+        return {
+            "queries": int(j.get("dns_queries_today", 0)),
+            "blocked": int(j.get("ads_blocked_today", 0)),
+            "clients": int(j.get("unique_clients", 0)),
+        }
+    except:
+        return {"queries": 0, "blocked": 0, "clients": 0}
+
+def tailscale_devices():
+    out = sh("tailscale status --json 2>/dev/null")
+    devices = []
+    if out:
+        try:
+            j = json.loads(out)
+            self_name = j.get("Self", {}).get("HostName", "this-device")
+            self_ip = (j.get("Self", {}).get("TailscaleIPs") or [""])[0]
+            if self_ip:
+                devices.append((self_name, self_ip))
+            for p in j.get("Peer", {}).values():
+                name = p.get("HostName", "device")
+                ips = p.get("TailscaleIPs") or [""]
+                online = p.get("Online", False)
+                if ips and online:
+                    devices.append((name, ips[0]))
+        except:
+            pass
+    if not devices:
+        out = sh("tailscale status 2>/dev/null")
+        for ln in out.splitlines():
+            parts = ln.split()
+            if len(parts) >= 2 and parts[0].startswith("100."):
+                devices.append((parts[1], parts[0]))
+    return devices
+
+def progress(d, x, y, w, pct):
+    d.rectangle((x, y, x+w, y+8), outline=0, width=1)
+    fillw = int(w * max(0, min(100, int(pct))) / 100)
+    d.rectangle((x, y, x+fillw, y+8), fill=0)
+
+def icon_cloud_sun(d, x, y, s=80):
+    # clean simple icon
+    d.ellipse((x, y, x+s//2, y+s//2), outline=0, width=5)
+    for dx, dy in [(20,-20),(55,-15),(-10,20),(70,25)]:
+        line(d, (x+s//4, y+s//4, x+s//4+dx, y+s//4+dy), 4)
+    cx, cy = x+s//2, y+s//2+12
+    d.arc((cx-45, cy-30, cx+10, cy+25), 180, 360, fill=0, width=5)
+    d.arc((cx-15, cy-55, cx+55, cy+25), 180, 360, fill=0, width=5)
+    line(d, (cx-45, cy+25, cx+60, cy+25), 5)
+
+def icon_sun(d, x, y, s=45):
+    r = s//4; cx=x+s//2; cy=y+s//2
+    d.ellipse((cx-r, cy-r, cx+r, cy+r), outline=0, width=3)
+    for dx,dy in [(0,-22),(0,22),(-22,0),(22,0),(-16,-16),(16,16),(-16,16),(16,-16)]:
+        line(d,(cx,cy,cx+dx,cy+dy),2)
+
+def icon_cloud(d, x, y, s=45):
+    cx=x+s//2; cy=y+s//2
+    d.arc((cx-30,cy-10,cx+5,cy+22),180,360,fill=0,width=3)
+    d.arc((cx-10,cy-28,cx+32,cy+22),180,360,fill=0,width=3)
+    line(d,(cx-30,cy+22,cx+35,cy+22),3)
+
+def generate():
+    data = weather()
+    cur = data["current_condition"][0]
+    days = data["weather"]
+    ph = pihole()
+    ts = tailscale_devices()
+
+    now = datetime.now()
+    temp = int(cur["temp_C"])
+    feels = int(cur["FeelsLikeC"])
+    desc = cur["weatherDesc"][0]["value"]
+    humidity = cur["humidity"]
+    wind = cur["windspeedMiles"]
+    wind_dir = cur["winddir16Point"]
+    pressure = cur["pressure"]
+    hi, lo = days[0]["maxtempC"], days[0]["mintempC"]
+    sunrise = days[0]["astronomy"][0]["sunrise"][:5]
+    sunset = days[0]["astronomy"][0]["sunset"][:5]
+
+    FB72=f(FONT_BOLD,72); FB58=f(FONT_BOLD,58); FB36=f(FONT_BOLD,36)
+    FB30=f(FONT_BOLD,30); FB26=f(FONT_BOLD,26); FB22=f(FONT_BOLD,22)
+    FB20=f(FONT_BOLD,20); FR20=f(FONT_REG,20); FR18=f(FONT_REG,18)
+    FR16=f(FONT_REG,16); FR14=f(FONT_REG,14)
+
+    img = Image.new("L", (W,H), 255)
+    d = ImageDraw.Draw(img)
+
+    box(d,(6,6,752,1018),14,2)
+
+    # Header
+    txt(d,(40,38),"⌂  NOTTINGHAM HOME",FB30)
+    txt(d,(42,76),now.strftime("%A, %d %B %Y"),FR18)
+    txt(d,(718,70),now.strftime("%H:%M"),FB58,anchor="ra")
+    line(d,(28,120,730,120),2)
+
+    # Weather
+    box(d,(28,145,730,365),14,2)
+    icon_cloud_sun(d,70,205,95)
+    txt(d,(250,190),f"{temp}°C",FB72)
+    txt(d,(255,275),desc,FB30)
+    txt(d,(258,318),f"Feels like {feels}°C",FR20)
+    line(d,(505,165,505,345),1)
+    txt(d,(535,178),"High / Low",FB20); txt(d,(665,178),f"{hi}°C / {lo}°C",FB20,anchor="ra")
+    txt(d,(535,222),"Humidity",FB20); txt(d,(665,222),f"{humidity}%",FR20,anchor="ra")
+    txt(d,(535,266),"Wind",FB20); txt(d,(665,266),f"{wind} mph {wind_dir}",FR20,anchor="ra")
+    txt(d,(535,310),"Sunrise / Sunset",FB20); txt(d,(705,310),f"{sunrise} / {sunset}",FR20,anchor="ra")
+
+    # Forecast
+    txt(d,(34,410),"FORECAST",FB26)
+    names=["TODAY","TOMORROW"]
+    try: names.append(datetime.strptime(days[2]["date"],"%Y-%m-%d").strftime("%A").upper())
+    except: names.append("DAY 3")
+    for i,day in enumerate(days[:3]):
+        x=34+i*236
+        box(d,(x,455,x+210,620),10,2)
+        txt(d,(x+105,485),names[i],FB20,anchor="mm")
+        if i==2: icon_sun(d,x+82,510,52)
+        else: icon_cloud(d,x+82,515,52)
+        txt(d,(x+105,575),f"{day['maxtempC']}° / {day['mintempC']}°",FB26,anchor="mm")
+        txt(d,(x+105,603),f"{day['hourly'][4]['chanceofrain']}% rain",FR16,anchor="mm")
+
+    line(d,(28,650,730,650),2)
+
+    # Server status
+    txt(d,(34,690),"SERVER STATUS",FB26)
+    c=cpu(); r=ram(); dk=disk()
+    stats=[
+        ("CPU",f"{c}%",c),
+        ("RAM",f"{r}%",r),
+        ("DISK",f"{dk}%",dk),
+        ("PI-HOLE",fmt(ph["blocked"]),None),
+        ("QUERIES",fmt(ph["queries"]),None),
+        ("TAILSCALE",len(ts),None),
+    ]
+    for i,(label,val,pct) in enumerate(stats):
+        row=i//3; col=i%3
+        x=34+col*236; y=730+row*105
+        box(d,(x,y,x+210,y+88),8,2)
+        txt(d,(x+20,y+24),label,FB20)
+        txt(d,(x+190,y+48),val,FB30,anchor="ra")
+        if pct is not None:
+            progress(d,x+55,y+68,125,pct)
+        elif label=="TAILSCALE":
+            txt(d,(x+20,y+68),"devices",FR14)
+        elif label=="PI-HOLE":
+            txt(d,(x+20,y+68),"blocked today",FR14)
+        else:
+            txt(d,(x+20,y+68),"dns today",FR14)
+
+    # Footer
+    line(d,(28,955,730,955),2)
+    txt(d,(54,985),f"Updated {now.strftime('%H:%M')}",FR16)
+    txt(d,(292,985),f"Pressure {pressure} hPa",FR16)
+    txt(d,(548,985),f"Clients {ph['clients']}",FR16)
+
+    img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+    img.save(OUT)
+    print(f"Saved: {OUT}")
+
+if __name__ == "__main__":
+    generate()

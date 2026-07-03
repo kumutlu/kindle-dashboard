@@ -2,68 +2,100 @@
 
 Transform an old Kindle Paperwhite into a remotely managed e-ink smart display.
 
+## Overview
+
+Kindle Dashboard is a self-hosted dashboard platform designed for jailbroken Kindle Paperwhite devices.
+
+The project runs on an Ubuntu server, generates optimized e-ink dashboard images, and remotely manages the Kindle through SSH.
+
+The goal is to give old Kindle devices a second life as always-on smart displays.
+
+---
+
 ## Features
 
 ### Dashboard Themes
+
+Available themes:
 
 - Home Dashboard
 - Minimal Weather
 - Server Monitor
 - Travel Weather
-- Upcoming: Maarif Calendar
+
+Planned themes:
+
+- Maarif Calendar
+- Photo Gallery
+- Health Dashboard
+- Shopping List
+
+---
 
 ### Remote Management
 
-Manage the Kindle from any browser:
+Manage your Kindle from any browser.
+
+Features include:
 
 - Theme selection
-- Weather location settings
+- Location configuration
 - Display toggles
 - Dashboard refresh
-- Push updates
+- Push to Kindle
 - Autostart controls
 - Front light controls
 - Kindle restart
+- System logs
 
-### System Monitoring
+---
 
+### Monitoring
+
+Built-in dashboard widgets include:
+
+- Current weather
 - Weather forecast
 - Server statistics
 - Pi-hole statistics
 - Tailscale status
 - Network information
 
+---
+
 ### Mobile Friendly
 
-Responsive web interface accessible from:
+The settings interface works on:
 
 - Desktop
 - Tablet
 - Mobile
-- Tailscale remote connection
+
+Remote access is supported through Tailscale.
+
+---
 
 ## Architecture
 
 Ubuntu Server
+
 ↓
+
 Dashboard Generator
+
 ↓
+
 Flask Settings UI
+
 ↓
+
 SSH Connection
+
 ↓
+
 Kindle Paperwhite
 
-## Roadmap
-
-### Planned
-
-- Maarif Calendar Theme
-- Theme Playlist Engine
-- Photo Gallery Mode
-- Health Dashboard
-- Shopping List Dashboard
-- Additional Plugins
+---
 
 ## Hardware
 
@@ -71,6 +103,21 @@ Tested on:
 
 - Kindle Paperwhite 1 (PW1)
 - Ubuntu Linux
+
+---
+
+## Roadmap
+
+### Planned Features
+
+- Maarif Calendar Theme
+- Theme Playlist Engine
+- Photo Gallery Mode
+- Additional Dashboard Plugins
+- Live Dashboard Preview
+- City Search with Geocoding
+
+---
 
 ## License
 

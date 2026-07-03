@@ -97,6 +97,7 @@ class SettingsServerTests(unittest.TestCase):
         self.regeneration_calls = 0
         self.fail_regeneration = False
         self.device_calls = []
+        self.settings_restart_calls = 0
 
         class FakeDevice:
             def run_action(inner_self, action):
@@ -144,12 +145,16 @@ class SettingsServerTests(unittest.TestCase):
             if self.fail_regeneration:
                 raise RuntimeError("controlled regeneration failure")
 
+        def restart_settings():
+            self.settings_restart_calls += 1
+
         self.server = settings_server.make_server(
             host="127.0.0.1",
             port=0,
             config_path=self.config_path,
             regenerate=regenerate,
             device=self.device,
+            restart_settings=restart_settings,
         )
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -395,6 +400,53 @@ class SettingsServerTests(unittest.TestCase):
             headers={"X-CSRF-Token": csrf},
         )
         self.assertEqual(status, 404)
+
+    def test_maintenance_restart_endpoint_requires_csrf(self):
+        status, _, _ = self.request(
+            "POST",
+            "/api/maintenance/restart-settings",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(self.settings_restart_calls, 0)
+
+    def test_maintenance_restart_endpoint_is_registered(self):
+        csrf = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/maintenance/restart-settings",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 202, body)
+        self.assertEqual(self.settings_restart_calls, 1)
+        self.assertEqual(json.loads(body)["ok"], True)
+
+    def test_unknown_maintenance_action_is_404(self):
+        csrf = self.csrf_token()
+        status, _, _ = self.request(
+            "POST",
+            "/api/maintenance/anything",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 404)
+
+    def test_maintenance_ui_contains_restart_flow(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertIn('id="maintenance"', text)
+        self.assertIn("Advanced / Maintenance", text)
+        self.assertIn('id="restart-settings-server"', text)
+        self.assertIn(
+            "Restarting the settings server will make this page "
+            "unavailable for a few seconds. Continue?",
+            text,
+        )
+        self.assertIn("Restarting settings server...", text)
+        self.assertIn("Settings server restarted successfully.", text)
+        self.assertIn(
+            "Server is still restarting. Please refresh manually or check SSH.",
+            text,
+        )
+        self.assertIn("/api/maintenance/restart-settings", text)
 
     def test_future_prayer_location_controls_are_safe_and_disabled(self):
         _, _, body = self.request("GET", "/settings")

@@ -142,6 +142,16 @@ def regenerate_dashboard():
         raise RuntimeError("dashboard regeneration failed")
 
 
+def terminate_settings_process():
+    os._exit(1)
+
+
+def schedule_settings_restart():
+    timer = threading.Timer(0.35, terminate_settings_process)
+    timer.daemon = True
+    timer.start()
+
+
 def update_config(config_path, candidate, regenerate):
     config_path = Path(config_path)
     previous_exists = config_path.exists()
@@ -298,6 +308,11 @@ button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allo
 .device-message{{min-height:44px;margin:12px 0!important;padding:11px 12px;border-radius:12px;background:var(--soft)}}
 .light-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}}
 .log-box{{max-height:240px;overflow:auto;margin:12px 0 0;padding:12px;border-radius:12px;background:#171717;color:#f2f2f2;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}}
+.maintenance{{opacity:.78;background:#fafafa}}
+.maintenance details summary{{min-height:44px;display:flex;align-items:center;font-weight:700;cursor:pointer}}
+.maintenance details[open] summary{{margin-bottom:10px}}
+.maintenance button{{border-color:#999;color:#444}}
+.maintenance-message{{min-height:24px;color:var(--muted);font-size:.9rem}}
 .status-list{{display:grid;gap:10px;margin:0}}
 .status-row{{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid #ecece8}}
 .status-row:last-child{{border-bottom:0}}
@@ -398,6 +413,14 @@ button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allo
 <div class="status-row"><dt>Last generation</dt><dd>{html.escape(status_message or 'No result in this session')}</dd></div>
 <div class="status-row"><dt>Last push</dt><dd id="last-push">Not in this session</dd></div>
 </dl>
+</section>
+<section class="card maintenance" id="maintenance">
+<details>
+<summary>Advanced / Maintenance</summary>
+<p class="section-note">Occasional server maintenance actions.</p>
+<button type="button" id="restart-settings-server">Restart Settings Server</button>
+<p class="maintenance-message" id="maintenance-message" role="status"></p>
+</details>
 </section>
 </div>
 <div class="action-bar">
@@ -530,13 +553,42 @@ document.getElementById("restart-kindle").addEventListener("click",event=>{{
   if(confirmation!=="RESTART"){{deviceMessage.textContent="Restart cancelled";return;}}
   runDeviceAction(event.currentTarget,"/api/device/restart",{{confirm:confirmation}}).catch(()=>{{}});
 }});
+document.getElementById("restart-settings-server").addEventListener("click",async event=>{{
+  const confirmed=window.confirm("Restarting the settings server will make this page unavailable for a few seconds. Continue?");
+  if(!confirmed) return;
+  const button=event.currentTarget;
+  const maintenanceMessage=document.getElementById("maintenance-message");
+  button.disabled=true;
+  maintenanceMessage.textContent="Restarting settings server...";
+  const started=Date.now();
+  try{{
+    await deviceApi("/api/maintenance/restart-settings",{{method:"POST"}});
+  }}catch(error){{}}
+  async function retrySettings(){{
+    try{{
+      const response=await fetch("/settings",{{cache:"no-store"}});
+      if(response.ok){{
+        const successMessage="Settings server restarted successfully.";
+        window.location.href=`/settings?status=${{encodeURIComponent(successMessage)}}`;
+        return;
+      }}
+    }}catch(error){{}}
+    if(Date.now()-started>=20000){{
+      maintenanceMessage.textContent="Server is still restarting. Please refresh manually or check SSH.";
+      button.disabled=false;
+      return;
+    }}
+    setTimeout(retrySettings,2000);
+  }}
+  setTimeout(retrySettings,5000);
+}});
 loadDeviceState();
 </script>
 </body>
 </html>"""
 
 
-def make_handler(config_path, regenerate, device):
+def make_handler(config_path, regenerate, device, restart_settings):
     config_path = Path(config_path)
     csrf_token = secrets.token_urlsafe(32)
     update_lock = threading.Lock()
@@ -620,6 +672,12 @@ def make_handler(config_path, regenerate, device):
             if parsed.path == "/settings":
                 self.handle_form_post()
                 return
+            if parsed.path.startswith("/api/maintenance/"):
+                if parsed.path != "/api/maintenance/restart-settings":
+                    self.send_bytes(404, b"", "text/plain")
+                    return
+                self.handle_maintenance_restart()
+                return
             if parsed.path.startswith("/api/device/"):
                 known_paths = {
                     "/api/device/start-dashboard",
@@ -637,6 +695,28 @@ def make_handler(config_path, regenerate, device):
                 self.handle_device_post(parsed.path)
                 return
             self.send_bytes(404, b"", "text/plain")
+
+        def handle_maintenance_restart(self):
+            if not self.device_csrf_valid():
+                self.send_json(
+                    403,
+                    {"ok": False, "error": "invalid request token"},
+                )
+                return
+            try:
+                restart_settings()
+                self.send_json(
+                    202,
+                    {
+                        "ok": True,
+                        "message": "Restarting settings server...",
+                    },
+                )
+            except Exception:
+                self.send_json(
+                    500,
+                    {"ok": False, "error": "Settings restart failed"},
+                )
 
         def handle_device_get(self, path):
             try:
@@ -764,12 +844,13 @@ def make_handler(config_path, regenerate, device):
 
 
 def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
-                regenerate=regenerate_dashboard, device=None):
+                regenerate=regenerate_dashboard, device=None,
+                restart_settings=schedule_settings_restart):
     if device is None:
         device = KindleDevice()
     return ThreadingHTTPServer(
         (host, port),
-        make_handler(config_path, regenerate, device),
+        make_handler(config_path, regenerate, device, restart_settings),
     )
 
 

@@ -7,6 +7,7 @@ import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlencode
 
 import settings_server
 import weather_image
@@ -36,6 +37,24 @@ class ConfigTests(unittest.TestCase):
         config["secret"] = "not allowed"
         with self.assertRaises(ValueError):
             weather_image.validate_config(config)
+
+    def test_legacy_config_is_upgraded_with_optional_location_fields(self):
+        legacy = {
+            key: value
+            for key, value in weather_image.DEFAULT_CONFIG.items()
+            if key not in {
+                "location",
+                "country",
+                "latitude",
+                "longitude",
+                "location_display",
+            }
+        }
+        upgraded = weather_image.validate_config(legacy)
+        self.assertEqual(upgraded["location"], legacy["weather_query"])
+        self.assertEqual(upgraded["location_display"], legacy["location_label"])
+        self.assertIsNone(upgraded["latitude"])
+        self.assertIsNone(upgraded["longitude"])
 
 
 class PiholeSessionTests(unittest.TestCase):
@@ -98,6 +117,17 @@ class SettingsServerTests(unittest.TestCase):
         self.fail_regeneration = False
         self.device_calls = []
         self.settings_restart_calls = 0
+        self.geocode_queries = []
+        self.geocode_failure = False
+        self.geocode_results = [{
+            "city": "Nottingham",
+            "region": "England",
+            "country": "United Kingdom",
+            "latitude": 52.9536,
+            "longitude": -1.1505,
+            "timezone": "Europe/London",
+            "display_name": "Nottingham, England, United Kingdom",
+        }]
 
         class FakeDevice:
             def run_action(inner_self, action):
@@ -148,6 +178,12 @@ class SettingsServerTests(unittest.TestCase):
         def restart_settings():
             self.settings_restart_calls += 1
 
+        def geocode(query):
+            self.geocode_queries.append(query)
+            if self.geocode_failure:
+                raise RuntimeError("controlled geocoding failure")
+            return self.geocode_results
+
         self.server = settings_server.make_server(
             host="127.0.0.1",
             port=0,
@@ -155,6 +191,7 @@ class SettingsServerTests(unittest.TestCase):
             regenerate=regenerate,
             device=self.device,
             restart_settings=restart_settings,
+            geocode=geocode,
         )
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -299,28 +336,110 @@ class SettingsServerTests(unittest.TestCase):
                 text,
             )
 
-    def test_location_card_has_city_country_timezone_and_advanced_fields(self):
+    def test_location_card_uses_city_search_with_advanced_fallback(self):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")
-        self.assertIn('id="country"', text)
         self.assertIn('id="city-search"', text)
+        self.assertIn('id="city-results"', text)
         self.assertIn('id="city-match"', text)
-        self.assertIn('id="timezone-select"', text)
         self.assertIn('<details class="advanced">', text)
+        self.assertIn("Advanced location settings", text)
         self.assertIn('name="weather_query"', text)
         self.assertIn('name="location_label"', text)
         self.assertIn('name="timezone"', text)
-        for city in (
-            "Nottingham", "Leicester", "London", "Birmingham",
-            "Manchester", "Oxford", "Reading", "Lincoln", "Istanbul",
-            "Ankara", "Izmir", "Antalya", "Amsterdam",
+        for name in (
+            "location", "country", "latitude", "longitude",
+            "location_display",
         ):
-            self.assertIn(city, text)
-        for timezone in (
-            "Europe/London", "Europe/Istanbul", "Europe/Amsterdam",
-            "Europe/Berlin", "Europe/Paris", "UTC",
-        ):
-            self.assertIn(timezone, text)
+            self.assertIn(f'name="{name}"', text)
+        self.assertNotIn('<select id="country"', text)
+        self.assertNotIn('id="timezone-select"', text)
+
+    def test_geocode_endpoint_requires_query(self):
+        for path in ("/api/geocode", "/api/geocode?q="):
+            status, _, body = self.request("GET", path)
+            self.assertEqual(status, 400)
+            self.assertFalse(json.loads(body)["ok"])
+
+    def test_geocode_endpoint_returns_normalized_results(self):
+        status, _, body = self.request(
+            "GET",
+            "/api/geocode?q=Nottingham",
+        )
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.geocode_queries, ["Nottingham"])
+        self.assertEqual(payload["results"], self.geocode_results)
+        self.assertNotIn("raw", payload)
+
+    def test_geocode_endpoint_handles_no_results_and_api_failure(self):
+        self.geocode_results = []
+        status, _, body = self.request("GET", "/api/geocode?q=Nowhere")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["results"], [])
+
+        self.geocode_failure = True
+        status, _, body = self.request("GET", "/api/geocode?q=Istanbul")
+        self.assertEqual(status, 502)
+        self.assertEqual(
+            json.loads(body)["error"],
+            "Location search is temporarily unavailable",
+        )
+
+    def test_selected_city_saves_coordinate_config(self):
+        selected = dict(weather_image.DEFAULT_CONFIG)
+        selected.update({
+            "title": "NOTTINGHAM HOME",
+            "location": "Nottingham",
+            "country": "United Kingdom",
+            "latitude": 52.9536,
+            "longitude": -1.1505,
+            "timezone": "Europe/London",
+            "location_display": "Nottingham, England, United Kingdom",
+            "weather_query": "Nottingham",
+            "location_label": "Nottingham, England, United Kingdom",
+        })
+        status, _, body = self.request(
+            "POST",
+            "/api/config",
+            body=json.dumps(selected),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, body)
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["latitude"], 52.9536)
+        self.assertEqual(saved["longitude"], -1.1505)
+        self.assertEqual(saved["location_display"], selected["location_display"])
+
+    def test_legacy_settings_form_save_still_works(self):
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "title": "LONDON DASHBOARD",
+            "location_label": "London, UK",
+            "weather_query": "London",
+            "timezone": "Europe/London",
+            "theme": "home_dashboard",
+            "show_weather": "on",
+            "show_forecast": "on",
+            "show_server": "on",
+            "show_pihole": "on",
+            "show_tailscale": "on",
+        }
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/settings?status=saved")
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["weather_query"], "London")
+        self.assertIsNone(saved["latitude"])
+        self.assertEqual(self.regeneration_calls, 1)
 
     def test_sticky_action_bar_and_push_are_present(self):
         _, _, body = self.request("GET", "/settings")

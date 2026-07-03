@@ -34,6 +34,33 @@ OPEN_METEO_SAMPLE = {
     },
 }
 
+GEOCODING_SAMPLE = {
+    "results": [
+        {
+            "id": 2641170,
+            "name": "Nottingham",
+            "latitude": 52.9536,
+            "longitude": -1.1505,
+            "elevation": 46,
+            "feature_code": "PPLA2",
+            "country_code": "GB",
+            "admin1": "England",
+            "country": "United Kingdom",
+            "timezone": "Europe/London",
+            "population": 323632,
+        },
+        {
+            "id": 741098,
+            "name": "İstanbul",
+            "latitude": 41.0138,
+            "longitude": 28.9497,
+            "admin1": "Istanbul",
+            "country": "Türkiye",
+            "timezone": "Europe/Istanbul",
+        },
+    ]
+}
+
 
 class OpenMeteoConversionTests(unittest.TestCase):
     def test_weather_code_mapping(self):
@@ -107,6 +134,43 @@ class OpenMeteoConversionTests(unittest.TestCase):
 
         self.assertIs(result, fallback)
         wttr.assert_called_once_with("Nottingham")
+
+    def test_geocoding_results_are_normalized_without_raw_fields(self):
+        with mock.patch(
+            "weather_image.http_json",
+            return_value=GEOCODING_SAMPLE,
+        ):
+            results = weather_image.geocode_locations("Nottingham")
+
+        self.assertEqual(results[0], {
+            "city": "Nottingham",
+            "region": "England",
+            "country": "United Kingdom",
+            "latitude": 52.9536,
+            "longitude": -1.1505,
+            "timezone": "Europe/London",
+            "display_name": "Nottingham, England, United Kingdom",
+        })
+        self.assertEqual(results[1]["city"], "İstanbul")
+        self.assertNotIn("population", results[0])
+        self.assertNotIn("id", results[0])
+
+    def test_coordinate_weather_fetch_skips_geocoding(self):
+        with mock.patch(
+            "weather_image.http_json",
+            return_value=OPEN_METEO_SAMPLE,
+        ) as http_json:
+            weather_image.fetch_open_meteo(
+                "Nottingham",
+                "Europe/London",
+                latitude=52.9536,
+                longitude=-1.1505,
+            )
+
+        self.assertEqual(http_json.call_count, 1)
+        url = http_json.call_args.args[0]
+        self.assertIn("latitude=52.9536", url)
+        self.assertIn("longitude=-1.1505", url)
 
 
 if __name__ == "__main__":

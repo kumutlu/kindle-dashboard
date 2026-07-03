@@ -13,7 +13,12 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 from dashboard_themes import THEMES
 from kindle_device import DeviceError, KindleDevice
-from weather_image import DEFAULT_CONFIG, load_config, validate_config
+from weather_image import (
+    DEFAULT_CONFIG,
+    geocode_locations,
+    load_config,
+    validate_config,
+)
 
 
 BIND_HOST = "0.0.0.0"
@@ -172,6 +177,12 @@ def update_config(config_path, candidate, regenerate):
 def render_settings(config, csrf_token, status_message=""):
     escaped = {key: html.escape(str(value), quote=True)
                for key, value in config.items()}
+    latitude_value = (
+        "" if config["latitude"] is None else str(config["latitude"])
+    )
+    longitude_value = (
+        "" if config["longitude"] is None else str(config["longitude"])
+    )
 
     def checked(key):
         return " checked" if config[key] else ""
@@ -181,44 +192,6 @@ def render_settings(config, csrf_token, status_message=""):
         f"{html.escape(name)}</button>"
         for name in PRESETS
     )
-    cities = [
-        {
-            "city": city,
-            "country": country,
-            "location_label": label,
-            "weather_query": city,
-            "timezone": timezone,
-            "title": title,
-        }
-        for city, country, label, timezone, title in CITY_DATA
-    ]
-    city_json = json.dumps(cities, ensure_ascii=False).replace("<", "\\u003c")
-    city_options = "".join(
-        f'<option value="{html.escape(city, quote=True)}"></option>'
-        for city, _, _, _, _ in CITY_DATA
-    )
-    if config["timezone"] == "Europe/Istanbul":
-        current_country = "Türkiye"
-    elif config["timezone"] == "Europe/Amsterdam":
-        current_country = "Netherlands"
-    else:
-        current_country = "United Kingdom"
-    country_options = "".join(
-        f'<option value="{html.escape(country, quote=True)}"'
-        f'{" selected" if country == current_country else ""}>'
-        f"{html.escape(country)}</option>"
-        for country in ("United Kingdom", "Türkiye", "Netherlands", "Other")
-    )
-    timezone_options = "".join(
-        f'<option value="{html.escape(timezone, quote=True)}"'
-        f'{" selected" if timezone == config["timezone"] else ""}>'
-        f"{html.escape(timezone)}</option>"
-        for timezone in COMMON_TIMEZONES
-    )
-    if config["timezone"] not in COMMON_TIMEZONES:
-        timezone_options += '<option value="custom" selected>Custom timezone…</option>'
-    else:
-        timezone_options += '<option value="custom">Custom timezone…</option>'
     theme_cards = "".join(
         f'<label class="theme-choice{" disabled" if not definition["implemented"] else ""}">'
         f'<input type="radio" name="theme" value="{html.escape(theme, quote=True)}"'
@@ -275,7 +248,7 @@ body{{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-a
 .card p{{margin:8px 0}}
 .field{{display:block;margin:14px 0}}
 .field span{{display:block;margin-bottom:6px;font-weight:700}}
-input[type=text],input[type=search],select{{width:100%;min-height:48px;padding:11px 12px;border:1px solid #aeb4ba;border-radius:12px;background:#fff;color:#111;font:inherit}}
+input[type=text],input[type=search],input[type=number],select{{width:100%;min-height:48px;padding:11px 12px;border:1px solid #aeb4ba;border-radius:12px;background:#fff;color:#111;font:inherit}}
 input:focus,select:focus{{outline:3px solid rgba(17,17,17,.12);border-color:#333}}
 .button-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}
 button{{min-height:48px;padding:10px 12px;border:1px solid #555;border-radius:12px;background:#fff;color:#111;font:700 .95rem system-ui;touch-action:manipulation}}
@@ -283,8 +256,11 @@ button:active:not(:disabled){{transform:translateY(1px)}}
 button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allowed}}
 .preset-grid{{display:flex;flex-wrap:wrap;gap:8px;margin:0 -2px 16px;padding:2px}}
 .preset{{flex:0 0 auto;min-height:42px;padding:7px 14px;border-radius:999px}}
-.location-grid{{display:grid;grid-template-columns:1fr;gap:0}}
 .match{{margin:-4px 0 8px;padding:11px 12px;border-radius:12px;background:var(--soft);color:var(--muted);font-size:.9rem}}
+.city-results{{display:grid;gap:8px;margin:0 0 14px}}
+.city-result{{display:grid;gap:3px;width:100%;min-height:58px;text-align:left;padding:10px 12px;border-color:var(--line)}}
+.city-result strong{{font-size:.95rem}}.city-result small{{color:var(--muted);font-weight:500}}
+.search-state{{padding:10px 12px;color:var(--muted);background:var(--soft);border-radius:12px}}
 .toggle-list{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}
 .toggle{{display:flex;align-items:center;gap:9px;min-height:50px;margin:0;padding:9px 10px;border:1px solid var(--line);border-radius:12px;font-weight:650;cursor:pointer}}
 .toggle input{{width:24px;height:24px;margin:0;accent-color:#111;flex:0 0 auto}}
@@ -327,7 +303,7 @@ button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allo
   .shell{{padding:34px 24px 170px}}
   .grid{{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}}
   .card.location{{grid-column:1/-1}}
-  .location-grid{{grid-template-columns:1fr 1fr;column-gap:18px}}
+  .city-results{{grid-template-columns:1fr 1fr}}
   .button-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}
   .action-bar{{left:50%;right:auto;bottom:86px;width:min(620px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:8px;box-shadow:0 8px 30px rgba(0,0,0,.13)}}
   .bottom-nav{{left:50%;right:auto;bottom:16px;width:min(560px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:6px;box-shadow:0 6px 24px rgba(0,0,0,.12)}}
@@ -346,26 +322,28 @@ button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allo
 <div class="grid">
 <section class="card location" id="location">
 <h2>Location</h2>
-<p class="section-note">Search locally or use a quick preset. Custom cities are always allowed.</p>
+<p class="section-note">Search for a city, then select the correct result.</p>
 <div class="preset-grid">{preset_buttons}</div>
-<div class="location-grid">
-<label class="field"><span>Country</span><select id="country">{country_options}</select></label>
-<label class="field"><span>City search</span><input type="search" id="city-search" list="city-list" value="{escaped['weather_query']}" placeholder="Type any city" autocomplete="off"><datalist id="city-list">{city_options}</datalist></label>
-</div>
-<div class="match" id="city-match">Matched location: {escaped['location_label']} · {escaped['timezone']}</div>
-<label class="field"><span>Dashboard title</span><input type="text" name="title" maxlength="28" value="{escaped['title']}" required></label>
-<label class="field"><span>Timezone</span><select id="timezone-select">{timezone_options}</select></label>
+<label class="field"><span>Search city</span><input type="search" id="city-search" value="{escaped['location']}" placeholder="Nottingham, Istanbul, London…" autocomplete="off"></label>
+<div class="city-results" id="city-results" aria-live="polite"></div>
+<div class="match" id="city-match">Selected: {escaped['location_display']} · {escaped['timezone']}</div>
 <details class="advanced">
-<summary>Advanced location fields</summary>
+<summary>Advanced location settings</summary>
+<label class="field"><span>Dashboard title</span><input type="text" name="title" maxlength="28" value="{escaped['title']}" required></label>
+<label class="field"><span>City</span><input type="text" name="location" maxlength="100" value="{escaped['location']}" required></label>
+<label class="field"><span>Country</span><input type="text" name="country" maxlength="100" value="{escaped['country']}"></label>
+<label class="field"><span>Latitude</span><input type="number" name="latitude" step="any" min="-90" max="90" value="{html.escape(latitude_value, quote=True)}"></label>
+<label class="field"><span>Longitude</span><input type="number" name="longitude" step="any" min="-180" max="180" value="{html.escape(longitude_value, quote=True)}"></label>
+<label class="field"><span>Display name</span><input type="text" name="location_display" maxlength="160" value="{escaped['location_display']}" required></label>
 <label class="field"><span>Weather query</span><input type="text" name="weather_query" maxlength="100" value="{escaped['weather_query']}" required></label>
-<label class="field"><span>Location label</span><input type="text" name="location_label" maxlength="80" value="{escaped['location_label']}" required></label>
-<label class="field"><span>Custom timezone</span><input type="text" name="timezone" id="timezone-custom" maxlength="64" value="{escaped['timezone']}" required></label>
+<label class="field"><span>Location label</span><input type="text" name="location_label" maxlength="160" value="{escaped['location_label']}" required></label>
+<label class="field"><span>Timezone</span><input type="text" name="timezone" maxlength="64" value="{escaped['timezone']}" required></label>
 <div class="future-box">
 <h3>Prayer location · future</h3>
 <p>Prepared for Maarif Calendar. These fields are not stored yet.</p>
 <label class="toggle"><input type="checkbox" id="same-prayer-location" checked disabled><span>Use weather location</span></label>
 <label class="field"><span>Prayer location</span><input type="text" id="prayer-location" disabled value="{escaped['weather_query']}"></label>
-<label class="field"><span>Prayer country</span><input type="text" id="prayer-country" disabled value="{html.escape(current_country, quote=True)}"></label>
+<label class="field"><span>Prayer country</span><input type="text" id="prayer-country" disabled value="{escaped['country']}"></label>
 </div>
 </details>
 </section>
@@ -436,55 +414,93 @@ button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allo
 <a href="#status">Status</a>
 </nav>
 <script>
-const cities={city_json};
 const citySearch=document.getElementById("city-search");
-const country=document.getElementById("country");
-const timezoneSelect=document.getElementById("timezone-select");
-const timezoneCustom=document.getElementById("timezone-custom");
+const cityResults=document.getElementById("city-results");
 const cityMatch=document.getElementById("city-match");
-const advanced=document.querySelector("details.advanced");
 const prayerLocation=document.getElementById("prayer-location");
 const prayerCountry=document.getElementById("prayer-country");
-const byName=name=>cities.find(city=>city.city.toLowerCase()===name.trim().toLowerCase());
-function updateMatch(city){{
-  cityMatch.textContent=`Matched location: ${{city.location_label}} · ${{city.timezone}}`;
+let citySearchTimer;
+let citySearchController;
+function setLocationField(name,value){{
+  document.querySelector(`[name="${{name}}"]`).value=value;
 }}
-function applyCity(city){{
-  citySearch.value=city.city;
-  country.value=city.country;
-  document.querySelector('[name="title"]').value=city.title;
-  document.querySelector('[name="weather_query"]').value=city.weather_query;
-  document.querySelector('[name="location_label"]').value=city.location_label;
-  timezoneCustom.value=city.timezone;
-  timezoneSelect.value=city.timezone;
-  prayerLocation.value=city.weather_query;
-  prayerCountry.value=city.country;
-  updateMatch(city);
+function selectCity(result){{
+  citySearch.value=result.city;
+  setLocationField("location",result.city);
+  setLocationField("country",result.country);
+  setLocationField("latitude",result.latitude);
+  setLocationField("longitude",result.longitude);
+  setLocationField("location_display",result.display_name);
+  setLocationField("weather_query",result.city);
+  setLocationField("location_label",result.display_name);
+  setLocationField("timezone",result.timezone);
+  setLocationField(
+    "title",
+    result.city.toLowerCase()==="nottingham"
+      ?"NOTTINGHAM HOME"
+      :`${{result.city.toUpperCase()}} DASHBOARD`.slice(0,28),
+  );
+  prayerLocation.value=result.city;
+  prayerCountry.value=result.country;
+  cityMatch.textContent=`Selected: ${{result.display_name}} · ${{result.timezone}}`;
+  cityResults.replaceChildren();
 }}
-function applyCustomCity(){{
-  const value=citySearch.value.trim();
-  if(!value) return;
-  const match=byName(value);
-  if(match){{applyCity(match);return;}}
-  const suffix=country.value==="United Kingdom"?"UK":country.value;
-  document.querySelector('[name="weather_query"]').value=value;
-  document.querySelector('[name="location_label"]').value=`${{value}}, ${{suffix}}`;
-  document.querySelector('[name="title"]').value=`${{value.toUpperCase()}} DASHBOARD`.slice(0,28);
-  prayerLocation.value=value;
-  prayerCountry.value=country.value;
-  cityMatch.textContent=`Custom city: ${{value}} · ${{timezoneCustom.value}}`;
+function renderCityResults(results){{
+  cityResults.replaceChildren();
+  if(!results.length){{
+    const empty=document.createElement("div");
+    empty.className="search-state";
+    empty.textContent="No matching cities found. Use Advanced location settings for manual entry.";
+    cityResults.append(empty);
+    return;
+  }}
+  results.forEach(result=>{{
+    const button=document.createElement("button");
+    button.type="button";
+    button.className="city-result";
+    const name=document.createElement("strong");
+    name.textContent=result.display_name;
+    const coordinates=document.createElement("small");
+    coordinates.textContent=`${{result.latitude.toFixed(4)}}, ${{result.longitude.toFixed(4)}} · ${{result.timezone}}`;
+    button.append(name,coordinates);
+    button.addEventListener("click",()=>selectCity(result));
+    cityResults.append(button);
+  }});
 }}
-document.querySelectorAll("[data-preset]").forEach(button=>button.addEventListener("click",()=>applyCity(byName(button.dataset.preset))));
-citySearch.addEventListener("change",applyCustomCity);
-timezoneSelect.addEventListener("change",()=>{{
-  if(timezoneSelect.value==="custom"){{advanced.open=true;timezoneCustom.focus();return;}}
-  timezoneCustom.value=timezoneSelect.value;
-  cityMatch.textContent=`Location: ${{document.querySelector('[name="location_label"]').value}} · ${{timezoneCustom.value}}`;
+async function searchCities(query){{
+  query=query.trim();
+  if(!query){{
+    cityResults.replaceChildren();
+    return;
+  }}
+  if(citySearchController) citySearchController.abort();
+  citySearchController=new AbortController();
+  cityResults.innerHTML='<div class="search-state">Searching…</div>';
+  try{{
+    const response=await fetch(`/api/geocode?q=${{encodeURIComponent(query)}}`,{{
+      signal:citySearchController.signal,
+      cache:"no-store",
+    }});
+    const data=await response.json();
+    if(!response.ok) throw new Error(data.error||"Location search failed");
+    renderCityResults(data.results);
+  }}catch(error){{
+    if(error.name==="AbortError") return;
+    cityResults.innerHTML="";
+    const failure=document.createElement("div");
+    failure.className="search-state";
+    failure.textContent=error.message;
+    cityResults.append(failure);
+  }}
+}}
+citySearch.addEventListener("input",()=>{{
+  clearTimeout(citySearchTimer);
+  citySearchTimer=setTimeout(()=>searchCities(citySearch.value),350);
 }});
-timezoneCustom.addEventListener("input",()=>{{
-  const common=[...timezoneSelect.options].some(option=>option.value===timezoneCustom.value);
-  timezoneSelect.value=common?timezoneCustom.value:"custom";
-}});
+document.querySelectorAll("[data-preset]").forEach(button=>button.addEventListener("click",()=>{{
+  citySearch.value=button.dataset.preset;
+  searchCities(button.dataset.preset);
+}}));
 const csrfToken=document.querySelector('[name="csrf_token"]').value;
 const deviceMessage=document.getElementById("device-message");
 const connectionValue=document.getElementById("kindle-connection");
@@ -588,7 +604,7 @@ loadDeviceState();
 </html>"""
 
 
-def make_handler(config_path, regenerate, device, restart_settings):
+def make_handler(config_path, regenerate, device, restart_settings, geocode):
     config_path = Path(config_path)
     csrf_token = secrets.token_urlsafe(32)
     update_lock = threading.Lock()
@@ -644,6 +660,37 @@ def make_handler(config_path, regenerate, device, restart_settings):
                 return
             if parsed.path == "/api/config":
                 self.send_json(200, load_config(config_path))
+                return
+            if parsed.path == "/api/geocode":
+                query = parse_qs(
+                    parsed.query,
+                    keep_blank_values=True,
+                ).get("q", [""])[0].strip()
+                if not query:
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "city query is required"},
+                    )
+                    return
+                if len(query) > 100:
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "city query is too long"},
+                    )
+                    return
+                try:
+                    self.send_json(
+                        200,
+                        {"ok": True, "results": geocode(query)},
+                    )
+                except Exception:
+                    self.send_json(
+                        502,
+                        {
+                            "ok": False,
+                            "error": "Location search is temporarily unavailable",
+                        },
+                    )
                 return
             if parsed.path in (
                 "/api/device/status",
@@ -823,6 +870,29 @@ def make_handler(config_path, regenerate, device, restart_settings):
                     for key in ("title", "location_label", "weather_query",
                                 "timezone", "theme")
                 }
+                candidate.update({
+                    "location": form.get(
+                        "location",
+                        [candidate["weather_query"]],
+                    )[0],
+                    "country": form.get("country", [""])[0],
+                    "location_display": form.get(
+                        "location_display",
+                        [candidate["location_label"]],
+                    )[0],
+                })
+                latitude = form.get("latitude", [""])[0].strip()
+                longitude = form.get("longitude", [""])[0].strip()
+                if latitude or longitude:
+                    if not latitude or not longitude:
+                        raise ValueError(
+                            "latitude and longitude must be provided together"
+                        )
+                    candidate["latitude"] = float(latitude)
+                    candidate["longitude"] = float(longitude)
+                else:
+                    candidate["latitude"] = None
+                    candidate["longitude"] = None
                 for key in ("show_weather", "show_forecast", "show_server",
                             "show_pihole", "show_tailscale"):
                     candidate[key] = key in form
@@ -845,12 +915,19 @@ def make_handler(config_path, regenerate, device, restart_settings):
 
 def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
                 regenerate=regenerate_dashboard, device=None,
-                restart_settings=schedule_settings_restart):
+                restart_settings=schedule_settings_restart,
+                geocode=geocode_locations):
     if device is None:
         device = KindleDevice()
     return ThreadingHTTPServer(
         (host, port),
-        make_handler(config_path, regenerate, device, restart_settings),
+        make_handler(
+            config_path,
+            regenerate,
+            device,
+            restart_settings,
+            geocode,
+        ),
     )
 
 

@@ -29,6 +29,11 @@ FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 DEFAULT_CONFIG = {
     "title": "NOTTINGHAM HOME",
+    "location": "Nottingham",
+    "country": "United Kingdom",
+    "latitude": 52.9536,
+    "longitude": -1.1505,
+    "location_display": "Nottingham, England, United Kingdom",
     "location_label": "Nottingham, UK",
     "weather_query": "Nottingham",
     "timezone": "Europe/London",
@@ -42,10 +47,20 @@ DEFAULT_CONFIG = {
 
 STRING_LIMITS = {
     "title": 28,
-    "location_label": 80,
+    "location": 100,
+    "country": 100,
+    "location_display": 160,
+    "location_label": 160,
     "weather_query": 100,
     "timezone": 64,
     "theme": 40,
+}
+OPTIONAL_LOCATION_FIELDS = {
+    "location",
+    "country",
+    "latitude",
+    "longitude",
+    "location_display",
 }
 BOOLEAN_FIELDS = {
     "show_weather",
@@ -59,8 +74,17 @@ BOOLEAN_FIELDS = {
 def validate_config(value):
     if not isinstance(value, dict):
         raise ValueError("configuration must be a JSON object")
-    if set(value) != set(DEFAULT_CONFIG):
+    unknown = set(value) - set(DEFAULT_CONFIG)
+    required = set(DEFAULT_CONFIG) - OPTIONAL_LOCATION_FIELDS
+    if unknown or not required.issubset(value):
         raise ValueError("configuration fields do not match the supported schema")
+
+    value = dict(value)
+    value.setdefault("location", value["weather_query"])
+    value.setdefault("country", "")
+    value.setdefault("latitude", None)
+    value.setdefault("longitude", None)
+    value.setdefault("location_display", value["location_label"])
 
     config = {}
     for key, limit in STRING_LIMITS.items():
@@ -68,9 +92,32 @@ def validate_config(value):
         if not isinstance(item, str):
             raise ValueError(f"{key} must be text")
         item = item.strip()
+        if key == "country" and not item:
+            config[key] = ""
+            continue
         if not item or len(item) > limit:
             raise ValueError(f"{key} must contain 1-{limit} characters")
         config[key] = item
+
+    latitude = value.get("latitude")
+    longitude = value.get("longitude")
+    if (latitude is None) != (longitude is None):
+        raise ValueError("latitude and longitude must be provided together")
+    if latitude is not None:
+        if (
+            isinstance(latitude, bool)
+            or isinstance(longitude, bool)
+            or not isinstance(latitude, (int, float))
+            or not isinstance(longitude, (int, float))
+        ):
+            raise ValueError("latitude and longitude must be numbers")
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError("latitude or longitude is out of range")
+        config["latitude"] = float(latitude)
+        config["longitude"] = float(longitude)
+    else:
+        config["latitude"] = None
+        config["longitude"] = None
 
     validate_theme(config["theme"])
     try:
@@ -250,27 +297,76 @@ def normalize_open_meteo(payload):
     }
 
 
-def fetch_open_meteo(query, timezone):
+def geocode_locations(query, count=8):
+    query = str(query).strip()
+    if not query:
+        raise ValueError("location query is required")
     geocoding_url = (
         f"{OPEN_METEO_GEOCODING}?"
         + urlencode({
             "name": query,
-            "count": 1,
+            "count": max(1, min(int(count), 10)),
             "language": "en",
             "format": "json",
         })
     )
     geocoding = http_json(geocoding_url, timeout=12)
-    results = geocoding.get("results") or []
-    if not results:
-        raise ValueError("location was not found")
-    location = results[0]
+    normalized = []
+    seen = set()
+    for item in geocoding.get("results") or []:
+        try:
+            city = str(item["name"]).strip()
+            country = str(item["country"]).strip()
+            latitude = float(item["latitude"])
+            longitude = float(item["longitude"])
+            timezone = str(item["timezone"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        region = str(
+            item.get("admin1") or item.get("admin2") or ""
+        ).strip()
+        parts = [city]
+        if region and region.casefold() != city.casefold():
+            parts.append(region)
+        if country and country.casefold() not in {
+            part.casefold() for part in parts
+        }:
+            parts.append(country)
+        key = (
+            city.casefold(),
+            region.casefold(),
+            country.casefold(),
+            round(latitude, 5),
+            round(longitude, 5),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "city": city,
+            "region": region,
+            "country": country,
+            "latitude": latitude,
+            "longitude": longitude,
+            "timezone": timezone,
+            "display_name": ", ".join(parts),
+        })
+    return normalized
+
+
+def fetch_open_meteo(query, timezone, latitude=None, longitude=None):
+    if latitude is None or longitude is None:
+        results = geocode_locations(query, count=1)
+        if not results:
+            raise ValueError("location was not found")
+        latitude = results[0]["latitude"]
+        longitude = results[0]["longitude"]
 
     forecast_url = (
         f"{OPEN_METEO_FORECAST}?"
         + urlencode({
-            "latitude": location["latitude"],
-            "longitude": location["longitude"],
+            "latitude": latitude,
+            "longitude": longitude,
             "current": ",".join((
                 "temperature_2m",
                 "apparent_temperature",
@@ -300,9 +396,14 @@ def fetch_wttr(query):
     return http_json(weather_url(query), timeout=20)
 
 
-def fetch_weather(query, timezone):
+def fetch_weather(query, timezone, latitude=None, longitude=None):
     try:
-        weather = fetch_open_meteo(query, timezone)
+        weather = fetch_open_meteo(
+            query,
+            timezone,
+            latitude=latitude,
+            longitude=longitude,
+        )
         provider = "open_meteo"
     except Exception:
         weather = fetch_wttr(query)
@@ -919,7 +1020,12 @@ def main():
 
 
 def collect_dashboard_data(config):
-    weather = fetch_weather(config["weather_query"], config["timezone"])
+    weather = fetch_weather(
+        config["weather_query"],
+        config["timezone"],
+        latitude=config.get("latitude"),
+        longitude=config.get("longitude"),
+    )
     current = weather["current_condition"][0]
     days = weather["weather"]
     now = datetime.now(ZoneInfo(config["timezone"]))

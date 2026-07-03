@@ -19,17 +19,17 @@ PORT = 8765
 
 
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Path'i query'den ayir; ?batt=NN varsa pil degerini kaydet
+    def _serve_image(self, include_body=True):
         raw_path = self.path
         route_path = raw_path.split("?", 1)[0]
-        m = re.search(r"[?&]batt=(\d{1,3})", raw_path)
-        if m:
-            try:
-                with open(BATT_FILE, "w") as f:
-                    f.write(m.group(1))
-            except Exception:
-                pass
+        if include_body:
+            m = re.search(r"[?&]batt=(\d{1,3})", raw_path)
+            if m:
+                try:
+                    with open(BATT_FILE, "w") as f:
+                        f.write(m.group(1))
+                except Exception:
+                    pass
         path = ROUTES.get(route_path)
         if path:
             try:
@@ -39,14 +39,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
-                self.wfile.write(data)
+                if include_body:
+                    self.wfile.write(data)
             except FileNotFoundError:
                 self.send_response(404)
                 self.end_headers()
-                self.wfile.write(b"Image not found")
+                if include_body:
+                    self.wfile.write(b"Image not found")
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_GET(self):
+        self._serve_image(include_body=True)
+
+    def do_HEAD(self):
+        self._serve_image(include_body=False)
 
     def log_message(self, fmt, *args):
         # Log Kindle accesses (for diagnostics)

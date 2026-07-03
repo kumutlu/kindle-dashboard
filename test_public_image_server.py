@@ -34,7 +34,7 @@ class PublicImageServerTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.tempdir.cleanup()
 
-    def request(self, path, token=None):
+    def request(self, path, token=None, method="GET"):
         headers = {}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
@@ -43,7 +43,7 @@ class PublicImageServerTests(unittest.TestCase):
             self.server.server_port,
             timeout=2,
         )
-        connection.request("GET", path, headers=headers)
+        connection.request(method, path, headers=headers)
         response = connection.getresponse()
         body = response.read()
         headers = dict(response.getheaders())
@@ -66,6 +66,14 @@ class PublicImageServerTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "image/png")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(body, self.PNG_BYTES)
+
+    def test_head_request_returns_no_body(self):
+        status, headers, body = self.request("/weather.png", self.TOKEN, method="HEAD")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(headers["Content-Length"], str(len(self.PNG_BYTES)))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(body, b"")
 
     def test_root_returns_404_even_with_token(self):
         status, _, _ = self.request("/", self.TOKEN)

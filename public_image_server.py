@@ -19,7 +19,7 @@ def make_handler(image_path, token):
         server_version = "KindleImage"
         sys_version = ""
 
-        def do_GET(self):
+        def _serve_image(self, include_body=True):
             if urlsplit(self.path).path != "/weather.png":
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
@@ -50,7 +50,14 @@ def make_handler(image_path, token):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            self.wfile.write(image)
+            if include_body:
+                self.wfile.write(image)
+
+        def do_GET(self):
+            self._serve_image(include_body=True)
+
+        def do_HEAD(self):
+            self._serve_image(include_body=False)
 
         def log_message(self, format_string, *args):
             return

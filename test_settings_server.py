@@ -570,14 +570,15 @@ class SettingsServerTests(unittest.TestCase):
         )
         self.assertIn("/api/maintenance/restart-settings", text)
 
-    def test_future_prayer_location_controls_are_safe_and_disabled(self):
+    def test_maarif_prayer_controls_are_implemented_and_functional(self):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")
-        self.assertIn('id="same-prayer-location" checked disabled', text)
-        self.assertIn('id="prayer-location" disabled', text)
-        self.assertIn('id="prayer-country" disabled', text)
-        self.assertNotIn('name="prayer_location"', text)
-        self.assertNotIn('name="prayer_country"', text)
+        self.assertIn('name="prayer_method"', text)
+        self.assertIn('name="prayer_school"', text)
+        self.assertIn('name="prayer_high_latitude"', text)
+        self.assertIn('name="hijri_adjustment"', text)
+        self.assertIn('<dt>Prayer data status</dt>', text)
+        self.assertIn('<dt>Last prayer update</dt>', text)
 
     def test_status_includes_location_timezone_and_push_state(self):
         _, _, body = self.request("GET", "/settings")

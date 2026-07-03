@@ -1,0 +1,299 @@
+import unittest
+from unittest import mock
+import tempfile
+import json
+from pathlib import Path
+from zoneinfo import ZoneInfo
+from datetime import datetime
+
+import weather_image
+
+class MaarifReliabilityTests(unittest.TestCase):
+    def setUp(self):
+        # Create temp dir for testing cache and config
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.project_path = Path(self.test_dir.name)
+        
+        # Patch PROJECT_DIR in weather_image to point to our temp dir
+        self.project_dir_patcher = mock.patch("weather_image.PROJECT_DIR", self.project_path)
+        self.project_dir_patcher.start()
+        
+        # Patch OUT in weather_image to point to our temp dir
+        self.out_patcher = mock.patch("weather_image.OUT", self.project_path / "kindle_weather.png")
+        self.out_patcher.start()
+        
+        # Set up a sample config
+        self.config = {
+            "title": "TEST CALENDAR",
+            "location": "Nottingham",
+            "country": "United Kingdom",
+            "latitude": 52.9536,
+            "longitude": -1.1505,
+            "location_display": "Nottingham, England, United Kingdom",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "maarif_calendar",
+            "show_weather": True,
+            "show_forecast": True,
+            "show_server": False,
+            "show_pihole": False,
+            "show_tailscale": False,
+            "kindle_frontlight": 8,
+            "prayer_method": 13,
+            "prayer_school": 0,
+            "prayer_high_latitude": 3,
+            "hijri_adjustment": 0,
+        }
+        
+    def tearDown(self):
+        self.out_patcher.stop()
+        self.project_dir_patcher.stop()
+        self.test_dir.cleanup()
+
+    def mock_weather_data(self):
+        return {
+            "current_condition": [{
+                "temp_C": "18",
+                "FeelsLikeC": "17",
+                "humidity": "72",
+                "windspeedMiles": "6",
+                "winddir16Point": "WSW",
+                "pressure": "1022",
+                "weatherCode": "2",
+                "weatherDesc": [{"value": "Partly Cloudy"}]
+            }],
+            "weather": [{
+                "maxtempC": "24",
+                "mintempC": "12",
+                "astronomy": [{
+                    "sunrise": "04:45 AM",
+                    "sunset": "09:33 PM"
+                }],
+                "hourly": []
+            }]
+        }
+
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_timezone_local_date_and_coordinates_in_api_request(self, mock_http, mock_fetch):
+        mock_fetch.return_value = self.mock_weather_data()
+        
+        def mock_http_side_effect(url, **kwargs):
+            if "api.aladhan.com" in url:
+                return {"code": 200, "data": {
+                    "timings": {
+                        "Fajr": "02:58",
+                        "Sunrise": "04:45",
+                        "Dhuhr": "13:10",
+                        "Asr": "17:30",
+                        "Maghrib": "21:30",
+                        "Isha": "23:05",
+                        "Imsak": "02:48"
+                    },
+                    "date": {
+                        "hijri": {
+                            "day": "18",
+                            "month": {"number": 1},
+                            "year": "1448"
+                        }
+                    }
+                }}
+            return {}
+
+        mock_http.side_effect = mock_http_side_effect
+        
+        # Call collect_dashboard_data
+        data = weather_image.collect_dashboard_data(self.config)
+        
+        # Verify coordinates from config are used directly
+        # Verify http_json was called with local formatted date
+        self.assertTrue(mock_http.called)
+        called_urls = [call.args[0] for call in mock_http.call_args_list]
+        aladhan_call = next(url for url in called_urls if "api.aladhan.com" in url)
+        
+        # Date should be today's date in Europe/London timezone
+        now_tz = datetime.now(ZoneInfo("Europe/London"))
+        expected_date = now_tz.strftime("%d-%m-%Y")
+        
+        self.assertIn(f"timings/{expected_date}", aladhan_call)
+        self.assertIn("latitude=52.9536", aladhan_call)
+        self.assertIn("longitude=-1.1505", aladhan_call)
+        self.assertIn("method=13", aladhan_call)
+        self.assertIn("school=0", aladhan_call)
+        self.assertIn("latitudeAdjustmentMethod=3", aladhan_call)
+
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_cache_is_written_on_successful_api(self, mock_http, mock_fetch):
+        mock_fetch.return_value = self.mock_weather_data()
+        
+        def mock_http_side_effect(url, **kwargs):
+            if "api.aladhan.com" in url:
+                return {"code": 200, "data": {
+                    "timings": {
+                        "Fajr": "02:58",
+                        "Sunrise": "04:45",
+                        "Dhuhr": "13:10",
+                        "Asr": "17:30",
+                        "Maghrib": "21:30",
+                        "Isha": "23:05",
+                        "Imsak": "02:48"
+                    },
+                    "date": {
+                        "hijri": {
+                            "day": "18",
+                            "month": {"number": 1},
+                            "year": "1448"
+                        }
+                    }
+                }}
+            return {}
+
+        mock_http.side_effect = mock_http_side_effect
+        
+        # Generate cache directory path
+        cache_dir = self.project_path / "cache" / "prayer_times"
+        self.assertFalse(cache_dir.exists())
+        
+        weather_image.collect_dashboard_data(self.config)
+        
+        # Cache directory and cache file should now exist
+        self.assertTrue(cache_dir.exists())
+        cache_files = list(cache_dir.glob("prayer_*.json"))
+        self.assertEqual(len(cache_files), 1)
+        
+        # Read and check cache content
+        cache_content = json.loads(cache_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(cache_content["fajr"], "02:58")
+        self.assertEqual(cache_content["sunrise"], "04:45")
+        self.assertEqual(cache_content["hijri_day"], 18)
+
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_cache_is_used_when_api_fails(self, mock_http, mock_fetch):
+        mock_fetch.return_value = self.mock_weather_data()
+        
+        # First pre-populate the cache
+        cache_dir = self.project_path / "cache" / "prayer_times"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        now_tz = datetime.now(ZoneInfo("Europe/London"))
+        date_str = now_tz.strftime("%d-%m-%Y")
+        
+        import hashlib
+        key_string = f"{date_str}_52.9536_-1.1505_Europe/London_13_0_3"
+        cache_filename = f"prayer_{hashlib.md5(key_string.encode('utf-8')).hexdigest()}.json"
+        
+        cache_data = {
+            "date": now_tz.strftime("%Y-%m-%d"),
+            "location_display": "Nottingham, UK",
+            "latitude": 52.9536,
+            "longitude": -1.1505,
+            "timezone": "Europe/London",
+            "method": 13,
+            "school": 0,
+            "high_latitude_adjustment": 3,
+            "fajr": "02:59",
+            "sunrise": "04:46",
+            "dhuhr": "13:11",
+            "asr": "17:31",
+            "maghrib": "21:31",
+            "isha": "23:06",
+            "imsak": "02:49",
+            "hijri_day": 19,
+            "hijri_month_num": 1,
+            "hijri_year": 1448,
+            "source": "aladhan",
+            "fetched_at": "2026-07-03 12:00:00"
+        }
+        (cache_dir / cache_filename).write_text(json.dumps(cache_data), encoding="utf-8")
+        
+        # Mock API to raise an exception (simulate failure)
+        mock_http.side_effect = RuntimeError("API down")
+        
+        data = weather_image.collect_dashboard_data(self.config)
+        
+        # Verify timings and Hijri date were loaded from the cache
+        self.assertEqual(data["timings"]["Fajr"], "02:59")
+        self.assertEqual(data["timings"]["Sunrise"], "04:46")
+        self.assertEqual(data["hijri_day"], 19)
+
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_invalid_prayer_time_order_is_rejected(self, mock_http, mock_fetch):
+        mock_fetch.return_value = self.mock_weather_data()
+        
+        # Isha is earlier than Maghrib, which is invalid
+        def mock_http_side_effect(url, **kwargs):
+            if "api.aladhan.com" in url:
+                return {"code": 200, "data": {
+                    "timings": {
+                        "Fajr": "02:58",
+                        "Sunrise": "04:45",
+                        "Dhuhr": "13:10",
+                        "Asr": "17:30",
+                        "Maghrib": "21:30",
+                        "Isha": "20:00", 
+                        "Imsak": "02:48"
+                    },
+                    "date": {
+                        "hijri": {
+                            "day": "18",
+                            "month": {"number": 1},
+                            "year": "1448"
+                        }
+                    }
+                }}
+            return {}
+
+        mock_http.side_effect = mock_http_side_effect
+        
+        data = weather_image.collect_dashboard_data(self.config)
+        
+        # Since API response is invalid and no cache exists, timings should be None
+        self.assertIsNone(data["timings"])
+
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_missing_api_and_missing_cache_does_not_crash_but_sets_timings_to_none(self, mock_http, mock_fetch):
+        mock_fetch.return_value = self.mock_weather_data()
+        mock_http.side_effect = RuntimeError("API down")
+        
+        # Call collect_dashboard_data should not raise exception
+        data = weather_image.collect_dashboard_data(self.config)
+        self.assertIsNone(data["timings"])
+
+    def test_hijri_adjustment_values(self):
+        # adjust_hijri_date(year, month, day, offset)
+        # Standard case
+        self.assertEqual(weather_image.adjust_hijri_date(1448, 1, 18, 0), (1448, 1, 18))
+        self.assertEqual(weather_image.adjust_hijri_date(1448, 1, 18, 1), (1448, 1, 19))
+        self.assertEqual(weather_image.adjust_hijri_date(1448, 1, 18, -1), (1448, 1, 17))
+        self.assertEqual(weather_image.adjust_hijri_date(1448, 1, 18, 2), (1448, 1, 20))
+        self.assertEqual(weather_image.adjust_hijri_date(1448, 1, 18, -2), (1448, 1, 16))
+        
+        # Month rollover backward: 1 Muharram -> last day of Dhul-Hijjah (month 12)
+        # Dhul-Hijjah standard length is 29 (except leap year 30). y=1447 is leap.
+        self.assertEqual(weather_image.adjust_hijri_date(1448, 1, 1, -1), (1447, 12, 30))
+        
+        # Month rollover forward: 30 Muharram -> 1 Safar
+        self.assertEqual(weather_image.adjust_hijri_date(1448, 1, 30, 1), (1448, 2, 1))
+
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_render_maarif_calendar_renders_with_timings_unavailable_msg(self, mock_http, mock_fetch):
+        mock_fetch.return_value = self.mock_weather_data()
+        mock_http.side_effect = RuntimeError("API down")
+        
+        # Generate with English locale
+        config_en = dict(self.config, location_label="London, UK")
+        
+        # Should not crash during render
+        weather_image.render_maarif_calendar(config_en)
+        self.assertTrue((self.project_path / "kindle_weather.png").exists())
+        
+        # Generate with Turkish locale
+        config_tr = dict(self.config, location_label="Istanbul, Turkey")
+        weather_image.render_maarif_calendar(config_tr)
+        self.assertTrue((self.project_path / "kindle_weather.png").exists())

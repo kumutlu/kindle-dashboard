@@ -33,3 +33,6 @@ news_image.py
 
 # Runtime battery value written by serve_image.py
 battery.txt
+
+# Local data cache
+cache/

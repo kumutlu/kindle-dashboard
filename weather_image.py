@@ -44,6 +44,10 @@ DEFAULT_CONFIG = {
     "show_pihole": True,
     "show_tailscale": True,
     "kindle_frontlight": 8,
+    "prayer_method": 13,
+    "prayer_school": 0,
+    "prayer_high_latitude": 3,
+    "hijri_adjustment": 0,
 }
 
 STRING_LIMITS = {
@@ -63,6 +67,10 @@ OPTIONAL_LOCATION_FIELDS = {
     "longitude",
     "location_display",
     "kindle_frontlight",
+    "prayer_method",
+    "prayer_school",
+    "prayer_high_latitude",
+    "hijri_adjustment",
 }
 BOOLEAN_FIELDS = {
     "show_weather",
@@ -142,6 +150,20 @@ def validate_config(value):
         config["kindle_frontlight"] = kindle_frontlight
     else:
         config["kindle_frontlight"] = 8
+
+    for field, default, validator in (
+        ("prayer_method", 13, lambda x: isinstance(x, int) and (0 <= x <= 23 or x == 99)),
+        ("prayer_school", 0, lambda x: isinstance(x, int) and x in (0, 1)),
+        ("prayer_high_latitude", 3, lambda x: isinstance(x, int) and x in (1, 2, 3)),
+        ("hijri_adjustment", 0, lambda x: isinstance(x, int) and -2 <= x <= 2),
+    ):
+        val = value.get(field)
+        if val is not None:
+            if isinstance(val, bool) or not validator(val):
+                raise ValueError(f"invalid value for {field}")
+            config[field] = val
+        else:
+            config[field] = default
 
     return config
 
@@ -504,7 +526,8 @@ LOCALES = {
             ("Rüzgâr eken,", "fırtına biçer.", "Atasözü"),
         ],
         "h_unit": "S.",
-        "m_unit": "D."
+        "m_unit": "D.",
+        "prayer_unavailable": "Namaz vakitleri\nalınamadı"
     },
     "en": {
         "hijri_suffix": "Hijri",
@@ -578,7 +601,8 @@ LOCALES = {
             ("Where there is a will,", "there is a way.", "Proverb"),
         ],
         "h_unit": "h",
-        "m_unit": "m"
+        "m_unit": "m",
+        "prayer_unavailable": "Prayer times\nunavailable"
     }
 }
 
@@ -624,6 +648,58 @@ def gregorian_to_hijri(g_year, g_month, g_day):
         return h_year, h_month, h_day
     except Exception:
         return 1448, 1, 8
+
+def adjust_hijri_date(h_year, h_month, h_day, offset):
+    if offset == 0:
+        return h_year, h_month, h_day
+
+    def month_days(y, m):
+        if m in (1, 3, 5, 7, 9, 11):
+            return 30
+        if m == 12:
+            is_leap = (y * 11 + 14) % 30 < 11
+            return 30 if is_leap else 29
+        return 29
+
+    h_day += offset
+    while h_day <= 0:
+        h_month -= 1
+        if h_month <= 0:
+            h_month = 12
+            h_year -= 1
+        h_day += month_days(h_year, h_month)
+
+    while h_day > month_days(h_year, h_month):
+        h_day -= month_days(h_year, h_month)
+        h_month += 1
+        if h_month > 12:
+            h_month = 1
+            h_year += 1
+
+    return h_year, h_month, h_day
+
+def validate_prayer_times(timings):
+    required = ["Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha", "Imsak"]
+    if not timings or not all(k in timings for k in required):
+        return False
+    import re
+    time_pat = re.compile(r"^\d{2}:\d{2}$")
+    for k in required:
+        if not isinstance(timings[k], str) or not time_pat.match(timings[k]):
+            return False
+    try:
+        minutes = {}
+        for k in required:
+            h, m = map(int, timings[k].split(":"))
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                return False
+            minutes[k] = h * 60 + m
+        # Fajr < Sunrise < Dhuhr < Asr < Maghrib < Isha
+        if not (minutes["Fajr"] < minutes["Sunrise"] < minutes["Dhuhr"] < minutes["Asr"] < minutes["Maghrib"] < minutes["Isha"]):
+            return False
+    except Exception:
+        return False
+    return True
 
 def gregorian_to_rumi(g_year, g_month, g_day):
     import datetime
@@ -1047,37 +1123,111 @@ def collect_dashboard_data(config):
     locale = LOCALES[lang]
     
     # Maarif-specific calculations
-    lat, lng = resolve_coordinates(config["weather_query"])
+    lat = config.get("latitude")
+    lng = config.get("longitude")
+    if lat is None or lng is None:
+        try:
+            lat, lng = resolve_coordinates(config["weather_query"])
+        except Exception:
+            lat, lng = 52.9536, -1.1505
+
+    import hashlib
+    import json
+    from datetime import datetime as dt_class
+
+    date_str = now.strftime("%d-%m-%Y")
+    method = config.get("prayer_method", 13)
+    school = config.get("prayer_school", 0)
+    high_latitude = config.get("prayer_high_latitude", 3)
+    hijri_adj = config.get("hijri_adjustment", 0)
+
+    key_string = f"{date_str}_{lat:.4f}_{lng:.4f}_{config['timezone']}_{method}_{school}_{high_latitude}"
+    cache_dir = PROJECT_DIR / "cache" / "prayer_times"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"prayer_{hashlib.md5(key_string.encode('utf-8')).hexdigest()}.json"
+
+    def load_from_cache():
+        if cache_file.exists():
+            try:
+                c_data = json.loads(cache_file.read_text(encoding="utf-8"))
+                timings_cached = {
+                    "Fajr": c_data.get("fajr"),
+                    "Sunrise": c_data.get("sunrise"),
+                    "Dhuhr": c_data.get("dhuhr"),
+                    "Asr": c_data.get("asr"),
+                    "Maghrib": c_data.get("maghrib"),
+                    "Isha": c_data.get("isha"),
+                    "Imsak": c_data.get("imsak", "03:42"),
+                }
+                if validate_prayer_times(timings_cached):
+                    return timings_cached, int(c_data.get("hijri_year")), int(c_data.get("hijri_month_num")), int(c_data.get("hijri_day"))
+            except Exception:
+                pass
+        return None
+
+    timings = None
+    hijri_year, hijri_month_num, hijri_day = None, None, None
+
     prayer_data = None
     try:
-        url = f"http://api.aladhan.com/v1/timings?latitude={lat}&longitude={lng}&method=13"
+        url = (
+            f"http://api.aladhan.com/v1/timings/{date_str}?"
+            f"latitude={lat}&longitude={lng}&method={method}&school={school}"
+            f"&latitudeAdjustmentMethod={high_latitude}"
+        )
         prayer_data = http_json(url, timeout=7)
     except Exception as e:
         print(f"Failed to fetch prayer times: {e}")
-        
+
     if prayer_data and prayer_data.get("code") == 200:
-        p_data = prayer_data["data"]
-        timings = p_data["timings"]
-        hijri = p_data["date"]["hijri"]
-        hijri_day = int(hijri["day"])
-        hijri_month_num = int(hijri["month"]["number"])
-        hijri_year = int(hijri["year"])
-    else:
-        # Fallback Hijri calculation
+        try:
+            p_data = prayer_data["data"]
+            timings_api = p_data["timings"]
+            if validate_prayer_times(timings_api):
+                timings = timings_api
+                hijri = p_data["date"]["hijri"]
+                hijri_day = int(hijri["day"])
+                hijri_month_num = int(hijri["month"]["number"])
+                hijri_year = int(hijri["year"])
+
+                norm_data = {
+                    "date": now.strftime("%Y-%m-%d"),
+                    "location_display": config.get("location_display", ""),
+                    "latitude": float(lat),
+                    "longitude": float(lng),
+                    "timezone": config["timezone"],
+                    "method": method,
+                    "school": school,
+                    "high_latitude_adjustment": high_latitude,
+                    "fajr": timings["Fajr"],
+                    "sunrise": timings["Sunrise"],
+                    "dhuhr": timings["Dhuhr"],
+                    "asr": timings["Asr"],
+                    "maghrib": timings["Maghrib"],
+                    "isha": timings["Isha"],
+                    "imsak": timings.get("Imsak", "03:42"),
+                    "hijri_day": hijri_day,
+                    "hijri_month_num": hijri_month_num,
+                    "hijri_year": hijri_year,
+                    "source": "aladhan",
+                    "fetched_at": dt_class.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                cache_file.write_text(json.dumps(norm_data, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"Error processing Aladhan API response: {e}")
+
+    if timings is None:
+        cached = load_from_cache()
+        if cached:
+            timings, hijri_year, hijri_month_num, hijri_day = cached
+
+    if timings is None:
         hijri_year, hijri_month_num, hijri_day = gregorian_to_hijri(now.year, now.month, now.day)
-        # Fallback seasonal timings
-        import math
-        day_of_year = now.timetuple().tm_yday
-        offset = 60 * math.sin(2 * math.pi * (day_of_year - 80) / 365.0)
-        timings = {
-            "Fajr": f"{int((270 - offset) // 60):02d}:{int((270 - offset) % 60):02d}",
-            "Sunrise": f"{int((360 - offset) // 60):02d}:{int((360 - offset) % 60):02d}",
-            "Dhuhr": "13:08",
-            "Asr": f"{int((1020 + offset // 2) // 60):02d}:{int((1020 + offset // 2) % 60):02d}",
-            "Maghrib": f"{int((1260 + offset) // 60):02d}:{int((1260 + offset) % 60):02d}",
-            "Isha": f"{int((1350 + offset) // 60):02d}:{int((1350 + offset) % 60):02d}",
-            "Imsak": f"{int((260 - offset) // 60):02d}:{int((260 - offset) % 60):02d}"
-        }
+
+    if hijri_year is not None:
+        hijri_year, hijri_month_num, hijri_day = adjust_hijri_date(
+            hijri_year, hijri_month_num, hijri_day, hijri_adj
+        )
 
     # Calendar dates
     rumi_year, rumi_month_num, rumi_day = gregorian_to_rumi(now.year, now.month, now.day)
@@ -1686,19 +1836,26 @@ def render_maarif_calendar(config):
     txt(d, 150, 268, config["location_label"].split(",")[0].upper(), sans_bold_18, anchor="ma")
     box(d, (50, 298, 250, 698), radius=6, width=2)
     
-    prayer_order = [
-        (locale["prayers"][0], data["timings"].get("Sunrise", "05:14")),
-        (locale["prayers"][1], data["timings"].get("Dhuhr", "13:08")),
-        (locale["prayers"][2], data["timings"].get("Asr", "17:02")),
-        (locale["prayers"][3], data["timings"].get("Maghrib", "20:45")),
-        (locale["prayers"][4], data["timings"].get("Isha", "22:15")),
-        (locale["prayers"][5], data["timings"].get("Imsak", "03:42")),
-    ]
-    
-    for i, (name, tm) in enumerate(prayer_order):
-        y_pos = 312 + i * 62
-        txt(d, 150, y_pos, name, sans_bold_16, anchor="ma")
-        txt(d, 150, y_pos + 22, tm, sans_reg_18, anchor="ma")
+    if data["timings"] is not None:
+        prayer_order = [
+            (locale["prayers"][0], data["timings"].get("Sunrise", "05:14")),
+            (locale["prayers"][1], data["timings"].get("Dhuhr", "13:08")),
+            (locale["prayers"][2], data["timings"].get("Asr", "17:02")),
+            (locale["prayers"][3], data["timings"].get("Maghrib", "20:45")),
+            (locale["prayers"][4], data["timings"].get("Isha", "22:15")),
+            (locale["prayers"][5], data["timings"].get("Imsak", "03:42")),
+        ]
+        
+        for i, (name, tm) in enumerate(prayer_order):
+            y_pos = 312 + i * 62
+            txt(d, 150, y_pos, name, sans_bold_16, anchor="ma")
+            txt(d, 150, y_pos + 22, tm, sans_reg_18, anchor="ma")
+    else:
+        msg = locale.get("prayer_unavailable", "Prayer times\nunavailable")
+        lines = msg.split("\n")
+        txt(d, 150, 480, lines[0], sans_bold_16, anchor="ma")
+        if len(lines) > 1:
+            txt(d, 150, 510, lines[1], sans_bold_16, anchor="ma")
         
     # Right Box: Weather Stats
     txt(d, 608, 268, locale["weather_label"], sans_bold_18, anchor="ma")

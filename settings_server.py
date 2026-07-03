@@ -123,14 +123,15 @@ def update_config(config_path, candidate, regenerate):
     previous_exists = config_path.exists()
     previous_data = config_path.read_bytes() if previous_exists else None
 
-    # Preserve kindle_frontlight from existing config if not in candidate
-    if previous_exists and "kindle_frontlight" not in candidate:
-        try:
-            prev_config = json.loads(previous_data.decode("utf-8"))
-            if "kindle_frontlight" in prev_config:
-                candidate["kindle_frontlight"] = prev_config["kindle_frontlight"]
-        except Exception:
-            pass
+    # Preserve custom Maarif fields from existing config if not in candidate
+    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment"):
+        if previous_exists and field not in candidate:
+            try:
+                prev_config = json.loads(previous_data.decode("utf-8"))
+                if field in prev_config:
+                    candidate[field] = prev_config[field]
+            except Exception:
+                pass
 
     validated = validate_config(candidate)
     atomic_write_config(config_path, validated)
@@ -145,6 +146,37 @@ def update_config(config_path, candidate, regenerate):
     return validated
 
 
+def get_prayer_cache_status(config):
+    try:
+        import hashlib
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        lat = config.get("latitude")
+        lng = config.get("longitude")
+        if lat is None or lng is None:
+            return "Unavailable (Missing coordinates)", "Never"
+        timezone = config.get("timezone", "Europe/London")
+        method = config.get("prayer_method", 13)
+        school = config.get("prayer_school", 0)
+        high_latitude = config.get("prayer_high_latitude", 3)
+
+        now = datetime.now(ZoneInfo(timezone))
+        date_str = now.strftime("%d-%m-%Y")
+
+        project_dir = Path(__file__).resolve().parent
+        cache_dir = project_dir / "cache" / "prayer_times"
+        key_string = f"{date_str}_{lat:.4f}_{lng:.4f}_{timezone}_{method}_{school}_{high_latitude}"
+        cache_filename = f"prayer_{hashlib.md5(key_string.encode('utf-8')).hexdigest()}.json"
+        cache_file = cache_dir / cache_filename
+
+        if cache_file.exists():
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            return "Cached (API)", data.get("fetched_at", "Unknown")
+    except Exception:
+        pass
+    return "Not cached / Pending fetch", "Never"
+
+
 def render_settings(config, csrf_token, status_message=""):
     escaped = {key: html.escape(str(value), quote=True)
                for key, value in config.items()}
@@ -157,6 +189,11 @@ def render_settings(config, csrf_token, status_message=""):
 
     def checked(key):
         return " checked" if config[key] else ""
+
+    def selected_opt(key, val):
+        return " selected" if str(config.get(key)) == str(val) else ""
+
+    prayer_status, prayer_last_update = get_prayer_cache_status(config)
 
     theme_cards = "".join(
         f'<label class="theme-choice{" disabled" if not definition["implemented"] else ""}">'
@@ -393,12 +430,47 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
     <label class="field"><span>Weather query</span><input type="text" name="weather_query" maxlength="100" value="{escaped['weather_query']}" required></label>
     <label class="field"><span>Location label</span><input type="text" name="location_label" maxlength="160" value="{escaped['location_label']}" required></label>
     <label class="field"><span>Timezone</span><input type="text" name="timezone" maxlength="64" value="{escaped['timezone']}" required></label>
-    <div class="future-box">
-      <h3>Prayer location · future</h3>
-      <p>Prepared for Maarif Calendar. These fields are not stored yet.</p>
-      <label class="toggle"><input type="checkbox" id="same-prayer-location" checked disabled><span>Use weather location</span></label>
-      <label class="field"><span>Prayer location</span><input type="text" id="prayer-location" disabled value="{escaped['weather_query']}"></label>
-      <label class="field"><span>Prayer country</span><input type="text" id="prayer-country" disabled value="{escaped['country']}"></label>
+    <div class="future-box" style="margin-top:20px;border-top:1px solid var(--line);padding-top:16px">
+      <h3 style="font-size:1.05rem;font-weight:700;margin:0 0 12px">Maarif / Prayer Settings</h3>
+      <label class="field"><span>Prayer calculation method</span>
+        <select name="prayer_method">
+          <option value="13"{selected_opt('prayer_method', 13)}>Turkey (Diyanet)</option>
+          <option value="1"{selected_opt('prayer_method', 1)}>Karachi (Univ of Islamic Sciences)</option>
+          <option value="2"{selected_opt('prayer_method', 2)}>ISNA (North America)</option>
+          <option value="3"{selected_opt('prayer_method', 3)}>MWL (Muslim World League)</option>
+          <option value="4"{selected_opt('prayer_method', 4)}>Umm Al-Qura (Makkah)</option>
+          <option value="5"{selected_opt('prayer_method', 5)}>Egyptian Authority</option>
+          <option value="7"{selected_opt('prayer_method', 7)}>Tehran (Univ of Geophysics)</option>
+          <option value="8"{selected_opt('prayer_method', 8)}>Gulf Region</option>
+          <option value="9"{selected_opt('prayer_method', 9)}>Kuwait</option>
+          <option value="10"{selected_opt('prayer_method', 10)}>Qatar</option>
+          <option value="11"{selected_opt('prayer_method', 11)}>Singapore (MUIS)</option>
+          <option value="12"{selected_opt('prayer_method', 12)}>France (UOIF)</option>
+          <option value="14"{selected_opt('prayer_method', 14)}>Russia (SAMR)</option>
+        </select>
+      </label>
+      <label class="field"><span>Asr school</span>
+        <select name="prayer_school">
+          <option value="0"{selected_opt('prayer_school', 0)}>Standard (Shafi, Maliki, Hanbali)</option>
+          <option value="1"{selected_opt('prayer_school', 1)}>Hanafi</option>
+        </select>
+      </label>
+      <label class="field"><span>High latitude adjustment</span>
+        <select name="prayer_high_latitude">
+          <option value="3"{selected_opt('prayer_high_latitude', 3)}>Angle Based (Default)</option>
+          <option value="1"{selected_opt('prayer_high_latitude', 1)}>Middle of the Night</option>
+          <option value="2"{selected_opt('prayer_high_latitude', 2)}>One Seventh</option>
+        </select>
+      </label>
+      <label class="field"><span>Hijri date adjustment</span>
+        <select name="hijri_adjustment">
+          <option value="0"{selected_opt('hijri_adjustment', 0)}>No adjustment (0)</option>
+          <option value="-2"{selected_opt('hijri_adjustment', -2)}>Subtract 2 days (-2)</option>
+          <option value="-1"{selected_opt('hijri_adjustment', -1)}>Subtract 1 day (-1)</option>
+          <option value="1"{selected_opt('hijri_adjustment', 1)}>Add 1 day (+1)</option>
+          <option value="2"{selected_opt('hijri_adjustment', 2)}>Add 2 days (+2)</option>
+        </select>
+      </label>
     </div>
   </details>
 </section>
@@ -461,6 +533,8 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
     <div class="status-row"><dt>Location label</dt><dd>{escaped['location_label']}</dd></div>
     <div class="status-row"><dt>Timezone</dt><dd>{escaped['timezone']}</dd></div>
     <div class="status-row"><dt>Selected theme</dt><dd>{escaped['theme']}</dd></div>
+    <div class="status-row"><dt>Prayer data status</dt><dd>{prayer_status}</dd></div>
+    <div class="status-row"><dt>Last prayer update</dt><dd>{prayer_last_update}</dd></div>
     <div class="status-row"><dt>Last generation</dt><dd>{html.escape(status_message or 'No result in this session')}</dd></div>
     <div class="status-row"><dt>Last push</dt><dd id="last-push">Not in this session</dd></div>
   </dl>
@@ -1012,6 +1086,12 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 for key in ("show_weather", "show_forecast", "show_server",
                             "show_pihole", "show_tailscale"):
                     candidate[key] = key in form
+                for key in ("prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment"):
+                    if key in form:
+                        try:
+                            candidate[key] = int(form[key][0])
+                        except Exception:
+                            pass
                 with update_lock:
                     update_config(config_path, candidate, regenerate)
                 self.redirect("/settings?status=saved")

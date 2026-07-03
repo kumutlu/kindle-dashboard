@@ -28,7 +28,7 @@ Available themes:
 
 Planned themes:
 
-- Maarif Calendar
+- Traditional Calendar
 - Photo Gallery
 - Health Dashboard
 - Shopping List

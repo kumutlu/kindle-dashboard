@@ -652,6 +652,29 @@ class SettingsServerTests(unittest.TestCase):
             before,
         )
 
+    def test_tabbed_settings_ui_elements(self):
+        status, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+
+        # Tab button checks
+        for tab in ("overview", "location", "theme", "display", "device", "maintenance", "status"):
+            self.assertIn(f'data-tab="{tab}"', text)
+
+        # Confirm tabs structure has active class/content
+        self.assertIn('class="tabs-nav"', text)
+        self.assertIn('class="tab-btn active" data-tab="overview"', text)
+
+        # Confirm Overview tab info exists
+        self.assertIn('id="overview"', text)
+        self.assertIn('id="overview-push-kindle-btn"', text)
+
+        # Re-check the critical UI elements are present
+        self.assertIn('id="city-search"', text)
+        self.assertIn('id="push-kindle"', text)
+        self.assertIn('id="restart-settings-server"', text)
+        self.assertIn('id="restart-kindle"', text)
+
 
 if __name__ == "__main__":
     unittest.main()

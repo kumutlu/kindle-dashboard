@@ -189,78 +189,123 @@ def render_settings(config, csrf_token, status_message=""):
 <link rel="icon" href="data:,">
 <title>Kindle Dashboard</title>
 <style>
-:root{{--bg:#f2f3f5;--card:#fff;--ink:#171717;--muted:#687078;--line:#dfe2e5;--accent:#111;--soft:#f6f7f8}}
+:root{{
+  --bg:#f5f6f8;
+  --card:#ffffff;
+  --ink:#111111;
+  --muted:#6e767f;
+  --line:#e1e4e8;
+  --accent:#2b6cb0;
+  --soft:#f8f9fa;
+  --border-radius:16px;
+}}
 *{{box-sizing:border-box}}
 html{{scroll-behavior:smooth}}
-body{{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
-.shell{{max-width:1080px;margin:0 auto;padding:20px 14px 190px}}
-.app-header{{padding:10px 4px 20px}}
-.app-header h1{{font-size:1.65rem;line-height:1.15;margin:0 0 7px}}
-.subtitle{{margin:0;color:var(--muted);font-size:.95rem}}
-.grid{{display:grid;grid-template-columns:1fr;gap:16px}}
-.card{{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:0 4px 18px rgba(20,25,30,.05);scroll-margin-top:16px}}
-.card h2{{font-size:1.12rem;margin:0 0 4px}}
-.section-note{{margin:0 0 16px!important;color:var(--muted);font-size:.9rem}}
-.card p{{margin:8px 0}}
-.field{{display:block;margin:14px 0}}
-.field span{{display:block;margin-bottom:6px;font-weight:700}}
-input[type=text],input[type=search],input[type=number],select{{width:100%;min-height:48px;padding:11px 12px;border:1px solid #aeb4ba;border-radius:12px;background:#fff;color:#111;font:inherit}}
-input:focus,select:focus{{outline:3px solid rgba(17,17,17,.12);border-color:#333}}
-.button-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}
-button{{min-height:48px;padding:10px 12px;border:1px solid #555;border-radius:12px;background:#fff;color:#111;font:700 .95rem system-ui;touch-action:manipulation}}
+body{{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+.shell{{max-width:900px;margin:0 auto;padding:24px 16px 140px}}
+.app-header{{margin-bottom:24px;text-align:center}}
+.app-header h1{{font-size:1.8rem;font-weight:800;margin:0 0 6px;letter-spacing:-0.025em}}
+.subtitle{{margin:0;color:var(--muted);font-size:0.95rem}}
+
+/* Tabs Navigation */
+.tabs-nav{{display:flex;gap:8px;overflow-x:auto;padding:4px;margin-bottom:24px;background:var(--soft);border-radius:14px;border:1px solid var(--line);scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch}}
+.tabs-nav::-webkit-scrollbar{{display:none}}
+.tabs-nav{{-ms-overflow-style:none;scrollbar-width:none}}
+.tab-btn{{flex:0 0 auto;scroll-snap-align:start;min-height:40px;padding:8px 16px;border:none;border-radius:10px;background:transparent;color:var(--muted);font-size:0.95rem;font-weight:600;cursor:pointer;transition:all 0.2s ease}}
+.tab-btn:hover{{color:var(--ink);background:rgba(0,0,0,0.04)}}
+.tab-btn.active{{color:var(--ink);background:var(--card);box-shadow:0 2px 8px rgba(0,0,0,0.06)}}
+
+/* Tab Section Visibility */
+.tab-content{{display:none}}
+.tab-content.active{{display:block}}
+
+/* Section Card */
+.card{{background:var(--card);border:1px solid var(--line);border-radius:var(--border-radius);padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.03)}}
+.card h2{{font-size:1.3rem;font-weight:750;margin:0 0 8px;letter-spacing:-0.015em}}
+.section-note{{margin:0 0 20px!important;color:var(--muted);font-size:0.9rem;line-height:1.45}}
+
+/* Form Fields */
+.field{{display:block;margin-bottom:18px}}
+.field span{{display:block;margin-bottom:8px;font-weight:650;font-size:0.9rem}}
+input[type=text],input[type=search],input[type=number],select{{width:100%;min-height:46px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);font-size:0.95rem;transition:all 0.2s ease}}
+input:focus,select:focus{{outline:none;border-color:var(--ink);box-shadow:0 0 0 3px rgba(0,0,0,0.05)}}
+
+/* Buttons */
+.button-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:16px}}
+button{{min-height:46px;padding:10px 16px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);font-weight:650;font-size:0.92rem;cursor:pointer;transition:all 0.2s ease}}
+button:hover:not(:disabled){{background:var(--soft);border-color:#a0aec0}}
 button:active:not(:disabled){{transform:translateY(1px)}}
-button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allowed}}
-.match{{margin:-4px 0 8px;padding:11px 12px;border-radius:12px;background:var(--soft);color:var(--muted);font-size:.9rem}}
+button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;opacity:0.65}}
+
+/* Overview Dashboard */
+.overview-stats{{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:24px}}
+.stat-item{{padding:14px;background:var(--soft);border-radius:12px;border:1px solid var(--line)}}
+.stat-item small{{display:block;color:var(--muted);font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px}}
+.stat-item strong{{display:block;font-size:1.05rem;font-weight:700}}
+.match{{margin:-4px 0 14px;padding:11px 12px;border-radius:12px;background:var(--soft);color:var(--muted);font-size:0.9rem;border:1px solid var(--line)}}
+
+/* City Results */
 .city-results{{display:grid;gap:8px;margin:0 0 14px}}
 .city-result{{display:grid;gap:3px;width:100%;min-height:58px;text-align:left;padding:10px 12px;border-color:var(--line)}}
 .city-result strong{{font-size:.95rem}}.city-result small{{color:var(--muted);font-weight:500}}
-.search-state{{padding:10px 12px;color:var(--muted);background:var(--soft);border-radius:12px}}
-.toggle-list{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}
-.toggle{{display:flex;align-items:center;gap:9px;min-height:50px;margin:0;padding:9px 10px;border:1px solid var(--line);border-radius:12px;font-weight:650;cursor:pointer}}
-.toggle input{{width:24px;height:24px;margin:0;accent-color:#111;flex:0 0 auto}}
+.search-state{{padding:10px 12px;color:var(--muted);background:var(--soft);border-radius:12px;border:1px solid var(--line)}}
+
+/* Theme Selection Cards */
+.theme-list{{display:grid;gap:12px;margin-top:14px}}
+.theme-choice{{display:flex;align-items:center;gap:14px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;cursor:pointer;transition:all 0.2s ease}}
+.theme-choice:hover:not(.disabled){{border-color:#a0aec0;background:var(--soft)}}
+.theme-choice:has(input:checked){{border-color:var(--ink);border-width:2px;padding:13px 15px;background:var(--soft)}}
+.theme-choice input[type=radio]{{width:20px;height:20px;accent-color:var(--ink);margin:0;flex:0 0 auto}}
+.theme-choice span{{display:flex;flex-direction:column;gap:2px}}
+.theme-choice strong{{font-size:1rem;font-weight:700}}
+.theme-choice small{{color:var(--muted);font-size:0.85rem}}
+.theme-choice.disabled{{opacity:0.5;cursor:not-allowed}}
+
+/* Display Toggles */
+.toggle-list{{display:grid;grid-template-columns:1fr;gap:12px}}
+.toggle{{display:flex;align-items:center;gap:12px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;font-weight:600;font-size:0.95rem;cursor:pointer;transition:all 0.2s ease}}
+.toggle:hover{{background:var(--soft)}}
+.toggle input[type=checkbox]{{width:22px;height:22px;margin:0;accent-color:var(--ink);flex:0 0 auto}}
+
+/* Device Tab */
+.device-state{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}}
+.device-stat{{padding:12px 8px;background:var(--soft);border:1px solid var(--line);border-radius:12px;text-align:center}}
+.device-stat small{{display:block;color:var(--muted);font-size:0.72rem;text-transform:uppercase;margin-bottom:4px}}
+.device-stat strong{{display:block;font-size:0.95rem;font-weight:750}}
+.device-message{{padding:12px 14px;background:var(--soft);border-radius:12px;font-size:0.9rem;margin:0 0 16px!important;border:1px solid var(--line)}}
+.light-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}}
+.log-box{{max-height:280px;overflow:auto;margin-top:14px;padding:16px;border-radius:12px;background:#1a202c;color:#edf2f7;font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:0.8rem;line-height:1.5;white-space:pre-wrap;border:1px solid #2d3748}}
+
+/* Maintenance Tab */
+.maintenance-message{{margin-top:12px;color:var(--muted);font-size:0.88rem}}
+
+/* Status Tab */
+.status-list{{display:grid;gap:10px;margin:0}}
+.status-row{{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}}
+.status-row:last-child{{border-bottom:0}}
+.status-row dt{{color:var(--muted);font-size:0.92rem}}
+.status-row dd{{margin:0;text-align:right;font-weight:700;font-size:0.92rem}}
+
+/* Action Bar */
+.action-bar{{position:fixed;z-index:100;left:0;right:0;bottom:0;display:grid;grid-template-columns:1.35fr 1fr;gap:12px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:rgba(255, 255, 255, 0.96);border-top:1px solid var(--line);box-shadow:0 -8px 30px rgba(0, 0, 0, 0.08);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}
+.action-bar button{{margin:0;width:100%}}
+.action-bar button[type=submit],.overview-actions button[type=submit]{{background:var(--ink);color:var(--card);border-color:var(--ink)}}
+.action-bar button[type=submit]:hover:not(:disabled),.overview-actions button[type=submit]:hover:not(:disabled){{background:#2d3748;border-color:#2d3748}}
+
 .advanced{{margin-top:14px;border-top:1px solid var(--line);padding-top:14px}}
-.advanced summary,.device-details summary{{min-height:44px;display:flex;align-items:center;font-weight:750;cursor:pointer}}
-.future-box{{margin-top:16px;padding:14px;background:var(--soft);border-radius:14px}}
+.advanced summary{{min-height:44px;display:flex;align-items:center;font-weight:750;cursor:pointer}}
+.future-box{{margin-top:16px;padding:14px;background:var(--soft);border-radius:14px;border:1px solid var(--line)}}
 .future-box h3{{margin:0 0 4px;font-size:.95rem}}
 .future-box p{{color:var(--muted);font-size:.86rem}}
 .future-box input:disabled{{opacity:.65}}
-.theme-list{{display:grid;gap:9px;margin-top:14px}}
-.theme-choice{{display:flex;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid var(--line);border-radius:14px;cursor:pointer}}
-.theme-choice:has(input:checked){{border:2px solid #111;padding:10px 11px;background:#fafafa}}
-.theme-choice input{{width:22px;height:22px;accent-color:#111;flex:0 0 auto}}
-.theme-choice span{{display:grid;gap:2px}}.theme-choice small{{color:var(--muted)}}
-.theme-choice.disabled{{opacity:.55;cursor:not-allowed}}
-.device-details summary h2{{margin:0}}.device-details[open] summary{{margin-bottom:14px}}
-.coming{{color:var(--muted);font-size:.9rem}}
-.device-state{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}}
-.device-stat{{padding:10px 8px;background:var(--soft);border-radius:12px;text-align:center}}
-.device-stat small{{display:block;color:var(--muted);font-size:.72rem}}.device-stat strong{{display:block;margin-top:3px;font-size:.9rem}}
-.device-message{{min-height:44px;margin:12px 0!important;padding:11px 12px;border-radius:12px;background:var(--soft)}}
-.light-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}}
-.log-box{{max-height:240px;overflow:auto;margin:12px 0 0;padding:12px;border-radius:12px;background:#171717;color:#f2f2f2;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}}
-.maintenance{{opacity:.78;background:#fafafa}}
-.maintenance details summary{{min-height:44px;display:flex;align-items:center;font-weight:700;cursor:pointer}}
-.maintenance details[open] summary{{margin-bottom:10px}}
-.maintenance button{{border-color:#999;color:#444}}
-.maintenance-message{{min-height:24px;color:var(--muted);font-size:.9rem}}
-.status-list{{display:grid;gap:10px;margin:0}}
-.status-row{{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid #ecece8}}
-.status-row:last-child{{border-bottom:0}}
-.status-row dt{{color:var(--muted)}}.status-row dd{{margin:0;text-align:right;font-weight:700;overflow-wrap:anywhere}}
-.message{{margin:0 0 16px;padding:12px 14px;background:#eaf6eb;border:1px solid #bedcc1;border-radius:12px}}
-.action-bar{{position:fixed;z-index:20;left:0;right:0;bottom:65px;display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:9px;padding:10px max(12px,env(safe-area-inset-right)) 10px max(12px,env(safe-area-inset-left));background:rgba(255,255,255,.96);border-top:1px solid var(--line);box-shadow:0 -8px 24px rgba(20,25,30,.08);backdrop-filter:blur(12px)}}
-.action-bar button{{margin:0;width:100%}}.action-bar button[type=submit]{{background:var(--accent);color:#fff;border-color:var(--accent)}}
-.bottom-nav{{position:fixed;z-index:10;left:0;right:0;bottom:0;display:grid;grid-template-columns:repeat(4,1fr);padding:8px max(8px,env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));background:rgba(255,255,255,.96);border-top:1px solid var(--line)}}
-.bottom-nav a{{min-height:48px;display:flex;align-items:center;justify-content:center;color:#222;text-decoration:none;font-size:.82rem;font-weight:750;border-radius:10px}}
-.bottom-nav a:active{{background:#eee}}
+
+/* Desktop Styles */
 @media (min-width: 760px){{
-  .shell{{padding:34px 24px 170px}}
-  .grid{{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}}
-  .card.location{{grid-column:1/-1}}
+  .shell{{padding:40px 24px 160px}}
+  .overview-stats{{grid-template-columns:repeat(3,1fr)}}
+  .toggle-list{{grid-template-columns:1fr 1fr}}
   .city-results{{grid-template-columns:1fr 1fr}}
-  .button-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}
-  .action-bar{{left:50%;right:auto;bottom:86px;width:min(620px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:8px;box-shadow:0 8px 30px rgba(0,0,0,.13)}}
-  .bottom-nav{{left:50%;right:auto;bottom:16px;width:min(560px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:6px;box-shadow:0 6px 24px rgba(0,0,0,.12)}}
+  .action-bar{{left:50%;right:auto;bottom:24px;width:min(600px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:10px;box-shadow:0 8px 30px rgba(0,0,0,0.12)}}
 }}
 </style>
 </head>
@@ -271,102 +316,184 @@ button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allo
 <p class="subtitle">{escaped['location_label']} · {escaped['theme']}</p>
 </header>
 {message}
+
+<nav class="tabs-nav" aria-label="Dashboard sections">
+  <button type="button" class="tab-btn active" data-tab="overview">Overview</button>
+  <button type="button" class="tab-btn" data-tab="location">Location</button>
+  <button type="button" class="tab-btn" data-tab="theme">Theme</button>
+  <button type="button" class="tab-btn" data-tab="display">Display</button>
+  <button type="button" class="tab-btn" data-tab="device">Device</button>
+  <button type="button" class="tab-btn" data-tab="maintenance">Maintenance</button>
+  <button type="button" class="tab-btn" data-tab="status">Status</button>
+</nav>
+
 <form method="post" action="/settings">
 <input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">
-<div class="grid">
-<section class="card location" id="location">
-<h2>Location</h2>
-<p class="section-note">Search for a city, then select the correct result.</p>
-<label class="field"><span>Search city</span><input type="search" id="city-search" value="{escaped['location']}" placeholder="Nottingham, Istanbul, London…" autocomplete="off"></label>
-<div class="city-results" id="city-results" aria-live="polite"></div>
-<div class="match" id="city-match">Selected: {escaped['location_display']} · {escaped['timezone']}</div>
-<details class="advanced">
-<summary>Advanced location settings</summary>
-<label class="field"><span>Dashboard title</span><input type="text" name="title" maxlength="28" value="{escaped['title']}" required></label>
-<label class="field"><span>City</span><input type="text" name="location" maxlength="100" value="{escaped['location']}" required></label>
-<label class="field"><span>Country</span><input type="text" name="country" maxlength="100" value="{escaped['country']}"></label>
-<label class="field"><span>Latitude</span><input type="number" name="latitude" step="any" min="-90" max="90" value="{html.escape(latitude_value, quote=True)}"></label>
-<label class="field"><span>Longitude</span><input type="number" name="longitude" step="any" min="-180" max="180" value="{html.escape(longitude_value, quote=True)}"></label>
-<label class="field"><span>Display name</span><input type="text" name="location_display" maxlength="160" value="{escaped['location_display']}" required></label>
-<label class="field"><span>Weather query</span><input type="text" name="weather_query" maxlength="100" value="{escaped['weather_query']}" required></label>
-<label class="field"><span>Location label</span><input type="text" name="location_label" maxlength="160" value="{escaped['location_label']}" required></label>
-<label class="field"><span>Timezone</span><input type="text" name="timezone" maxlength="64" value="{escaped['timezone']}" required></label>
-<div class="future-box">
-<h3>Prayer location · future</h3>
-<p>Prepared for Maarif Calendar. These fields are not stored yet.</p>
-<label class="toggle"><input type="checkbox" id="same-prayer-location" checked disabled><span>Use weather location</span></label>
-<label class="field"><span>Prayer location</span><input type="text" id="prayer-location" disabled value="{escaped['weather_query']}"></label>
-<label class="field"><span>Prayer country</span><input type="text" id="prayer-country" disabled value="{escaped['country']}"></label>
-</div>
-</details>
+
+<!-- TAB CONTENTS -->
+
+<!-- 1. Overview Tab -->
+<section class="card tab-content active" id="overview">
+  <h2>Overview</h2>
+  <p class="section-note">Quick summary and primary dashboard actions.</p>
+  <div class="overview-stats">
+    <div class="stat-item">
+      <small>Location</small>
+      <strong>{escaped['location_label']}</strong>
+    </div>
+    <div class="stat-item">
+      <small>Theme</small>
+      <strong>{escaped['theme']}</strong>
+    </div>
+    <div class="stat-item">
+      <small>Last Generated</small>
+      <strong>{html.escape(status_message or 'No result in this session')}</strong>
+    </div>
+    <div class="stat-item">
+      <small>Server Status</small>
+      <strong style="color: #2f855a;">Online</strong>
+    </div>
+    <div class="stat-item">
+      <small>Kindle Connection</small>
+      <strong id="overview-kindle-connection">Checking…</strong>
+    </div>
+  </div>
+  <div class="button-grid overview-actions">
+    <button type="submit">Save &amp; Regenerate</button>
+    <button type="button" id="overview-push-kindle-btn">Push to Kindle</button>
+  </div>
 </section>
-<section class="card display" id="display">
-<h2>Display</h2>
-<p class="section-note">Choose what appears on Home Dashboard.</p>
-<div class="toggle-list">
-<label class="toggle"><input type="checkbox" name="show_weather"{checked('show_weather')}> <span>Weather</span></label>
-<label class="toggle"><input type="checkbox" name="show_forecast"{checked('show_forecast')}> <span>Forecast</span></label>
-<label class="toggle"><input type="checkbox" name="show_server"{checked('show_server')}> <span>Server status</span></label>
-<label class="toggle"><input type="checkbox" name="show_pihole"{checked('show_pihole')}> <span>Pi-hole</span></label>
-<label class="toggle"><input type="checkbox" name="show_tailscale"{checked('show_tailscale')}> <span>Tailscale</span></label>
-</div>
+
+<!-- 2. Location Tab -->
+<section class="card tab-content" id="location">
+  <h2>Location</h2>
+  <p class="section-note">Search for a city, then select the correct result.</p>
+  <label class="field"><span>Search city</span><input type="search" id="city-search" value="{escaped['location']}" placeholder="Nottingham, Istanbul, London…" autocomplete="off"></label>
+  <div class="city-results" id="city-results" aria-live="polite"></div>
+  <div class="match" id="city-match">Selected: {escaped['location_display']} · {escaped['timezone']}</div>
+  <details class="advanced">
+    <summary>Advanced location settings</summary>
+    <label class="field"><span>Dashboard title</span><input type="text" name="title" maxlength="28" value="{escaped['title']}" required></label>
+    <label class="field"><span>City</span><input type="text" name="location" maxlength="100" value="{escaped['location']}" required></label>
+    <label class="field"><span>Country</span><input type="text" name="country" maxlength="100" value="{escaped['country']}"></label>
+    <label class="field"><span>Latitude</span><input type="number" name="latitude" step="any" min="-90" max="90" value="{html.escape(latitude_value, quote=True)}"></label>
+    <label class="field"><span>Longitude</span><input type="number" name="longitude" step="any" min="-180" max="180" value="{html.escape(longitude_value, quote=True)}"></label>
+    <label class="field"><span>Display name</span><input type="text" name="location_display" maxlength="160" value="{escaped['location_display']}" required></label>
+    <label class="field"><span>Weather query</span><input type="text" name="weather_query" maxlength="100" value="{escaped['weather_query']}" required></label>
+    <label class="field"><span>Location label</span><input type="text" name="location_label" maxlength="160" value="{escaped['location_label']}" required></label>
+    <label class="field"><span>Timezone</span><input type="text" name="timezone" maxlength="64" value="{escaped['timezone']}" required></label>
+    <div class="future-box">
+      <h3>Prayer location · future</h3>
+      <p>Prepared for Maarif Calendar. These fields are not stored yet.</p>
+      <label class="toggle"><input type="checkbox" id="same-prayer-location" checked disabled><span>Use weather location</span></label>
+      <label class="field"><span>Prayer location</span><input type="text" id="prayer-location" disabled value="{escaped['weather_query']}"></label>
+      <label class="field"><span>Prayer country</span><input type="text" id="prayer-country" disabled value="{escaped['country']}"></label>
+    </div>
+  </details>
 </section>
-<section class="card theme" id="theme">
-<h2>Theme</h2>
-<p class="section-note">Choose the dashboard’s visual focus.</p>
-<div class="theme-list">{theme_cards}</div>
+
+<!-- 3. Theme Tab -->
+<section class="card tab-content" id="theme">
+  <h2>Theme</h2>
+  <p class="section-note">Choose the dashboard’s visual focus.</p>
+  <div class="theme-list">{theme_cards}</div>
 </section>
-<section class="card device" id="device">
-<details class="device-details" open>
-<summary><h2>Device Controls</h2></summary>
-<div class="device-state">
-<div class="device-stat"><small>Connection</small><strong id="kindle-connection">Checking…</strong></div>
-<div class="device-stat"><small>Brightness</small><strong id="kindle-brightness">—</strong></div>
-<div class="device-stat"><small>Autostart</small><strong id="kindle-autostart">—</strong></div>
-</div>
-<p class="device-message" id="device-message" role="status">Ready</p>
-<div class="button-grid">{device_buttons}</div>
-<h3>Front light</h3>
-<div class="light-grid">{light_buttons}</div>
-<button type="button" id="restart-kindle">Restart Kindle</button>
-<h3>Recent dashboard log</h3>
-<pre class="log-box" id="device-log">Loading…</pre>
-</details>
+
+<!-- 4. Display Tab -->
+<section class="card tab-content" id="display">
+  <h2>Display</h2>
+  <p class="section-note">Choose what appears on Home Dashboard.</p>
+  <div class="toggle-list">
+    <label class="toggle"><input type="checkbox" name="show_weather"{checked('show_weather')}> <span>Weather</span></label>
+    <label class="toggle"><input type="checkbox" name="show_forecast"{checked('show_forecast')}> <span>Forecast</span></label>
+    <label class="toggle"><input type="checkbox" name="show_server"{checked('show_server')}> <span>Server status</span></label>
+    <label class="toggle"><input type="checkbox" name="show_pihole"{checked('show_pihole')}> <span>Pi-hole</span></label>
+    <label class="toggle"><input type="checkbox" name="show_tailscale"{checked('show_tailscale')}> <span>Tailscale</span></label>
+  </div>
 </section>
-<section class="card status" id="status">
-<h2>Status</h2>
-<dl class="status-list">
-<div class="status-row"><dt>Current title</dt><dd>{escaped['title']}</dd></div>
-<div class="status-row"><dt>Weather query</dt><dd>{escaped['weather_query']}</dd></div>
-<div class="status-row"><dt>Location label</dt><dd>{escaped['location_label']}</dd></div>
-<div class="status-row"><dt>Timezone</dt><dd>{escaped['timezone']}</dd></div>
-<div class="status-row"><dt>Selected theme</dt><dd>{escaped['theme']}</dd></div>
-<div class="status-row"><dt>Last generation</dt><dd>{html.escape(status_message or 'No result in this session')}</dd></div>
-<div class="status-row"><dt>Last push</dt><dd id="last-push">Not in this session</dd></div>
-</dl>
+
+<!-- 5. Device Tab -->
+<section class="card tab-content" id="device">
+  <h2>Device Controls</h2>
+  <p class="section-note">Autostart controls, front light levels, and device actions.</p>
+  <div class="device-state">
+    <div class="device-stat"><small>Connection</small><strong id="kindle-connection">Checking…</strong></div>
+    <div class="device-stat"><small>Brightness</small><strong id="kindle-brightness">—</strong></div>
+    <div class="device-stat"><small>Autostart</small><strong id="kindle-autostart">—</strong></div>
+  </div>
+  <p class="device-message" id="device-message" role="status">Ready</p>
+  <div class="button-grid">{device_buttons}</div>
+  <h3 style="margin-top:20px;font-size:1.1rem;font-weight:700">Front light</h3>
+  <div class="light-grid">{light_buttons}</div>
+  <button type="button" id="restart-kindle" style="width:100%;border-color:#e53e3e;color:#e53e3e;background:#fff5f5">Restart Kindle</button>
 </section>
-<section class="card maintenance" id="maintenance">
-<details>
-<summary>Advanced / Maintenance</summary>
-<p class="section-note">Occasional server maintenance actions.</p>
-<button type="button" id="restart-settings-server">Restart Settings Server</button>
-<p class="maintenance-message" id="maintenance-message" role="status"></p>
-</details>
+
+<!-- 6. Maintenance Tab -->
+<section class="card tab-content" id="maintenance">
+  <h2>Advanced / Maintenance</h2>
+  <p class="section-note">Occasional server maintenance actions and recent logs.</p>
+  <button type="button" id="restart-settings-server" style="width:100%;margin-bottom:12px;border-color:#dd6b20;color:#dd6b20;background:#fffaf0">Restart Settings Server</button>
+  <p class="maintenance-message" id="maintenance-message" role="status"></p>
+  <h3 style="margin-top:20px;font-size:1.1rem;font-weight:700">Recent dashboard log</h3>
+  <pre class="log-box" id="device-log">Loading…</pre>
 </section>
-</div>
+
+<!-- 7. Status Tab -->
+<section class="card tab-content" id="status">
+  <h2>Status</h2>
+  <p class="section-note">Current server environment and settings info.</p>
+  <dl class="status-list">
+    <div class="status-row"><dt>Current title</dt><dd>{escaped['title']}</dd></div>
+    <div class="status-row"><dt>Weather query</dt><dd>{escaped['weather_query']}</dd></div>
+    <div class="status-row"><dt>Location label</dt><dd>{escaped['location_label']}</dd></div>
+    <div class="status-row"><dt>Timezone</dt><dd>{escaped['timezone']}</dd></div>
+    <div class="status-row"><dt>Selected theme</dt><dd>{escaped['theme']}</dd></div>
+    <div class="status-row"><dt>Last generation</dt><dd>{html.escape(status_message or 'No result in this session')}</dd></div>
+    <div class="status-row"><dt>Last push</dt><dd id="last-push">Not in this session</dd></div>
+  </dl>
+</section>
+
+<nav class="bottom-nav" aria-label="Dashboard sections" style="display:none">
+  <a href="#location">Settings</a>
+  <a href="#theme">Theme</a>
+  <a href="#device">Device</a>
+  <a href="#status">Status</a>
+</nav>
 <div class="action-bar">
-<button type="submit">Save &amp; Regenerate</button>
-<button type="button" id="push-kindle">Push to Kindle</button>
+  <button type="submit">Save &amp; Regenerate</button>
+  <button type="button" id="push-kindle">Push to Kindle</button>
+</div>
 </div>
 </form>
 </main>
-<nav class="bottom-nav" aria-label="Dashboard sections">
-<a href="#location">Settings</a>
-<a href="#theme">Theme</a>
-<a href="#device">Device</a>
-<a href="#status">Status</a>
-</nav>
 <script>
+const tabBtns=document.querySelectorAll(".tab-btn");
+const tabContents=document.querySelectorAll(".tab-content");
+function switchTab(tabId){{
+  tabBtns.forEach(btn=>btn.classList.toggle("active",btn.dataset.tab===tabId));
+  tabContents.forEach(content=>content.classList.toggle("active",content.id===tabId));
+  localStorage.setItem("active_tab",tabId);
+  window.location.hash=tabId;
+}}
+tabBtns.forEach(btn=>btn.addEventListener("click",()=>switchTab(btn.dataset.tab)));
+const initialTab=window.location.hash.slice(1)||localStorage.getItem("active_tab")||"overview";
+if(document.getElementById(initialTab)){{
+  switchTab(initialTab);
+}}else{{
+  switchTab("overview");
+}}
+window.addEventListener("hashchange",()=>{{
+  const tabId=window.location.hash.slice(1);
+  if(document.getElementById(tabId)) switchTab(tabId);
+}});
+
+const overviewPushBtn=document.getElementById("overview-push-kindle-btn");
+if(overviewPushBtn){{
+  overviewPushBtn.addEventListener("click",()=>{{
+    document.getElementById("push-kindle").click();
+  }});
+}}
+
 const citySearch=document.getElementById("city-search");
 const cityResults=document.getElementById("city-results");
 const cityMatch=document.getElementById("city-match");
@@ -474,9 +601,19 @@ async function loadDeviceState(){{
     brightnessValue.textContent=status.brightness;
     autostartValue.textContent=status.autostart;
     deviceLog.textContent=log.log||"No dashboard log yet.";
+    const overviewKindleConn=document.getElementById("overview-kindle-connection");
+    if(overviewKindleConn){{
+      overviewKindleConn.textContent=status.connected?"Online":"Offline";
+      overviewKindleConn.style.color=status.connected?"#2f855a":"#c53030";
+    }}
   }}catch(error){{
     connectionValue.textContent="Offline";
     deviceMessage.textContent=error.message;
+    const overviewKindleConn=document.getElementById("overview-kindle-connection");
+    if(overviewKindleConn){{
+      overviewKindleConn.textContent="Offline";
+      overviewKindleConn.style.color="#c53030";
+    }}
   }}
 }}
 async function runDeviceAction(button,path,body){{

@@ -28,45 +28,6 @@ CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 MAX_REQUEST_BYTES = 16 * 1024
 
-PRESETS = {
-    "Nottingham": {
-        "title": "NOTTINGHAM HOME",
-        "location_label": "Nottingham, UK",
-        "weather_query": "Nottingham",
-        "timezone": "Europe/London",
-    },
-    "London": {
-        "title": "LONDON DASHBOARD",
-        "location_label": "London, UK",
-        "weather_query": "London",
-        "timezone": "Europe/London",
-    },
-    "Birmingham": {
-        "title": "BIRMINGHAM DASHBOARD",
-        "location_label": "Birmingham, UK",
-        "weather_query": "Birmingham",
-        "timezone": "Europe/London",
-    },
-    "Manchester": {
-        "title": "MANCHESTER DASHBOARD",
-        "location_label": "Manchester, UK",
-        "weather_query": "Manchester",
-        "timezone": "Europe/London",
-    },
-    "Istanbul": {
-        "title": "ISTANBUL DASHBOARD",
-        "location_label": "Istanbul, Türkiye",
-        "weather_query": "Istanbul",
-        "timezone": "Europe/Istanbul",
-    },
-    "Ankara": {
-        "title": "ANKARA DASHBOARD",
-        "location_label": "Ankara, Türkiye",
-        "weather_query": "Ankara",
-        "timezone": "Europe/Istanbul",
-    },
-}
-
 CITY_DATA = [
     ("Nottingham", "United Kingdom", "Nottingham, UK", "Europe/London",
      "NOTTINGHAM HOME"),
@@ -187,11 +148,6 @@ def render_settings(config, csrf_token, status_message=""):
     def checked(key):
         return " checked" if config[key] else ""
 
-    preset_buttons = "".join(
-        f'<button type="button" class="preset" data-preset="{html.escape(name)}">'
-        f"{html.escape(name)}</button>"
-        for name in PRESETS
-    )
     theme_cards = "".join(
         f'<label class="theme-choice{" disabled" if not definition["implemented"] else ""}">'
         f'<input type="radio" name="theme" value="{html.escape(theme, quote=True)}"'
@@ -254,8 +210,6 @@ input:focus,select:focus{{outline:3px solid rgba(17,17,17,.12);border-color:#333
 button{{min-height:48px;padding:10px 12px;border:1px solid #555;border-radius:12px;background:#fff;color:#111;font:700 .95rem system-ui;touch-action:manipulation}}
 button:active:not(:disabled){{transform:translateY(1px)}}
 button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allowed}}
-.preset-grid{{display:flex;flex-wrap:wrap;gap:8px;margin:0 -2px 16px;padding:2px}}
-.preset{{flex:0 0 auto;min-height:42px;padding:7px 14px;border-radius:999px}}
 .match{{margin:-4px 0 8px;padding:11px 12px;border-radius:12px;background:var(--soft);color:var(--muted);font-size:.9rem}}
 .city-results{{display:grid;gap:8px;margin:0 0 14px}}
 .city-result{{display:grid;gap:3px;width:100%;min-height:58px;text-align:left;padding:10px 12px;border-color:var(--line)}}
@@ -323,7 +277,6 @@ button:disabled{{color:#777;background:#eee;border-color:#d2d2d2;cursor:not-allo
 <section class="card location" id="location">
 <h2>Location</h2>
 <p class="section-note">Search for a city, then select the correct result.</p>
-<div class="preset-grid">{preset_buttons}</div>
 <label class="field"><span>Search city</span><input type="search" id="city-search" value="{escaped['location']}" placeholder="Nottingham, Istanbul, London…" autocomplete="off"></label>
 <div class="city-results" id="city-results" aria-live="polite"></div>
 <div class="match" id="city-match">Selected: {escaped['location_display']} · {escaped['timezone']}</div>
@@ -497,10 +450,6 @@ citySearch.addEventListener("input",()=>{{
   clearTimeout(citySearchTimer);
   citySearchTimer=setTimeout(()=>searchCities(citySearch.value),350);
 }});
-document.querySelectorAll("[data-preset]").forEach(button=>button.addEventListener("click",()=>{{
-  citySearch.value=button.dataset.preset;
-  searchCities(button.dataset.preset);
-}}));
 const csrfToken=document.querySelector('[name="csrf_token"]').value;
 const deviceMessage=document.getElementById("device-message");
 const connectionValue=document.getElementById("kindle-connection");

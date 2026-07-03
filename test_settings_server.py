@@ -237,14 +237,17 @@ class SettingsServerTests(unittest.TestCase):
         status, _, _ = self.request("GET", "/not-a-route")
         self.assertEqual(status, 404)
 
-    def test_settings_form_contains_fields_and_presets(self):
+    def test_settings_form_contains_city_search_without_quick_shortcuts(self):
         status, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")
         self.assertEqual(status, 200)
         self.assertIn('name="title"', text)
         self.assertIn('name="weather_query"', text)
-        self.assertIn("Nottingham", text)
-        self.assertIn("Istanbul", text)
+        self.assertIn('id="city-search"', text)
+        self.assertIn('id="city-results"', text)
+        self.assertIn("Advanced location settings", text)
+        self.assertNotIn('data-preset="', text)
+        self.assertNotIn('class="preset-grid"', text)
 
     def test_settings_page_has_mobile_app_metadata_and_navigation(self):
         status, _, body = self.request("GET", "/settings")

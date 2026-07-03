@@ -15,7 +15,7 @@ ALL_VISIBLE = {
 
 
 class ThemeRegistryTests(unittest.TestCase):
-    def test_registry_contains_four_implemented_themes_and_placeholder(self):
+    def test_registry_contains_five_implemented_themes(self):
         self.assertEqual(
             list(dashboard_themes.THEMES),
             [
@@ -26,7 +26,7 @@ class ThemeRegistryTests(unittest.TestCase):
                 "maarif_calendar",
             ],
         )
-        self.assertFalse(
+        self.assertTrue(
             dashboard_themes.THEMES["maarif_calendar"]["implemented"]
         )
 
@@ -38,7 +38,7 @@ class ThemeRegistryTests(unittest.TestCase):
             flags,
         )
 
-    def test_minimal_and_travel_force_weather_only(self):
+    def test_minimal_travel_and_maarif_force_weather_only(self):
         expected = {
             "show_weather": True,
             "show_forecast": True,
@@ -46,7 +46,7 @@ class ThemeRegistryTests(unittest.TestCase):
             "show_pihole": False,
             "show_tailscale": False,
         }
-        for theme in ("minimal_weather", "travel_weather"):
+        for theme in ("minimal_weather", "travel_weather", "maarif_calendar"):
             with self.subTest(theme=theme):
                 self.assertEqual(
                     dashboard_themes.effective_visibility(theme, ALL_VISIBLE),
@@ -69,7 +69,7 @@ class ThemeRegistryTests(unittest.TestCase):
         )
 
     def test_placeholder_and_unknown_themes_are_rejected(self):
-        for theme in ("maarif_calendar", "unknown"):
+        for theme in ("unknown",):
             with self.subTest(theme=theme):
                 with self.assertRaises(ValueError):
                     dashboard_themes.validate_theme(theme)
@@ -80,6 +80,7 @@ class ThemeRegistryTests(unittest.TestCase):
             "minimal_weather",
             "server_monitor",
             "travel_weather",
+            "maarif_calendar",
         ):
             with self.subTest(theme=theme):
                 config = dict(weather_image.DEFAULT_CONFIG)
@@ -88,10 +89,6 @@ class ThemeRegistryTests(unittest.TestCase):
                     weather_image.validate_config(config)["theme"],
                     theme,
                 )
-        config = dict(weather_image.DEFAULT_CONFIG)
-        config["theme"] = "maarif_calendar"
-        with self.assertRaises(ValueError):
-            weather_image.validate_config(config)
 
     def test_every_implemented_theme_has_a_renderer(self):
         self.assertEqual(
@@ -101,6 +98,7 @@ class ThemeRegistryTests(unittest.TestCase):
                 "minimal_weather",
                 "server_monitor",
                 "travel_weather",
+                "maarif_calendar",
             },
         )
 

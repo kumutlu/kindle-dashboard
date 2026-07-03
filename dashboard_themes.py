@@ -32,8 +32,11 @@ THEMES = {
     },
     "maarif_calendar": {
         "label": "Maarif Calendar",
-        "description": "Coming soon",
-        "implemented": False,
+        "name": "Maarif Calendar",
+        "description": "Traditional Turkish Maarif calendar style dashboard",
+        "category": "calendar / lifestyle",
+        "status": "active",
+        "implemented": True,
     },
 }
 
@@ -67,7 +70,7 @@ def effective_visibility(theme, config):
     validate_theme(theme)
     if theme == "home_dashboard":
         return {key: config[key] for key in VISIBILITY_FIELDS}
-    if theme in ("minimal_weather", "travel_weather"):
+    if theme in ("minimal_weather", "travel_weather", "maarif_calendar"):
         return dict(WEATHER_ONLY)
     if theme == "server_monitor":
         return dict(SERVER_ONLY)

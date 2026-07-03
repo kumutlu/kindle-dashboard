@@ -185,8 +185,8 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIsNotNone(match)
         return match.group(1).decode("ascii")
 
-    def test_binding_is_home_lan_only(self):
-        self.assertEqual(settings_server.BIND_HOST, "192.168.68.167")
+    def test_binding_allows_remote_access(self):
+        self.assertEqual(settings_server.BIND_HOST, "0.0.0.0")
         self.assertEqual(settings_server.PORT, 8767)
 
     def test_health_and_unknown_route(self):
@@ -275,7 +275,7 @@ class SettingsServerTests(unittest.TestCase):
             self.assertIn(f'class="toggle"><input type="checkbox" name="{name}"', text)
         self.assertIn("@media (min-width: 760px)", text)
 
-    def test_theme_selector_lists_implemented_and_disabled_placeholder(self):
+    def test_theme_selector_lists_all_implemented_themes(self):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")
         for value in (
@@ -283,15 +283,16 @@ class SettingsServerTests(unittest.TestCase):
             "minimal_weather",
             "server_monitor",
             "travel_weather",
+            "maarif_calendar",
         ):
             self.assertIn(
                 f'type="radio" name="theme" value="{value}"',
                 text,
             )
-        self.assertIn(
-            'type="radio" name="theme" value="maarif_calendar" disabled',
-            text,
-        )
+            self.assertNotIn(
+                f'type="radio" name="theme" value="{value}" disabled',
+                text,
+            )
 
     def test_location_card_has_city_country_timezone_and_advanced_fields(self):
         _, _, body = self.request("GET", "/settings")
@@ -423,7 +424,7 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
 
         placeholder = dict(weather_image.DEFAULT_CONFIG)
-        placeholder["theme"] = "maarif_calendar"
+        placeholder["theme"] = "unknown"
         status, _, _ = self.request(
             "POST",
             "/api/config",

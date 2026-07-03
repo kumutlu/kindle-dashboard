@@ -316,6 +316,263 @@ def fetch_weather(query, timezone):
     return weather
 
 
+# --- Turkish/English Localized Maarif Calendar Helpers ---
+
+LOCALES = {
+    "tr": {
+        "hijri_suffix": "Hicri",
+        "rumi_suffix": "Rumi",
+        "remaining_daylight_label": "Kalan Günışığı",
+        "day_lengthening_label": "Günün Uzaması: 2 dk",
+        "year_label": "Yıl",
+        "month_label": "Ay",
+        "day_label": "Gün",
+        "weather_label": "HAVA DURUMU",
+        "day_length_prefix": "Günün uzunluğu",
+        "night_length_prefix": "Gecenin uzunluğu",
+        "year_day_suffix": "günü",
+        "year_day_prefix": "Yılın",
+        "daily_wisdom_label": "GÜNÜN SÖZÜ",
+        "credit_label": "Büyük Saatli Maarif Takvimi",
+        "prayers": ["Güneş", "Öğle", "İkindi", "Akşam", "Yatsı", "İmsak"],
+        "weather_rows": ["Derece", "Durum", "Gün Batımı", "Nem", "Basınç", "Rüzgar"],
+        "months": {
+            1: "OCAK", 2: "ŞUBAT", 3: "MART", 4: "NİSAN", 5: "MAYIS", 6: "HAZİRAN",
+            7: "TEMMUZ", 8: "AĞUSTOS", 9: "EYLÜL", 10: "EKİM", 11: "KASIM", 12: "ARALIK"
+        },
+        "hijri_months": {
+            1: "MUHARREM", 2: "SAFER", 3: "REBİÜLEVVEL", 4: "REBİÜLAHİR",
+            5: "CEMAZİYELEVVEL", 6: "CEMAZİYELAHİR", 7: "RECEP", 8: "ŞABAN",
+            9: "RAMAZAN", 10: "ŞEVVAL", 11: "ZİLKADE", 12: "ZİLHİCCE"
+        },
+        "weekdays": {
+            0: "PAZARTESİ", 1: "SALI", 2: "ÇARŞAMBA", 3: "PERŞEMBE",
+            4: "CUMA", 5: "CUMARTESİ", 6: "PAZAR"
+        },
+        "seasons": {
+            "Hızır": "Hızır",
+            "Kasım": "Kasım"
+        },
+        "weather_desc": {
+            "sun": "Açık",
+            "partly": "Parçalı Bulutlu",
+            "cloud": "Bulutlu",
+            "rain": "Yağmurlu",
+            "snow": "Karlı",
+            "storm": "Fırtınalı",
+            "fog": "Sisli"
+        },
+        "temp_desc": {
+            "cold": "Soğuk",
+            "mild": "Ilık",
+            "warm": "Sıcak",
+            "hot": "Çok Sıcak"
+        },
+        "quotes": [
+            ("Doğanın isteklerini anlamamazlıktan gelen", "cezasını görür.", "H. de Balzac"),
+            ("İşleyen demir pas tutmaz,", "çalışan insan kötülük düşünmez.", "Atasözü"),
+            ("Bir elin nesi var,", "iki elin sesi var.", "Atasözü"),
+            ("Dost acı söyler ama", "doğruyu söyler.", "Atasözü"),
+            ("Sabır acıdır,", "meyvesi tatlıdır.", "Atasözü"),
+            ("Akıl yaşta değil,", "baştadır.", "Atasözü"),
+            ("Bugünün işini", "asla yarına bırakma.", "Atasözü"),
+            ("Bilmemek ayıp değil,", "öğrenmemek ayıptır.", "Atasözü"),
+            ("Birlikten kuvvet doğar,", "dirlik ve düzen gelir.", "Atasözü"),
+            ("Komşu komşunun", "külüne muhtaçtır.", "Atasözü"),
+            ("Ne ekersen", "onu biçersin.", "Atasözü"),
+            ("Gülü seven", "dikenine katlanır.", "Atasözü"),
+            ("Damlaya damlaya", "göl olur.", "Atasözü"),
+            ("Ayağını yorganına", "göre uzat.", "Atasözü"),
+            ("Tatlı dil", "yılanı deliğinden çıkarır.", "Atasözü"),
+            ("Sakla samanı,", "gelir zamanı.", "Atasözü"),
+            ("Ağaç yaşken", "eğilir.", "Atasözü"),
+            ("Öfkeyle kalkan", "zararla oturur.", "Atasözü"),
+            ("Güneş balçıkla", "sıvanmaz.", "Atasözü"),
+            ("Rüzgâr eken,", "fırtına biçer.", "Atasözü"),
+        ],
+        "h_unit": "S.",
+        "m_unit": "D."
+    },
+    "en": {
+        "hijri_suffix": "Hijri",
+        "rumi_suffix": "Rumi",
+        "remaining_daylight_label": "Remaining Daylight",
+        "day_lengthening_label": "Day Lengthening: 2 min",
+        "year_label": "Year",
+        "month_label": "Month",
+        "day_label": "Day",
+        "weather_label": "WEATHER",
+        "day_length_prefix": "Day length",
+        "night_length_prefix": "Night length",
+        "year_day_suffix": "day of the year",
+        "year_day_prefix": "The",
+        "daily_wisdom_label": "DAILY WISDOM",
+        "credit_label": "Grand Maarif Calendar",
+        "prayers": ["Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha", "Fajr"],
+        "weather_rows": ["Temp", "Condition", "Sunset", "Humidity", "Pressure", "Wind"],
+        "months": {
+            1: "JANUARY", 2: "FEBRUARY", 3: "MARCH", 4: "APRIL", 5: "MAY", 6: "JUNE",
+            7: "JULY", 8: "AUGUST", 9: "SEPTEMBER", 10: "OCTOBER", 11: "NOVEMBER", 12: "DECEMBER"
+        },
+        "hijri_months": {
+            1: "MUHARRAM", 2: "SAFAR", 3: "RABI I", 4: "RABI II",
+            5: "JUMADA I", 6: "JUMADA II", 7: "RAJAB", 8: "SHA'BAN",
+            9: "RAMADAN", 10: "SHAWWAL", 11: "DHU'L-QA'DA", 12: "DHU'L-HIJJAH"
+        },
+        "weekdays": {
+            0: "MONDAY", 1: "TUESDAY", 2: "WEDNESDAY", 3: "THURSDAY",
+            4: "FRIDAY", 5: "SATURDAY", 6: "SUNDAY"
+        },
+        "seasons": {
+            "Hızır": "Summer",
+            "Kasım": "Winter"
+        },
+        "weather_desc": {
+            "sun": "Clear",
+            "partly": "Partly Cloudy",
+            "cloud": "Cloudy",
+            "rain": "Rainy",
+            "snow": "Snowy",
+            "storm": "Stormy",
+            "fog": "Foggy"
+        },
+        "temp_desc": {
+            "cold": "Cold",
+            "mild": "Mild",
+            "warm": "Warm",
+            "hot": "Hot"
+        },
+        "quotes": [
+            ("He who ignores the requests of nature", "receives its punishment.", "H. de Balzac"),
+            ("A rolling stone", "gathers no moss.", "Proverb"),
+            ("Actions speak", "louder than words.", "Proverb"),
+            ("A friend in need", "is a friend indeed.", "Proverb"),
+            ("Patience is bitter,", "but its fruit is sweet.", "Proverb"),
+            ("Wisdom is not in age,", "but in the head.", "Proverb"),
+            ("Never put off till tomorrow", "what you can do today.", "Proverb"),
+            ("It is not a shame not to know,", "it is a shame not to learn.", "Proverb"),
+            ("Unity makes strength,", "division brings fall.", "Proverb"),
+            ("A neighbor needs the smoke", "of his neighbor's chimney.", "Proverb"),
+            ("As you sow,", "so shall you reap.", "Proverb"),
+            ("He who loves the rose", "endures its thorns.", "Proverb"),
+            ("Many a mickle", "makes a muckle.", "Proverb"),
+            ("Cut your coat according", "to your cloth.", "Proverb"),
+            ("A soft answer", "turns away wrath.", "Proverb"),
+            ("No pain,", "no gain.", "Proverb"),
+            ("Barking dogs", "seldom bite.", "Proverb"),
+            ("Better late", "than never.", "Proverb"),
+            ("Truth is stranger", "than fiction.", "Proverb"),
+            ("Where there is a will,", "there is a way.", "Proverb"),
+        ],
+        "h_unit": "h",
+        "m_unit": "m"
+    }
+}
+
+def get_dashboard_lang(config):
+    tz = config.get("timezone", "").lower()
+    loc = config.get("location_label", "").lower()
+    title = config.get("title", "").lower()
+    if "istanbul" in tz or "turkey" in loc or "türkiye" in loc:
+        return "tr"
+    turkish_keywords = ["ev", "panel", "takvim", "maarif", "istanbul", "ankara", "izmir"]
+    if any(kw in title for kw in turkish_keywords) or any(kw in loc for kw in turkish_keywords):
+        return "tr"
+    return "en"
+
+def draw_star(d, cx, cy, size):
+    import math
+    points = []
+    for i in range(10):
+        r = size if i % 2 == 0 else size * 0.4
+        angle = i * math.pi / 5 - math.pi / 2
+        x = cx + r * math.cos(angle)
+        y = cy + r * math.sin(angle)
+        points.append((x, y))
+    d.polygon(points, fill=0)
+
+
+def gregorian_to_hijri(g_year, g_month, g_day):
+    import datetime
+    try:
+        g_date = datetime.date(g_year, g_month, g_day)
+        epoch = datetime.date(622, 7, 16)
+        diff = (g_date - epoch).days
+        h_year = int(diff / 354.367068) + 1
+        year_days = diff - int((h_year - 1) * 354.367068)
+        h_month = int(year_days / 29.530559) + 1
+        h_day = int(year_days - int((h_month - 1) * 29.530559)) + 1
+        if h_day > 30:
+            h_day -= 30
+            h_month += 1
+        if h_month > 12:
+            h_month -= 12
+            h_year += 1
+        return h_year, h_month, h_day
+    except Exception:
+        return 1448, 1, 8
+
+def gregorian_to_rumi(g_year, g_month, g_day):
+    import datetime
+    try:
+        g_date = datetime.datetime(g_year, g_month, g_day)
+        rumi_date = g_date - datetime.timedelta(days=13)
+        if rumi_date.month in (1, 2):
+            rumi_year = rumi_date.year - 585
+        else:
+            rumi_year = rumi_date.year - 584
+        return rumi_year, rumi_date.month, rumi_date.day
+    except Exception:
+        return 1442, 6, 20
+
+def turkish_season_info(now_dt):
+    import datetime
+    try:
+        curr_year = now_dt.year
+        hizir_start = datetime.date(curr_year, 5, 6)
+        kasim_start = datetime.date(curr_year, 11, 8)
+        curr_date = datetime.date(now_dt.year, now_dt.month, now_dt.day)
+        if curr_date >= hizir_start and curr_date < kasim_start:
+            season = "Hızır"
+            days = (curr_date - hizir_start).days + 1
+        else:
+            season = "Kasım"
+            if curr_date < hizir_start:
+                k_start = datetime.date(curr_year - 1, 11, 8)
+            else:
+                k_start = kasim_start
+            days = (curr_date - k_start).days + 1
+        return season, days
+    except Exception:
+        return "Hızır", 59
+
+def resolve_coordinates(query):
+    try:
+        geocoding_url = (
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + urlencode({
+                "name": query,
+                "count": 1,
+                "language": "en",
+                "format": "json",
+            })
+        )
+        geocoding = http_json(geocoding_url, timeout=6)
+        results = geocoding.get("results") or []
+        if results:
+            return results[0]["latitude"], results[0]["longitude"]
+    except Exception:
+        pass
+    q = query.lower()
+    if "istanbul" in q:
+        return 41.0082, 28.9784
+    if "ankara" in q:
+        return 39.9334, 32.8597
+    if "london" in q:
+        return 51.5074, -0.1278
+    return 52.9548, -1.1581
+
+
 def get_cpu():
     out = sh("top -bn1 | grep 'Cpu(s)'")
     try:
@@ -666,6 +923,111 @@ def collect_dashboard_data(config):
     current = weather["current_condition"][0]
     days = weather["weather"]
     now = datetime.now(ZoneInfo(config["timezone"]))
+    
+    # Auto-detect language
+    lang = get_dashboard_lang(config)
+    locale = LOCALES[lang]
+    
+    # Maarif-specific calculations
+    lat, lng = resolve_coordinates(config["weather_query"])
+    prayer_data = None
+    try:
+        url = f"http://api.aladhan.com/v1/timings?latitude={lat}&longitude={lng}&method=13"
+        prayer_data = http_json(url, timeout=7)
+    except Exception as e:
+        print(f"Failed to fetch prayer times: {e}")
+        
+    if prayer_data and prayer_data.get("code") == 200:
+        p_data = prayer_data["data"]
+        timings = p_data["timings"]
+        hijri = p_data["date"]["hijri"]
+        hijri_day = int(hijri["day"])
+        hijri_month_num = int(hijri["month"]["number"])
+        hijri_year = int(hijri["year"])
+    else:
+        # Fallback Hijri calculation
+        hijri_year, hijri_month_num, hijri_day = gregorian_to_hijri(now.year, now.month, now.day)
+        # Fallback seasonal timings
+        import math
+        day_of_year = now.timetuple().tm_yday
+        offset = 60 * math.sin(2 * math.pi * (day_of_year - 80) / 365.0)
+        timings = {
+            "Fajr": f"{int((270 - offset) // 60):02d}:{int((270 - offset) % 60):02d}",
+            "Sunrise": f"{int((360 - offset) // 60):02d}:{int((360 - offset) % 60):02d}",
+            "Dhuhr": "13:08",
+            "Asr": f"{int((1020 + offset // 2) // 60):02d}:{int((1020 + offset // 2) % 60):02d}",
+            "Maghrib": f"{int((1260 + offset) // 60):02d}:{int((1260 + offset) % 60):02d}",
+            "Isha": f"{int((1350 + offset) // 60):02d}:{int((1350 + offset) % 60):02d}",
+            "Imsak": f"{int((260 - offset) // 60):02d}:{int((260 - offset) % 60):02d}"
+        }
+
+    # Calendar dates
+    rumi_year, rumi_month_num, rumi_day = gregorian_to_rumi(now.year, now.month, now.day)
+    hijri_month_name = locale["hijri_months"].get(hijri_month_num, "MUHARREM")
+    rumi_month_name = locale["months"].get(rumi_month_num, "OCAK")
+    greg_month_localized = locale["months"].get(now.month, "OCAK")
+    day_name_localized = locale["weekdays"].get(now.weekday(), "PAZARTESİ")
+    
+    # Season Info
+    season_key, season_day = turkish_season_info(now)
+    season_name = locale["seasons"].get(season_key, "Hızır")
+    
+    # Daylight calculations
+    sunrise_time = days[0]["astronomy"][0]["sunrise"][:5]
+    sunset_time = days[0]["astronomy"][0]["sunset"][:5]
+    try:
+        sr_h, sr_m = map(int, sunrise_time.split(":"))
+        ss_h, ss_m = map(int, sunset_time.split(":"))
+        sr_min = sr_h * 60 + sr_m
+        ss_min = ss_h * 60 + ss_m
+        day_len_min = ss_min - sr_min
+        
+        day_h = day_len_min // 60
+        day_m = day_len_min % 60
+        day_length_str = f"{day_h} {locale['h_unit']} {day_m} {locale['m_unit']}"
+        
+        night_len_min = 1440 - day_len_min
+        night_h = night_len_min // 60
+        night_m = night_len_min % 60
+        night_length_str = f"{night_h} {locale['h_unit']} {night_m} {locale['m_unit']}"
+        
+        # Remaining daylight
+        now_min = now.hour * 60 + now.minute
+        if now_min < sr_min:
+            rem_min = day_len_min
+        elif now_min > ss_min:
+            rem_min = 0
+        else:
+            rem_min = ss_min - now_min
+        rem_h = rem_min // 60
+        rem_m = rem_min % 60
+        remaining_daylight_str = f"{rem_h} {locale['h_unit']} {rem_m} {locale['m_unit']}"
+    except Exception:
+        day_length_str = f"12 {locale['h_unit']} 0 {locale['m_unit']}"
+        night_length_str = f"12 {locale['h_unit']} 0 {locale['m_unit']}"
+        remaining_daylight_str = f"12 {locale['h_unit']} 0 {locale['m_unit']}"
+
+    # Temperature feeling description
+    temp_val = int(current["temp_C"])
+    if temp_val < 5:
+        temp_desc = locale["temp_desc"]["cold"]
+    elif temp_val < 15:
+        temp_desc = locale["temp_desc"]["mild"]
+    elif temp_val < 25:
+        temp_desc = locale["temp_desc"]["warm"]
+    else:
+        temp_desc = locale["temp_desc"]["hot"]
+        
+    # Weather description translation
+    weather_desc_localized = locale["weather_desc"].get(
+        weather_kind(current.get("weatherCode")),
+        current["weatherDesc"][0]["value"]
+    )
+        
+    # Quote of the day
+    day_of_year = now.timetuple().tm_yday
+    quote_tuple = locale["quotes"][day_of_year % len(locale["quotes"])]
+
     return {
         "weather": weather,
         "current": current,
@@ -680,13 +1042,31 @@ def collect_dashboard_data(config):
         "pressure": current["pressure"],
         "hi": days[0]["maxtempC"],
         "lo": days[0]["mintempC"],
-        "sunrise": days[0]["astronomy"][0]["sunrise"][:5],
-        "sunset": days[0]["astronomy"][0]["sunset"][:5],
+        "sunrise": sunrise_time,
+        "sunset": sunset_time,
         "cpu": get_cpu(),
         "ram": get_ram(),
         "disk": get_disk(),
         "ph": get_pihole(),
         "ts": get_tailscale(),
+        # Localized Maarif fields
+        "hijri_day": hijri_day,
+        "hijri_month_name": hijri_month_name,
+        "hijri_year": hijri_year,
+        "rumi_day": rumi_day,
+        "rumi_month_name": rumi_month_name,
+        "rumi_year": rumi_year,
+        "greg_month_localized": greg_month_localized,
+        "day_name_localized": day_name_localized,
+        "season_name": season_name,
+        "season_day": season_day,
+        "timings": timings,
+        "day_length": day_length_str,
+        "night_length": night_length_str,
+        "remaining_daylight": remaining_daylight_str,
+        "temp_desc": temp_desc,
+        "weather_desc_localized": weather_desc_localized,
+        "quote": quote_tuple,
     }
 
 
@@ -1057,11 +1437,211 @@ def render_travel_weather(config):
     save_dashboard(img, data)
 
 
+def maarif_font(style, weight, size):
+    import platform
+    if platform.system() == "Darwin":  # macOS
+        paths = {
+            ("serif", "reg"): "/System/Library/Fonts/Supplemental/Georgia.ttf",
+            ("serif", "bold"): "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+            ("serif", "italic"): "/System/Library/Fonts/Supplemental/Georgia Italic.ttf",
+            ("sans", "reg"): "/System/Library/Fonts/Supplemental/Arial.ttf",
+            ("sans", "bold"): "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        }
+    else:  # Linux (Ubuntu)
+        dejavu_dir = "/usr/share/fonts/truetype/dejavu"
+        paths = {
+            ("serif", "reg"): f"{dejavu_dir}/DejaVuSerif.ttf",
+            ("serif", "bold"): f"{dejavu_dir}/DejaVuSerif-Bold.ttf",
+            ("serif", "italic"): f"{dejavu_dir}/DejaVuSerif-Italic.ttf",
+            ("sans", "reg"): f"{dejavu_dir}/DejaVuSans.ttf",
+            ("sans", "bold"): f"{dejavu_dir}/DejaVuSans-Bold.ttf",
+        }
+    path = paths.get((style, weight))
+    try:
+        if path and os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    except Exception:
+        pass
+    try:
+        if weight == "bold":
+            return ImageFont.truetype(FONT_BOLD, size)
+        return ImageFont.truetype(FONT_REG, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def render_maarif_calendar(config):
+
+    data = collect_dashboard_data(config)
+    img = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(img)
+    
+    # Resolve active language
+    lang = get_dashboard_lang(config)
+    locale = LOCALES[lang]
+    
+    # Fonts
+    star_f = maarif_font("sans", "reg", 12)
+    sans_reg_14 = maarif_font("sans", "reg", 14)
+    sans_reg_16 = maarif_font("sans", "reg", 16)
+    sans_reg_18 = maarif_font("sans", "reg", 18)
+    sans_bold_16 = maarif_font("sans", "bold", 16)
+    sans_bold_18 = maarif_font("sans", "bold", 18)
+    sans_bold_20 = maarif_font("sans", "bold", 20)
+    sans_bold_44 = maarif_font("sans", "bold", 44)
+    sans_bold_56 = maarif_font("sans", "bold", 56)
+    serif_reg_14 = maarif_font("serif", "reg", 14)
+    serif_bold_20 = maarif_font("serif", "bold", 20)
+    serif_italic_18 = maarif_font("serif", "italic", 18)
+    
+    # 1. Custom polygonal star border (continuous solid black stars)
+    # Spaced every ~20px for high-density traditional look
+    for i in range(37): # 0 to 36
+        x = 20 + int(i * 718 / 36)
+        draw_star(d, x, 20, 6)
+        draw_star(d, x, 1006, 6)
+    for i in range(1, 49): # 1 to 48
+        y = 20 + int(i * 984 / 49)
+        draw_star(d, 20, y, 6)
+        draw_star(d, 738, y, 6)
+        
+    # 2. Top Header (Date Sections)
+    # Left column: Hijri Date
+    txt(d, 150, 36, f"{data['hijri_year']} {locale['hijri_suffix']}", sans_reg_16, anchor="ma")
+    txt(d, 150, 60, data["hijri_month_name"], sans_bold_18, anchor="ma")
+    txt(d, 150, 88, data["hijri_day"], sans_bold_20, anchor="ma")
+    
+    # Center column: Remaining daylight & daylight info
+    txt(d, 379, 36, locale["remaining_daylight_label"], sans_reg_16, anchor="ma")
+    txt(d, 379, 60, data["remaining_daylight"], sans_bold_18, anchor="ma")
+    txt(d, 379, 88, locale["day_lengthening_label"], sans_reg_14, anchor="ma")
+    
+    # Right column: Rumi Date
+    txt(d, 608, 36, f"{data['rumi_year']} {locale['rumi_suffix']}", sans_reg_16, anchor="ma")
+    txt(d, 608, 60, data["rumi_month_name"], sans_bold_18, anchor="ma")
+    txt(d, 608, 88, data["rumi_day"], sans_bold_20, anchor="ma")
+    
+    # Horizontal line below top row
+    d.line((24, 115, 734, 115), fill=0, width=2)
+    
+    # Second row: Gregorian date info
+    txt(d, 70, 122, f"{locale['year_label']}: {data['now'].year}", sans_reg_16)
+    txt(d, 230, 122, f"{locale['month_label']}: {data['now'].month}", sans_reg_16)
+    txt(d, 390, 122, f"{locale['day_label']}: {data['now'].timetuple().tm_yday}", sans_reg_16)
+    txt(d, 550, 122, f"{data['season_name']}: {data['season_day']}", sans_reg_16)
+    
+    # Horizontal line below Gregorian info
+    d.line((24, 148, 734, 148), fill=0, width=2)
+    
+    # 3. Middle Section: Month & Giant Day
+    # Gregorian Month Name (centered)
+    txt(d, 379, 168, data["greg_month_localized"], sans_bold_56, anchor="ma")
+    
+    # Giant Day Number (original blueprint rendering logic with 210px safety width cap)
+    day_str = str(data["now"].day)
+    serif_giant = maarif_font("serif", "bold", 420)
+    txt_img = Image.new("L", (800, 600), 255)
+    txt_draw = ImageDraw.Draw(txt_img)
+    txt_draw.text((400, 300), day_str, fill=0, font=serif_giant, anchor="mm")
+    
+    import PIL.ImageOps
+    inverted = PIL.ImageOps.invert(txt_img)
+    bbox = inverted.getbbox()
+    if bbox:
+        cropped = txt_img.crop(bbox)
+        w_crop = bbox[2] - bbox[0]
+        h_crop = bbox[3] - bbox[1]
+        
+        target_h = 420
+        target_w = int(w_crop * (target_h / h_crop) * 0.52)
+        # Cap to 210px to ensure zero touching/intersection with side boxes (gap is 258px)
+        if target_w > 210:
+            target_w = 210
+            
+        resized = cropped.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        
+        paste_x = 379 - target_w // 2
+        paste_y = 485 - target_h // 2
+        img.paste(resized, (paste_x, paste_y))
+    
+    # Left Box: Location & Prayer Times
+    txt(d, 150, 268, config["location_label"].split(",")[0].upper(), sans_bold_18, anchor="ma")
+    box(d, (50, 298, 250, 698), radius=6, width=2)
+    
+    prayer_order = [
+        (locale["prayers"][0], data["timings"].get("Sunrise", "05:14")),
+        (locale["prayers"][1], data["timings"].get("Dhuhr", "13:08")),
+        (locale["prayers"][2], data["timings"].get("Asr", "17:02")),
+        (locale["prayers"][3], data["timings"].get("Maghrib", "20:45")),
+        (locale["prayers"][4], data["timings"].get("Isha", "22:15")),
+        (locale["prayers"][5], data["timings"].get("Imsak", "03:42")),
+    ]
+    
+    for i, (name, tm) in enumerate(prayer_order):
+        y_pos = 312 + i * 62
+        txt(d, 150, y_pos, name, sans_bold_16, anchor="ma")
+        txt(d, 150, y_pos + 22, tm, sans_reg_18, anchor="ma")
+        
+    # Right Box: Weather Stats
+    txt(d, 608, 268, locale["weather_label"], sans_bold_18, anchor="ma")
+    box(d, (508, 298, 708, 698), radius=6, width=2)
+    
+    weather_rows = [
+        (locale["weather_rows"][0], f"{data['temp']}°C"),
+        (locale["weather_rows"][1], data["weather_desc_localized"]),
+        (locale["weather_rows"][2], data["sunset"]),
+        (locale["weather_rows"][3], f"%{data['humidity']}"),
+        (locale["weather_rows"][4], f"{data['pressure']} hPa"),
+        (locale["weather_rows"][5], f"{data['wind']} mph"),
+    ]
+    
+    for i, (label, val) in enumerate(weather_rows):
+        y_pos = 312 + i * 62
+        txt(d, 608, y_pos, label, sans_bold_16, anchor="ma")
+        txt(d, 608, y_pos + 22, val, sans_reg_18, anchor="ma")
+        
+    # 4. Below Middle Section
+    d_len_str = f"{locale['day_length_prefix']}: {data['day_length']}  —  {locale['night_length_prefix']}: {data['night_length']}"
+    txt(d, 379, 722, d_len_str, sans_reg_16, anchor="ma")
+    
+    # Large Day Name
+    txt(d, 379, 760, data["day_name_localized"], sans_bold_44, anchor="ma")
+    
+    # Parentheses info lines
+    p_line1 = f"({data['weather_desc_localized']} · {data['temp_desc']})"
+    txt(d, 379, 818, p_line1, sans_reg_16, anchor="ma")
+    p_line2 = f"({locale['year_day_prefix']} {data['now'].timetuple().tm_yday}. {locale['year_day_suffix']})"
+    txt(d, 379, 844, p_line2, sans_reg_14, anchor="ma")
+    
+    # Horizontal line above quote
+    d.line((24, 874, 734, 874), fill=0, width=2)
+    
+    # 5. Wisdom Quote
+    txt(d, 379, 890, locale["daily_wisdom_label"], serif_bold_20, anchor="ma")
+    q_line1, q_line2, q_author = data["quote"]
+    txt(d, 379, 916, f"“{q_line1}”", serif_italic_18, anchor="ma")
+    if q_line2:
+        txt(d, 379, 938, f"“{q_line2}”", serif_italic_18, anchor="ma")
+        txt(d, 379, 962, f"— {q_author}", serif_reg_14, anchor="ma")
+    else:
+        txt(d, 379, 950, f"— {q_author}", serif_reg_14, anchor="ma")
+        
+    # Bottom separator line
+    d.line((24, 980, 734, 980), fill=0, width=2)
+    
+    # Credit at very bottom
+    txt(d, 379, 990, locale["credit_label"], serif_reg_14, anchor="ma")
+    
+    save_dashboard(img, data)
+
+
+
 THEME_RENDERERS = {
     "home_dashboard": render_home_dashboard,
     "minimal_weather": render_minimal_weather,
     "server_monitor": render_server_monitor,
     "travel_weather": render_travel_weather,
+    "maarif_calendar": render_maarif_calendar,
 }
 
 

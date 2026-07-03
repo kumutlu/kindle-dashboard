@@ -3,7 +3,7 @@
   "location_label": "Nottingham, UK",
   "weather_query": "Nottingham",
   "timezone": "Europe/London",
-  "theme": "home_dashboard",
+  "theme": "maarif_calendar",
   "show_server": true,
   "show_weather": true,
   "show_forecast": true,

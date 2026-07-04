@@ -256,6 +256,19 @@ def render_settings(config, csrf_token, status_message=""):
 <meta name="theme-color" content="#111111">
 <link rel="icon" href="data:,">
 <title>Kindle Dashboard</title>
+<script>
+(function() {{
+  const theme = localStorage.getItem("kindle_dashboard_ui_theme") || "system";
+  if (theme === "dark") {{
+    document.documentElement.dataset.theme = "dark";
+  }} else if (theme === "light") {{
+    document.documentElement.dataset.theme = "light";
+  }} else {{
+    const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = systemDark ? "dark" : "light";
+  }}
+}})();
+</script>
 <style>
 :root{{
   --bg:#f5f6f8;
@@ -266,12 +279,75 @@ def render_settings(config, csrf_token, status_message=""):
   --accent:#2b6cb0;
   --soft:#f8f9fa;
   --border-radius:16px;
+  --action-bar-bg:rgba(255, 255, 255, 0.96);
+  --button-hover:#f8f9fa;
+  --button-hover-border:#a0aec0;
+  --input-focus-shadow:rgba(0, 0, 0, 0.05);
+  --success:#2f855a;
+  --danger:#dc2626;
+  --danger-soft:#fff5f5;
+  --primary-hover:#2d3748;
+}}
+[data-theme="dark"]{{
+  --bg:#0f1115;
+  --card:#171a21;
+  --ink:#f4f4f5;
+  --muted:#a1a1aa;
+  --line:#333846;
+  --accent:#3182ce;
+  --soft:#20242d;
+  --action-bar-bg:rgba(23, 26, 33, 0.96);
+  --button-hover:#20242d;
+  --button-hover-border:#4a5568;
+  --input-focus-shadow:rgba(255, 255, 255, 0.05);
+  --success:#4ade80;
+  --danger:#f87171;
+  --danger-soft:rgba(248, 113, 113, 0.15);
+  --primary-hover:#cbd5e0;
+}}
+.theme-toggle-group{{
+  display:inline-flex;
+  padding:3px;
+  background:var(--soft);
+  border-radius:10px;
+  border:1px solid var(--line);
+  margin-top:12px;
+}}
+@media (min-width: 600px){{
+  .theme-toggle-group{{margin-top:0}}
+}}
+.theme-toggle-btn{{
+  min-height:28px!important;
+  padding:3px 12px!important;
+  font-size:0.78rem!important;
+  font-weight:600!important;
+  border:none!important;
+  border-radius:6px!important;
+  background:transparent!important;
+  color:var(--muted)!important;
+  cursor:pointer;
+  transition:all 0.15s ease;
+  margin:0!important;
+}}
+.theme-toggle-btn:hover{{
+  color:var(--ink)!important;
+  background:transparent!important;
+  border-color:transparent!important;
+}}
+.theme-toggle-btn.active{{
+  background:var(--card)!important;
+  color:var(--ink)!important;
+  box-shadow:0 1px 3px rgba(0,0,0,0.12);
+  border-color:transparent!important;
 }}
 *{{box-sizing:border-box}}
 html{{scroll-behavior:smooth}}
 body{{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
 .shell{{max-width:900px;margin:0 auto;padding:24px 16px 140px}}
-.app-header{{margin-bottom:24px;text-align:center}}
+.app-header{{margin-bottom:24px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px}}
+@media (min-width: 600px){{
+  .app-header{{flex-direction:row;justify-content:space-between;text-align:left;align-items:center;gap:24px}}
+}}
 .app-header h1{{font-size:1.8rem;font-weight:800;margin:0 0 6px;letter-spacing:-0.025em}}
 .subtitle{{margin:0;color:var(--muted);font-size:0.95rem}}
 
@@ -280,7 +356,7 @@ body{{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,B
 .tabs-nav::-webkit-scrollbar{{display:none}}
 .tabs-nav{{-ms-overflow-style:none;scrollbar-width:none}}
 .tab-btn{{flex:0 0 auto;scroll-snap-align:start;min-height:40px;padding:8px 16px;border:none;border-radius:10px;background:transparent;color:var(--muted);font-size:0.95rem;font-weight:600;cursor:pointer;transition:all 0.2s ease}}
-.tab-btn:hover{{color:var(--ink);background:rgba(0,0,0,0.04)}}
+.tab-btn:hover{{color:var(--ink);background:var(--soft)}}
 .tab-btn.active{{color:var(--ink);background:var(--card);box-shadow:0 2px 8px rgba(0,0,0,0.06)}}
 
 /* Tab Section Visibility */
@@ -296,12 +372,12 @@ body{{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,B
 .field{{display:block;margin-bottom:18px}}
 .field span{{display:block;margin-bottom:8px;font-weight:650;font-size:0.9rem}}
 input[type=text],input[type=search],input[type=number],select{{width:100%;min-height:46px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);font-size:0.95rem;transition:all 0.2s ease}}
-input:focus,select:focus{{outline:none;border-color:var(--ink);box-shadow:0 0 0 3px rgba(0,0,0,0.05)}}
+input:focus,select:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--input-focus-shadow)}}
 
 /* Buttons */
 .button-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:16px}}
 button{{min-height:46px;padding:10px 16px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);font-weight:650;font-size:0.92rem;cursor:pointer;transition:all 0.2s ease}}
-button:hover:not(:disabled){{background:var(--soft);border-color:#a0aec0}}
+button:hover:not(:disabled){{background:var(--button-hover);border-color:var(--button-hover-border)}}
 button:active:not(:disabled){{transform:translateY(1px)}}
 button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;opacity:0.65}}
 
@@ -321,9 +397,9 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 /* Theme Selection Cards */
 .theme-list{{display:grid;gap:12px;margin-top:14px}}
 .theme-choice{{display:flex;align-items:center;gap:14px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;cursor:pointer;transition:all 0.2s ease}}
-.theme-choice:hover:not(.disabled){{border-color:#a0aec0;background:var(--soft)}}
-.theme-choice:has(input:checked){{border-color:var(--ink);border-width:2px;padding:13px 15px;background:var(--soft)}}
-.theme-choice input[type=radio]{{width:20px;height:20px;accent-color:var(--ink);margin:0;flex:0 0 auto}}
+.theme-choice:hover:not(.disabled){{border-color:var(--button-hover-border);background:var(--soft)}}
+.theme-choice:has(input:checked){{border-color:var(--accent);border-width:2px;padding:13px 15px;background:var(--soft)}}
+.theme-choice input[type=radio]{{width:20px;height:20px;accent-color:var(--accent);margin:0;flex:0 0 auto}}
 .theme-choice span{{display:flex;flex-direction:column;gap:2px}}
 .theme-choice strong{{font-size:1rem;font-weight:700}}
 .theme-choice small{{color:var(--muted);font-size:0.85rem}}
@@ -333,7 +409,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 .toggle-list{{display:grid;grid-template-columns:1fr;gap:12px}}
 .toggle{{display:flex;align-items:center;gap:12px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;font-weight:600;font-size:0.95rem;cursor:pointer;transition:all 0.2s ease}}
 .toggle:hover{{background:var(--soft)}}
-.toggle input[type=checkbox]{{width:22px;height:22px;margin:0;accent-color:var(--ink);flex:0 0 auto}}
+.toggle input[type=checkbox]{{width:22px;height:22px;margin:0;accent-color:var(--accent);flex:0 0 auto}}
 
 /* Device Tab */
 .device-state{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}}
@@ -355,10 +431,10 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 .status-row dd{{margin:0;text-align:right;font-weight:700;font-size:0.92rem}}
 
 /* Action Bar */
-.action-bar{{position:fixed;z-index:100;left:0;right:0;bottom:0;display:grid;grid-template-columns:1.35fr 1fr;gap:12px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:rgba(255, 255, 255, 0.96);border-top:1px solid var(--line);box-shadow:0 -8px 30px rgba(0, 0, 0, 0.08);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}
+.action-bar{{position:fixed;z-index:100;left:0;right:0;bottom:0;display:grid;grid-template-columns:1.35fr 1fr;gap:12px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:var(--action-bar-bg);border-top:1px solid var(--line);box-shadow:0 -8px 30px rgba(0, 0, 0, 0.08);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}
 .action-bar button{{margin:0;width:100%}}
 .action-bar button[type=submit],.overview-actions button[type=submit]{{background:var(--ink);color:var(--card);border-color:var(--ink)}}
-.action-bar button[type=submit]:hover:not(:disabled),.overview-actions button[type=submit]:hover:not(:disabled){{background:#2d3748;border-color:#2d3748}}
+.action-bar button[type=submit]:hover:not(:disabled),.overview-actions button[type=submit]:hover:not(:disabled){{background:var(--primary-hover);border-color:var(--primary-hover)}}
 
 .advanced{{margin-top:14px;border-top:1px solid var(--line);padding-top:14px}}
 .advanced summary{{min-height:44px;display:flex;align-items:center;font-weight:750;cursor:pointer}}
@@ -380,8 +456,15 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 <body>
 <main class="shell">
 <header class="app-header">
-<h1>Kindle Dashboard</h1>
-<p class="subtitle">{escaped['location_label']} · {escaped['theme']}</p>
+  <div>
+    <h1>Kindle Dashboard</h1>
+    <p class="subtitle">{escaped['location_label']} · {escaped['theme']}</p>
+  </div>
+  <div class="theme-toggle-group" role="group" aria-label="Theme selector">
+    <button type="button" class="theme-toggle-btn" data-theme-val="light">Light</button>
+    <button type="button" class="theme-toggle-btn" data-theme-val="dark">Dark</button>
+    <button type="button" class="theme-toggle-btn" data-theme-val="system">System</button>
+  </div>
 </header>
 {message}
 
@@ -726,6 +809,44 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 </form>
 </main>
 <script>
+const themeToggleButtons = document.querySelectorAll(".theme-toggle-btn");
+
+function applyTheme(themeVal) {{
+  themeToggleButtons.forEach(btn => {{
+    if (btn.dataset.themeVal === themeVal) {{
+      btn.classList.add("active");
+    }} else {{
+      btn.classList.remove("active");
+    }}
+  }});
+
+  if (themeVal === "dark") {{
+    document.documentElement.dataset.theme = "dark";
+  }} else if (themeVal === "light") {{
+    document.documentElement.dataset.theme = "light";
+  }} else {{
+    const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = systemDark ? "dark" : "light";
+  }}
+}}
+
+themeToggleButtons.forEach(btn => {{
+  btn.addEventListener("click", () => {{
+    const val = btn.dataset.themeVal;
+    localStorage.setItem("kindle_dashboard_ui_theme", val);
+    applyTheme(val);
+  }});
+}});
+
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e => {{
+  const currentPref = localStorage.getItem("kindle_dashboard_ui_theme") || "system";
+  if (currentPref === "system") {{
+    document.documentElement.dataset.theme = e.matches ? "dark" : "light";
+  }}
+}});
+
+applyTheme(localStorage.getItem("kindle_dashboard_ui_theme") || "system");
+
 const tabBtns=document.querySelectorAll(".tab-btn");
 const tabContents=document.querySelectorAll(".tab-content");
 function switchTab(tabId){{
@@ -863,7 +984,7 @@ async function loadDeviceState(){{
     const overviewKindleConn=document.getElementById("overview-kindle-connection");
     if(overviewKindleConn){{
       overviewKindleConn.textContent=status.connected?"Online":"Offline";
-      overviewKindleConn.style.color=status.connected?"#2f855a":"#c53030";
+      overviewKindleConn.style.color=status.connected?"var(--success)":"var(--danger)";
     }}
   }}catch(error){{
     connectionValue.textContent="Offline";
@@ -871,7 +992,7 @@ async function loadDeviceState(){{
     const overviewKindleConn=document.getElementById("overview-kindle-connection");
     if(overviewKindleConn){{
       overviewKindleConn.textContent="Offline";
-      overviewKindleConn.style.color="#c53030";
+      overviewKindleConn.style.color="var(--danger)";
     }}
   }}
 }}
@@ -990,8 +1111,8 @@ async function fetchReminders() {{
     renderRemindersList();
     renderRemindersPreview();
   }} catch (error) {{
-    notesList.innerHTML = `<span style="color: #c53030; font-size: 0.9rem;">Failed to load reminders: ${{error.message}}</span>`;
-    notesPreviewList.innerHTML = `<span style="color: #c53030; font-size: 0.9rem;">Failed to load preview.</span>`;
+    notesList.innerHTML = `<span style="color: var(--danger); font-size: 0.9rem;">Failed to load reminders: ${{error.message}}</span>`;
+    notesPreviewList.innerHTML = `<span style="color: var(--danger); font-size: 0.9rem;">Failed to load preview.</span>`;
   }}
 }}
 
@@ -1015,18 +1136,18 @@ function renderRemindersList() {{
     const toggle = document.createElement("input");
     toggle.type = "checkbox";
     toggle.checked = item.enabled !== false;
-    toggle.style.cssText = "width: 18px; height: 18px; accent-color: var(--ink); cursor: pointer; margin: 0;";
+    toggle.style.cssText = "width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; margin: 0;";
     toggle.addEventListener("change", () => toggleReminder(item.id, toggle.checked));
     
     const badge = document.createElement("span");
     badge.textContent = item.category || "NOTE";
-    badge.style.cssText = "font-size: 0.75rem; font-weight: 700; padding: 2px 6px; border: 1px solid var(--ink); border-radius: 4px; background: var(--soft);";
+    badge.style.cssText = "font-size: 0.75rem; font-weight: 700; padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--soft);";
     
     const title = document.createElement("strong");
     title.textContent = item.title;
     title.style.cssText = "font-size: 0.95rem; font-weight: 700;";
     if (item.priority === "high") {{
-      title.innerHTML += ' <span style="color: #c53030; font-weight: 800;">[!]</span>';
+      title.innerHTML += ' <span style="color: var(--danger); font-weight: 800;">[!]</span>';
     }}
     
     left.append(toggle, badge, title);
@@ -1043,7 +1164,7 @@ function renderRemindersList() {{
     const btnDelete = document.createElement("button");
     btnDelete.type = "button";
     btnDelete.textContent = "Delete";
-    btnDelete.style.cssText = "min-height: 28px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; border-radius: 6px; border-color: #e53e3e; color: #e53e3e; background: #fff5f5; margin: 0;";
+    btnDelete.style.cssText = "min-height: 28px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; border-radius: 6px; border-color: var(--danger); color: var(--danger); background: var(--danger-soft); margin: 0;";
     btnDelete.addEventListener("click", () => deleteReminder(item.id));
     
     right.append(btnEdit, btnDelete);
@@ -1176,7 +1297,7 @@ function renderRemindersPreview() {{
     bullet.style.cssText = "color: var(--ink); font-weight: 800;";
     if (item.priority === "high") {{
       bullet.textContent = "!";
-      bullet.style.cssText = "color: #c53030; font-weight: 800;";
+      bullet.style.cssText = "color: var(--danger); font-weight: 800;";
     }}
     
     const cat = document.createElement("strong");

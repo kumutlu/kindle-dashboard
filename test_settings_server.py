@@ -1054,6 +1054,17 @@ class SettingsServerTests(unittest.TestCase):
         notes = settings_server.load_daily_notes()
         self.assertEqual(notes, {"items": []})
 
+    def test_settings_dark_mode_theme_toggle_elements(self):
+        status, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn('class="theme-toggle-group"', text)
+        self.assertIn('data-theme-val="light"', text)
+        self.assertIn('data-theme-val="dark"', text)
+        self.assertIn('data-theme-val="system"', text)
+        self.assertIn('[data-theme="dark"]', text)
+        self.assertIn('kindle_dashboard_ui_theme', text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2189,6 +2189,277 @@ def render_compact_dashboard(config):
     save_dashboard(img, data)
 
 
+def load_daily_notes():
+    notes_path = PROJECT_DIR / "daily_notes.json"
+    if not notes_path.exists():
+        return {"items": []}
+    try:
+        return json.loads(notes_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Warning: Failed to load daily_notes.json: {e}")
+        return {"items": []}
+
+
+def get_active_reminders(notes_data, local_date_str):
+    try:
+        dt = datetime.strptime(local_date_str, "%Y-%m-%d").date()
+    except Exception:
+        dt = datetime.now().date()
+        
+    current_weekday = dt.strftime('%a').upper()
+    current_date_str = dt.strftime('%Y-%m-%d')
+    
+    active_items = []
+    items = notes_data.get("items", [])
+    for item in items:
+        if not item.get("enabled", True):
+            continue
+            
+        expires = item.get("expires_after_date")
+        if expires:
+            try:
+                if current_date_str > expires:
+                    continue
+            except Exception:
+                pass
+                
+        item_date = item.get("date")
+        if item_date:
+            if item_date == current_date_str:
+                active_items.append(item)
+            continue
+            
+        recurrence = item.get("recurrence")
+        if recurrence and recurrence.get("type") == "weekly":
+            days = recurrence.get("days", [])
+            if current_weekday in days:
+                active_items.append(item)
+            continue
+            
+        if not item_date and not recurrence:
+            active_items.append(item)
+            
+    def sort_key(x):
+        p_val = {"high": 0, "normal": 1, "low": 2}.get(x.get("priority", "normal"), 1)
+        category = x.get("category", "").upper()
+        title = x.get("title", "").lower()
+        return (p_val, category, title)
+        
+    active_items.sort(key=sort_key)
+    return active_items
+
+
+def render_family_dashboard(config):
+    data = collect_dashboard_data(config)
+    current = data["current"]
+    days = data["days"]
+    (
+        now, temp, feels, desc, humidity, wind, wind_dir, pressure,
+        hi, lo, sunrise, sunset,
+    ) = (
+        data[key] for key in (
+            "now", "temp", "feels", "desc", "humidity", "wind",
+            "wind_dir", "pressure", "hi", "lo", "sunrise", "sunset",
+        )
+    )
+    fonts = dashboard_fonts()
+    (
+        FB68, FB28, FB24, FB22, FB20, FB18, FR18, FR16, FR14,
+    ) = (
+        fonts[key] for key in (
+            "FB68", "FB28", "FB24", "FB22", "FB20", "FB18",
+            "FR18", "FR16", "FR14",
+        )
+    )
+
+    img = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(img)
+
+    box(d, (10, 10, 748, 1014), 10, 2)
+
+    lang = get_dashboard_lang(config)
+    locale = LOCALES[lang]
+
+    txt(d, 34, 28, config["title"].upper(), FB24)
+    
+    if lang == "en":
+        date_str = now.strftime("%A, %d %B %Y").upper()
+        updated_str = f"UPDATED: {now.strftime('%H:%M')}"
+    else:
+        date_str = data["day_name_localized"].upper() + ", " + now.strftime("%d ") + locale["months"].get(now.month, "OCAK") + now.strftime(" %Y")
+        updated_str = f"GÜNCELLEME: {now.strftime('%H:%M')}"
+        
+    txt(d, 720, 30, date_str, FB18, anchor="ra")
+    txt(d, 34, 62, updated_str, FR14)
+    txt(d, 720, 60, data["weather_desc_localized"].upper(), FB18, anchor="ra")
+
+    d.line((24, 90, 734, 90), fill=0, width=2)
+
+    visibility = effective_visibility("family_dashboard", config)
+    y = 110
+
+    if visibility["show_weather"]:
+        box(d, (24, y, 734, y + 150), 8, 2)
+        draw_weather_icon(
+            d,
+            weather_kind(current.get("weatherCode")),
+            110,
+            y + 75,
+            90,
+        )
+        txt(d, 280, y + 60, f"{temp}°C", FB68, anchor="mm")
+        txt(d, 280, y + 115, f"{feels}°C / {data['weather_desc_localized'].upper()}", FB18, anchor="mm")
+
+        col1_x = 450
+        val1_x = 550
+        col2_x = 580
+        val2_x = 710
+        
+        hi_lo_lbl = "Hi/Lo" if lang == "en" else "Derece"
+        humid_lbl = "Humid" if lang == "en" else "Nem"
+        wind_lbl = "Wind" if lang == "en" else "Rüzgar"
+        sunset_lbl = "Sunset" if lang == "en" else "Batış"
+        
+        txt(d, col1_x, y + 25, hi_lo_lbl, FR16)
+        txt(d, val1_x, y + 23, f"{hi}°/{lo}°", FB18, anchor="ra")
+        
+        txt(d, col2_x, y + 25, wind_lbl, FR16)
+        txt(d, val2_x, y + 23, f"{wind} mph", FB18, anchor="ra")
+        
+        txt(d, col1_x, y + 75, humid_lbl, FR16)
+        txt(d, val1_x, y + 73, f"%{humidity}" if lang == "tr" else f"{humidity}%", FB18, anchor="ra")
+        
+        txt(d, col2_x, y + 75, sunset_lbl, FR16)
+        txt(d, val2_x, y + 73, sunset, FB18, anchor="ra")
+        
+        press_lbl = "Press" if lang == "en" else "Basınç"
+        sr_lbl = "Rise" if lang == "en" else "Doğuş"
+        txt(d, col1_x, y + 125, press_lbl, FR16)
+        txt(d, val1_x, y + 123, f"{pressure}hPa", FB18, anchor="ra")
+        
+        txt(d, col2_x, y + 125, sr_lbl, FR16)
+        txt(d, val2_x, y + 123, sunrise, FB18, anchor="ra")
+
+        y += 170
+
+    if visibility["show_forecast"]:
+        heading_lbl = "FORECAST" if lang == "en" else "TAHMİN"
+        txt(d, 34, y, heading_lbl, FB18)
+        y += 30
+        
+        num_days = min(5, len(days))
+        col_width = (710 - (num_days - 1) * 12) // num_days
+        
+        today_lbl = "BUGÜN" if lang == "tr" else "TODAY"
+        tomorrow_lbl = "YARIN" if lang == "tr" else "TOMORROW"
+        
+        for i, day in enumerate(days[:num_days]):
+            x = 24 + i * (col_width + 12)
+            box(d, (x, y, x + col_width, y + 155), 6, 1)
+            
+            if i == 0:
+                day_name = today_lbl
+            elif i == 1:
+                day_name = tomorrow_lbl
+            else:
+                try:
+                    dt = datetime.strptime(day["date"], "%Y-%m-%d")
+                    w_day = dt.weekday()
+                    if lang == "tr":
+                        tr_short = {0: "PZT", 1: "SAL", 2: "ÇAR", 3: "PER", 4: "CUM", 5: "CMT", 6: "PAZ"}
+                        day_name = tr_short.get(w_day, "GÜN")
+                    else:
+                        day_name = locale["weekdays"][w_day][:3]
+                except Exception:
+                    day_name = f"DAY {i+1}"
+            
+            txt(d, x + col_width // 2, y + 22, day_name, FB18, anchor="mm")
+            
+            noon = day["hourly"][4]
+            draw_weather_icon(
+                d,
+                weather_kind(noon.get("weatherCode")),
+                x + col_width // 2,
+                y + 65,
+                42,
+            )
+            
+            txt(d, x + col_width // 2, y + 105, f"{day['maxtempC']}°/{day['mintempC']}°", FB18, anchor="mm")
+            txt(d, x + col_width // 2, y + 132, f"%{noon['chanceofrain']}" if lang == "tr" else f"{noon['chanceofrain']}%", FR14, anchor="mm")
+            
+        y += 180
+
+    heading_lbl = "TODAY" if lang == "en" else "BUGÜN"
+    txt(d, 34, y, heading_lbl, FB18)
+    y += 30
+    
+    notes_data = load_daily_notes()
+    local_date_str = get_local_date(config)
+    active_reminders = get_active_reminders(notes_data, local_date_str)
+    
+    notes_box_top = y
+    notes_box_bottom = 940
+    notes_box_height = notes_box_bottom - notes_box_top
+    
+    box(d, (24, notes_box_top, 734, notes_box_bottom), 8, 2)
+    
+    if not active_reminders:
+        no_rem_lbl = "No reminders for today" if lang == "en" else "Bugün için hatırlatıcı yok"
+        txt(d, 379, notes_box_top + notes_box_height // 2, no_rem_lbl, FR18, anchor="mm")
+    else:
+        row_h = 60
+        max_rows = (notes_box_height - 20) // row_h
+        
+        if len(active_reminders) > max_rows:
+            num_show = max_rows - 1
+            show_more = True
+        else:
+            num_show = len(active_reminders)
+            show_more = False
+            
+        for i in range(num_show):
+            item = active_reminders[i]
+            row_y = notes_box_top + 10 + i * row_h
+            
+            cat = item.get("category", "NOTE").upper()
+            badge_x1 = 39
+            badge_y1 = row_y + 12
+            badge_x2 = 139
+            badge_y2 = row_y + 48
+            d.rounded_rectangle((badge_x1, badge_y1, badge_x2, badge_y2), radius=4, outline=0, width=2)
+            txt(d, 89, row_y + 30, cat, FB18, anchor="mm")
+            
+            title = item.get("title", "")
+            title_x = 155
+            priority = item.get("priority", "normal")
+            if priority == "high":
+                d.ellipse((155, row_y + 26, 163, row_y + 34), fill=0)
+                title_x = 175
+                
+            txt(d, title_x, row_y + 30, title, FB18, anchor="lm")
+            
+            detail = item.get("detail", "")
+            if detail:
+                txt(d, 715, row_y + 30, detail, FR18, anchor="ra")
+                
+            if i < num_show - 1 or show_more:
+                d.line((34, row_y + 60, 724, row_y + 60), fill=0, width=1)
+                
+        if show_more:
+            row_y = notes_box_top + 10 + (max_rows - 1) * row_h
+            more_cnt = len(active_reminders) - num_show
+            more_lbl = f"+ {more_cnt} more reminders..." if lang == "en" else f"+ {more_cnt} hatırlatıcı daha..."
+            txt(d, 379, row_y + 30, more_lbl, FR18, anchor="mm")
+
+    d.line((24, 965, 734, 965), fill=0, width=2)
+    
+    interval_minutes = config.get("refresh_interval_minutes", 10)
+    footer_lbl = f"UPDATED: {now.strftime('%Y-%m-%d %H:%M:%S')}  ·  INTERVAL: {interval_minutes} MIN  ·  FAMILY" if lang == "en" else f"GÜNCELLEME: {now.strftime('%Y-%m-%d %H:%M:%S')}  ·  SÜRE: {interval_minutes} DK  ·  AİLE"
+    txt(d, 379, 985, footer_lbl, FR14, anchor="ma")
+
+    save_dashboard(img, data)
+
+
 THEME_RENDERERS = {
     "home_dashboard": render_home_dashboard,
     "minimal_weather": render_minimal_weather,
@@ -2196,6 +2467,7 @@ THEME_RENDERERS = {
     "travel_weather": render_travel_weather,
     "maarif_calendar": render_maarif_calendar,
     "compact_dashboard": render_compact_dashboard,
+    "family_dashboard": render_family_dashboard,
 }
 
 

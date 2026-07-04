@@ -26,6 +26,26 @@ PORT = 8767
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
+DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
+
+
+def load_daily_notes():
+    if not DAILY_NOTES_PATH.exists():
+        return {"items": []}
+    try:
+        return json.loads(DAILY_NOTES_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Warning: Failed to load daily_notes.json: {e}")
+        return {"items": []}
+
+
+def save_daily_notes(data):
+    try:
+        temp_file = DAILY_NOTES_PATH.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp_file.replace(DAILY_NOTES_PATH)
+    except Exception as e:
+        print(f"Error: Failed to save daily_notes.json: {e}")
 MAX_REQUEST_BYTES = 16 * 1024
 
 CITY_DATA = [
@@ -370,6 +390,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   <button type="button" class="tab-btn" data-tab="location">Location</button>
   <button type="button" class="tab-btn" data-tab="theme">Theme</button>
   <button type="button" class="tab-btn" data-tab="display">Display</button>
+  <button type="button" class="tab-btn" data-tab="daily_notes">Daily Notes</button>
   <button type="button" class="tab-btn" data-tab="device">Device</button>
   <button type="button" class="tab-btn" data-tab="maintenance">Maintenance</button>
   <button type="button" class="tab-btn" data-tab="status">Status</button>
@@ -504,6 +525,116 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
       </select>
     </label>
     <p class="section-note" style="margin-top: -10px;">How often the Kindle dashboard image should refresh automatically. For Maarif Calendar, 60 minutes is usually enough.</p>
+  </div>
+</section>
+
+<!-- 4b. Daily Notes Tab -->
+<section class="card tab-content" id="daily_notes">
+  <h2>Daily Notes &amp; Reminders</h2>
+  <p class="section-note">Add and manage household notifications, chores, and events.</p>
+  
+  <!-- Today's Preview -->
+  <div class="future-box" style="margin-bottom: 24px; padding: 18px;">
+    <h3 style="margin: 0 0 10px; font-size: 1.05rem; font-weight: 700;">Active Today Preview</h3>
+    <div id="notes-preview-list" style="display: grid; gap: 8px;">
+      <span style="color: var(--muted); font-size: 0.9rem;">Loading preview...</span>
+    </div>
+  </div>
+
+  <!-- Active List -->
+  <div id="notes-list-view">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+      <h3 style="margin: 0; font-size: 1.1rem; font-weight: 700;">All Reminders</h3>
+      <button type="button" id="btn-add-note" style="min-height: 38px; padding: 6px 14px; font-size: 0.88rem; background: var(--ink); color: var(--card); border-color: var(--ink);">+ Add Reminder</button>
+    </div>
+    <div id="notes-list" style="display: grid; gap: 12px;">
+      <span style="color: var(--muted); font-size: 0.9rem;">Loading reminders...</span>
+    </div>
+  </div>
+
+  <!-- Add/Edit Form (Hidden by default) -->
+  <div id="notes-form-view" style="display: none; border-top: 1px solid var(--line); padding-top: 20px; margin-top: 20px;">
+    <h3 id="notes-form-title" style="margin: 0 0 16px; font-size: 1.1rem; font-weight: 700;">Add Reminder</h3>
+    <input type="hidden" id="note-id">
+    
+    <label class="field">
+      <span>Category</span>
+      <select id="note-category">
+        <option value="NOTE">NOTE (General note)</option>
+        <option value="BIN">BIN (Waste disposal)</option>
+        <option value="SCHOOL">SCHOOL (Children/school info)</option>
+        <option value="APPT">APPT (Appointment)</option>
+        <option value="HOME">HOME (House chores)</option>
+        <option value="TODO">TODO (Tasks)</option>
+      </select>
+    </label>
+    
+    <label class="field">
+      <span>Priority</span>
+      <select id="note-priority">
+        <option value="normal">Normal</option>
+        <option value="low">Low</option>
+        <option value="high">High (! Urgent)</option>
+      </select>
+    </label>
+    
+    <label class="field">
+      <span>Title</span>
+      <input type="text" id="note-title" placeholder="Osman PE kit, Bin collection, Dentist..." required>
+    </label>
+    
+    <label class="field">
+      <span>Detail (Optional)</span>
+      <input type="text" id="note-detail" placeholder="16:30, Put out tonight, Take library books...">
+    </label>
+
+    <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 18px; background: var(--soft);">
+      <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Schedule Type</span>
+      <div style="display: flex; gap: 16px; margin-bottom: 12px;">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+          <input type="radio" name="schedule_type" value="always" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Always Active
+        </label>
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+          <input type="radio" name="schedule_type" value="oneoff" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> One-off Date
+        </label>
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+          <input type="radio" name="schedule_type" value="recurring" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Weekly Repeat
+        </label>
+      </div>
+
+      <!-- One-off Date Picker -->
+      <div id="schedule-date-box" style="display: none; margin-bottom: 10px;">
+        <label class="field" style="margin-bottom: 0;">
+          <span>Select Date</span>
+          <input type="date" id="note-date" style="width: 100%; min-height: 46px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-size: 0.95rem;">
+        </label>
+      </div>
+
+      <!-- Weekly Weekday Checkboxes -->
+      <div id="schedule-weekly-box" style="display: none; margin-bottom: 10px;">
+        <span style="display: block; font-weight: 650; font-size: 0.85rem; margin-bottom: 6px; color: var(--muted);">Select Days</span>
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;">
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="MON" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Mon</label>
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="TUE" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Tue</label>
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="WED" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Wed</label>
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="THU" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Thu</label>
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="FRI" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Fri</label>
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="SAT" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Sat</label>
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="SUN" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Sun</label>
+        </div>
+      </div>
+    </div>
+
+    <label class="field">
+      <span>Expiration Date (Optional)</span>
+      <input type="date" id="note-expires" style="width: 100%; min-height: 46px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-size: 0.95rem;">
+      <span style="display: block; font-size: 0.75rem; color: var(--muted); margin-top: 4px;">Reminder will automatically hide after this date.</span>
+    </label>
+
+    <div class="button-grid" style="margin-top: 20px;">
+      <button type="button" id="btn-save-note" style="background: var(--ink); color: var(--card); border-color: var(--ink);">Save Reminder</button>
+      <button type="button" id="btn-cancel-note">Cancel</button>
+    </div>
   </div>
 </section>
 
@@ -787,6 +918,350 @@ document.getElementById("restart-settings-server").addEventListener("click",asyn
   }}
   setTimeout(retrySettings,5000);
 }});
+// DAILY NOTES TABS LOGIC
+const notesList = document.getElementById("notes-list");
+const notesPreviewList = document.getElementById("notes-preview-list");
+const notesListView = document.getElementById("notes-list-view");
+const notesFormView = document.getElementById("notes-form-view");
+const notesFormTitle = document.getElementById("notes-form-title");
+
+const noteIdInput = document.getElementById("note-id");
+const noteCategoryInput = document.getElementById("note-category");
+const notePriorityInput = document.getElementById("note-priority");
+const noteTitleInput = document.getElementById("note-title");
+const noteDetailInput = document.getElementById("note-detail");
+const noteDateInput = document.getElementById("note-date");
+const noteExpiresInput = document.getElementById("note-expires");
+
+const scheduleTypeRadios = document.querySelectorAll('input[name="schedule_type"]');
+const scheduleDateBox = document.getElementById("schedule-date-box");
+const scheduleWeeklyBox = document.getElementById("schedule-weekly-box");
+
+function updateScheduleVisibility() {{
+  const selectedType = document.querySelector('input[name="schedule_type"]:checked').value;
+  scheduleDateBox.style.display = selectedType === "oneoff" ? "block" : "none";
+  scheduleWeeklyBox.style.display = selectedType === "recurring" ? "block" : "none";
+}}
+scheduleTypeRadios.forEach(radio => radio.addEventListener("change", updateScheduleVisibility));
+
+let remindersCache = [];
+
+async function fetchReminders() {{
+  try {{
+    const response = await fetch("/api/notes", {{ cache: "no-store" }});
+    const data = await response.json();
+    remindersCache = data.items || [];
+    renderRemindersList();
+    renderRemindersPreview();
+  }} catch (error) {{
+    notesList.innerHTML = `<span style="color: #c53030; font-size: 0.9rem;">Failed to load reminders: ${{error.message}}</span>`;
+    notesPreviewList.innerHTML = `<span style="color: #c53030; font-size: 0.9rem;">Failed to load preview.</span>`;
+  }}
+}}
+
+function renderRemindersList() {{
+  notesList.replaceChildren();
+  if (remindersCache.length === 0) {{
+    notesList.innerHTML = `<span style="color: var(--muted); font-size: 0.9rem;">No reminders configured. Click '+ Add Reminder' to start.</span>`;
+    return;
+  }}
+  
+  remindersCache.forEach(item => {{
+    const card = document.createElement("div");
+    card.style.cssText = "display: flex; flex-direction: column; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); margin-bottom: 8px;";
+    
+    const row1 = document.createElement("div");
+    row1.style.cssText = "display: flex; align-items: center; justify-content: space-between; gap: 10px;";
+    
+    const left = document.createElement("div");
+    left.style.cssText = "display: flex; align-items: center; gap: 10px;";
+    
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.checked = item.enabled !== false;
+    toggle.style.cssText = "width: 18px; height: 18px; accent-color: var(--ink); cursor: pointer; margin: 0;";
+    toggle.addEventListener("change", () => toggleReminder(item.id, toggle.checked));
+    
+    const badge = document.createElement("span");
+    badge.textContent = item.category || "NOTE";
+    badge.style.cssText = "font-size: 0.75rem; font-weight: 700; padding: 2px 6px; border: 1px solid var(--ink); border-radius: 4px; background: var(--soft);";
+    
+    const title = document.createElement("strong");
+    title.textContent = item.title;
+    title.style.cssText = "font-size: 0.95rem; font-weight: 700;";
+    if (item.priority === "high") {{
+      title.innerHTML += ' <span style="color: #c53030; font-weight: 800;">[!]</span>';
+    }}
+    
+    left.append(toggle, badge, title);
+    
+    const right = document.createElement("div");
+    right.style.cssText = "display: flex; gap: 6px;";
+    
+    const btnEdit = document.createElement("button");
+    btnEdit.type = "button";
+    btnEdit.textContent = "Edit";
+    btnEdit.style.cssText = "min-height: 28px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; border-radius: 6px; margin: 0;";
+    btnEdit.addEventListener("click", () => editReminderForm(item));
+    
+    const btnDelete = document.createElement("button");
+    btnDelete.type = "button";
+    btnDelete.textContent = "Delete";
+    btnDelete.style.cssText = "min-height: 28px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; border-radius: 6px; border-color: #e53e3e; color: #e53e3e; background: #fff5f5; margin: 0;";
+    btnDelete.addEventListener("click", () => deleteReminder(item.id));
+    
+    right.append(btnEdit, btnDelete);
+    
+    row1.append(left, right);
+    card.append(row1);
+    
+    const row2 = document.createElement("div");
+    row2.style.cssText = "font-size: 0.82rem; color: var(--muted); margin-left: 28px; display: flex; flex-direction: column; gap: 2px;";
+    
+    if (item.detail) {{
+      const detail = document.createElement("span");
+      detail.textContent = `Detail: ${{item.detail}}`;
+      row2.append(detail);
+    }}
+    
+    let schedStr = "Always Active";
+    if (item.date) {{
+      schedStr = `One-off: ${{item.date}}`;
+    }} else if (item.recurrence && item.recurrence.type === "weekly") {{
+      schedStr = `Weekly: ${{item.recurrence.days.join(", ")}}`;
+    }}
+    
+    if (item.expires_after_date) {{
+      schedStr += ` (Expires: ${{item.expires_after_date}})`;
+    }}
+    
+    const sched = document.createElement("span");
+    sched.textContent = `Schedule: ${{schedStr}}`;
+    row2.append(sched);
+    
+    card.append(row2);
+    notesList.append(card);
+  }});
+}}
+
+function renderRemindersPreview() {{
+  notesPreviewList.replaceChildren();
+  
+  const daysOfWeek = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+  const now = new Date();
+  const currentWeekday = daysOfWeek[now.getDay()];
+  const currentYear = now.getFullYear();
+  const currentMonth = String(now.getMonth() + 1).padStart(2, '0');
+  const currentDate = String(now.getDate()).padStart(2, '0');
+  const currentDateStr = `${{currentYear}}-${{currentMonth}}-${{currentDate}}`;
+  
+  const activeItems = remindersCache.filter(item => {{
+    if (item.enabled === false) return false;
+    
+    if (item.expires_after_date && currentDateStr > item.expires_after_date) {{
+      return false;
+    }}
+    
+    if (item.date) {{
+      return item.date === currentDateStr;
+    }}
+    
+    if (item.recurrence && item.recurrence.type === "weekly") {{
+      return item.recurrence.days.includes(currentWeekday);
+    }}
+    
+    return true;
+  }});
+  
+  activeItems.sort((a, b) => {{
+    const aPriority = a.priority === "high" ? 0 : a.priority === "normal" ? 1 : 2;
+    const bPriority = b.priority === "high" ? 0 : b.priority === "normal" ? 1 : 2;
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    const aCat = (a.category || "").toUpperCase();
+    const bCat = (b.category || "").toUpperCase();
+    if (aCat !== bCat) return aCat.localeCompare(bCat);
+    return (a.title || "").localeCompare(b.title || "");
+  }});
+  
+  if (activeItems.length === 0) {{
+    notesPreviewList.innerHTML = `<span style="color: var(--muted); font-size: 0.88rem; font-style: italic;">No active reminders for today.</span>`;
+    return;
+  }}
+  
+  activeItems.forEach(item => {{
+    const row = document.createElement("div");
+    row.style.cssText = "display: flex; align-items: center; gap: 8px; font-size: 0.88rem;";
+    
+    const bullet = document.createElement("span");
+    bullet.textContent = "•";
+    bullet.style.cssText = "color: var(--ink); font-weight: 800;";
+    if (item.priority === "high") {{
+      bullet.textContent = "!";
+      bullet.style.cssText = "color: #c53030; font-weight: 800;";
+    }}
+    
+    const cat = document.createElement("strong");
+    cat.textContent = `[${{item.category || "NOTE"}}]`;
+    
+    const title = document.createElement("span");
+    title.textContent = item.title;
+    
+    row.append(bullet, cat, title);
+    if (item.detail) {{
+      const detail = document.createElement("span");
+      detail.textContent = `(${{item.detail}})`;
+      detail.style.cssText = "color: var(--muted); font-size: 0.82rem; margin-left: 4px;";
+      row.append(detail);
+    }}
+    
+    notesPreviewList.append(row);
+  }});
+}}
+
+async function toggleReminder(id, enabled) {{
+  try {{
+    await deviceApi("/api/notes/toggle", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ id, enabled }})
+    }});
+    await fetchReminders();
+  }} catch (error) {{
+    alert(`Failed to toggle reminder: ${{error.message}}`);
+  }}
+}}
+
+async function deleteReminder(id) {{
+  if (!confirm("Are you sure you want to delete this reminder?")) return;
+  try {{
+    await deviceApi("/api/notes/delete", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ id }})
+    }});
+    await fetchReminders();
+  }} catch (error) {{
+    alert(`Failed to delete reminder: ${{error.message}}`);
+  }}
+}}
+
+function resetNoteForm() {{
+  noteIdInput.value = "";
+  noteCategoryInput.value = "NOTE";
+  notePriorityInput.value = "normal";
+  noteTitleInput.value = "";
+  noteDetailInput.value = "";
+  noteDateInput.value = "";
+  noteExpiresInput.value = "";
+  
+  document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
+  document.querySelectorAll('input[name="weekly_days"]').forEach(cb => cb.checked = false);
+  updateScheduleVisibility();
+}}
+
+function showForm(title) {{
+  notesFormTitle.textContent = title;
+  notesListView.style.display = "none";
+  notesFormView.style.display = "block";
+}}
+
+function hideForm() {{
+  notesFormView.style.display = "none";
+  notesListView.style.display = "block";
+}}
+
+document.getElementById("btn-add-note").addEventListener("click", () => {{
+  resetNoteForm();
+  showForm("Add Reminder");
+}});
+
+document.getElementById("btn-cancel-note").addEventListener("click", hideForm);
+
+function editReminderForm(item) {{
+  resetNoteForm();
+  noteIdInput.value = item.id;
+  noteCategoryInput.value = item.category || "NOTE";
+  notePriorityInput.value = item.priority || "normal";
+  noteTitleInput.value = item.title || "";
+  noteDetailInput.value = item.detail || "";
+  noteExpiresInput.value = item.expires_after_date || "";
+  
+  if (item.date) {{
+    document.querySelector('input[name="schedule_type"][value="oneoff"]').checked = true;
+    noteDateInput.value = item.date;
+  }} else if (item.recurrence && item.recurrence.type === "weekly") {{
+    document.querySelector('input[name="schedule_type"][value="recurring"]').checked = true;
+    const days = item.recurrence.days || [];
+    document.querySelectorAll('input[name="weekly_days"]').forEach(cb => {{
+      cb.checked = days.includes(cb.value);
+    }});
+  }} else {{
+    document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
+  }}
+  
+  updateScheduleVisibility();
+  showForm("Edit Reminder");
+}}
+
+document.getElementById("btn-save-note").addEventListener("click", async () => {{
+  const title = noteTitleInput.value.trim();
+  if (!title) {{
+    alert("Title is required!");
+    return;
+  }}
+  
+  const scheduleType = document.querySelector('input[name="schedule_type"]:checked').value;
+  let date = null;
+  let recurrence = null;
+  
+  if (scheduleType === "oneoff") {{
+    date = noteDateInput.value;
+    if (!date) {{
+      alert("Please select a date!");
+      return;
+    }}
+  }} else if (scheduleType === "recurring") {{
+    const selectedDays = [];
+    document.querySelectorAll('input[name="weekly_days"]:checked').forEach(cb => {{
+      selectedDays.push(cb.value);
+    }});
+    if (selectedDays.length === 0) {{
+      alert("Please select at least one day!");
+      return;
+    }}
+    recurrence = {{
+      type: "weekly",
+      days: selectedDays
+    }};
+  }}
+  
+  const body = {{
+    id: noteIdInput.value || null,
+    enabled: true,
+    category: noteCategoryInput.value,
+    priority: notePriorityInput.value,
+    title: title,
+    detail: noteDetailInput.value.trim(),
+    date: date,
+    recurrence: recurrence,
+    expires_after_date: noteExpiresInput.value || null
+  }};
+  
+  try {{
+    await deviceApi("/api/notes/save", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify(body)
+    }});
+    hideForm();
+    await fetchReminders();
+  }} catch (error) {{
+    alert(`Failed to save reminder: ${{error.message}}`);
+  }}
+}});
+
+fetchReminders();
+
 loadDeviceState();
 </script>
 </body>
@@ -850,6 +1325,9 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
             if parsed.path == "/api/config":
                 self.send_json(200, load_config(config_path))
                 return
+            if parsed.path == "/api/notes":
+                self.send_json(200, load_daily_notes())
+                return
             if parsed.path == "/api/geocode":
                 query = parse_qs(
                     parsed.query,
@@ -908,6 +1386,15 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
             if parsed.path == "/settings":
                 self.handle_form_post()
                 return
+            if parsed.path == "/api/notes/save":
+                self.handle_notes_save()
+                return
+            if parsed.path == "/api/notes/delete":
+                self.handle_notes_delete()
+                return
+            if parsed.path == "/api/notes/toggle":
+                self.handle_notes_toggle()
+                return
             if parsed.path.startswith("/api/maintenance/"):
                 if parsed.path != "/api/maintenance/restart-settings":
                     self.send_bytes(404, b"", "text/plain")
@@ -953,6 +1440,138 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                     500,
                     {"ok": False, "error": "Settings restart failed"},
                 )
+
+        def handle_notes_save(self):
+            if not self.device_csrf_valid():
+                self.send_json(
+                    403,
+                    {"ok": False, "error": "invalid request token"},
+                )
+                return
+            try:
+                candidate = self.read_json()
+                category = candidate.get("category", "NOTE").upper()
+                if category not in ("BIN", "SCHOOL", "APPT", "HOME", "TODO", "NOTE"):
+                    category = "NOTE"
+                
+                priority = candidate.get("priority", "normal").lower()
+                if priority not in ("low", "normal", "high"):
+                    priority = "normal"
+                    
+                title = candidate.get("title", "").strip()
+                if not title:
+                    self.send_json(400, {"ok": False, "error": "Title is required"})
+                    return
+                    
+                notes = load_daily_notes()
+                items = notes.setdefault("items", [])
+                
+                item_id = candidate.get("id")
+                if item_id:
+                    found = False
+                    for item in items:
+                        if item.get("id") == item_id:
+                            item.update({
+                                "enabled": bool(candidate.get("enabled", True)),
+                                "category": category,
+                                "title": title,
+                                "detail": candidate.get("detail", "").strip(),
+                                "priority": priority,
+                                "date": candidate.get("date") or None,
+                                "recurrence": candidate.get("recurrence") or None,
+                                "expires_after_date": candidate.get("expires_after_date") or None,
+                            })
+                            found = True
+                            break
+                    if not found:
+                        self.send_json(404, {"ok": False, "error": "Item not found"})
+                        return
+                else:
+                    import uuid
+                    item_id = str(uuid.uuid4())
+                    items.append({
+                        "id": item_id,
+                        "enabled": bool(candidate.get("enabled", True)),
+                        "category": category,
+                        "title": title,
+                        "detail": candidate.get("detail", "").strip(),
+                        "priority": priority,
+                        "date": candidate.get("date") or None,
+                        "recurrence": candidate.get("recurrence") or None,
+                        "expires_after_date": candidate.get("expires_after_date") or None,
+                    })
+                    
+                save_daily_notes(notes)
+                try:
+                    regenerate()
+                except Exception as e:
+                    print(f"Warning: Failed to regenerate dashboard: {e}")
+                self.send_json(200, {"ok": True, "id": item_id})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
+
+        def handle_notes_delete(self):
+            if not self.device_csrf_valid():
+                self.send_json(
+                    403,
+                    {"ok": False, "error": "invalid request token"},
+                )
+                return
+            try:
+                candidate = self.read_json()
+                item_id = candidate.get("id")
+                if not item_id:
+                    self.send_json(400, {"ok": False, "error": "ID is required"})
+                    return
+                notes = load_daily_notes()
+                items = notes.get("items", [])
+                new_items = [item for item in items if item.get("id") != item_id]
+                if len(items) == len(new_items):
+                    self.send_json(404, {"ok": False, "error": "Item not found"})
+                    return
+                notes["items"] = new_items
+                save_daily_notes(notes)
+                try:
+                    regenerate()
+                except Exception as e:
+                    print(f"Warning: Failed to regenerate dashboard: {e}")
+                self.send_json(200, {"ok": True})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
+
+        def handle_notes_toggle(self):
+            if not self.device_csrf_valid():
+                self.send_json(
+                    403,
+                    {"ok": False, "error": "invalid request token"},
+                )
+                return
+            try:
+                candidate = self.read_json()
+                item_id = candidate.get("id")
+                enabled = bool(candidate.get("enabled", True))
+                if not item_id:
+                    self.send_json(400, {"ok": False, "error": "ID is required"})
+                    return
+                notes = load_daily_notes()
+                items = notes.get("items", [])
+                found = False
+                for item in items:
+                    if item.get("id") == item_id:
+                        item["enabled"] = enabled
+                        found = True
+                        break
+                if not found:
+                    self.send_json(404, {"ok": False, "error": "Item not found"})
+                    return
+                save_daily_notes(notes)
+                try:
+                    regenerate()
+                except Exception as e:
+                    print(f"Warning: Failed to regenerate dashboard: {e}")
+                self.send_json(200, {"ok": True})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
 
         def handle_device_get(self, path):
             try:

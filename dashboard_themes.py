@@ -43,6 +43,11 @@ THEMES = {
         "description": "Narrow, dense information-rich layout",
         "implemented": True,
     },
+    "family_dashboard": {
+        "label": "Family Dashboard",
+        "description": "Compact weather with daily family reminders",
+        "implemented": True,
+    },
 }
 
 WEATHER_ONLY = {
@@ -75,6 +80,14 @@ def effective_visibility(theme, config):
     validate_theme(theme)
     if theme in ("home_dashboard", "compact_dashboard"):
         return {key: config[key] for key in VISIBILITY_FIELDS}
+    if theme == "family_dashboard":
+        return {
+            "show_weather": config.get("show_weather", True),
+            "show_forecast": config.get("show_forecast", True),
+            "show_server": False,
+            "show_pihole": False,
+            "show_tailscale": False,
+        }
     if theme in ("minimal_weather", "travel_weather", "maarif_calendar"):
         return dict(WEATHER_ONLY)
     if theme == "server_monitor":

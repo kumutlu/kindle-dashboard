@@ -8,25 +8,37 @@ IMG="/mnt/us/dashboard/weather.png"
 TMP="/mnt/us/dashboard/weather.tmp"
 LOCK_FILE="/tmp/kindle-refresh.lock"
 
+# Detect if a native timeout command is available
+TIMEOUT_CMD=""
+if command -v timeout >/dev/null 2>&1; then
+	if timeout 1 true >/dev/null 2>&1; then
+		TIMEOUT_CMD="timeout"
+	elif timeout -t 1 true >/dev/null 2>&1; then
+		TIMEOUT_CMD="timeout -t"
+	fi
+elif busybox | grep -q "\btimeout\b" >/dev/null 2>&1; then
+	if busybox timeout 1 true >/dev/null 2>&1; then
+		TIMEOUT_CMD="busybox timeout"
+	elif busybox timeout -t 1 true >/dev/null 2>&1; then
+		TIMEOUT_CMD="busybox timeout -t"
+	fi
+fi
+
 # POSIX sh compatible timeout helper
+# Note: On Kindle BusyBox ash, spawning a background watchdog subshell leaves
+# orphaned processes and leaks shell wrappers. We only use native timeout if available;
+# otherwise, we execute directly without custom timeout wrappers.
 timeout_cmd() {
 	TIMEOUT_SEC=$1
 	shift
-	"$@" &
-	CMD_PID=$!
-	(
-		trap 'kill -9 $sp 2>/dev/null; exit 0' EXIT TERM INT HUP
-		sleep "$TIMEOUT_SEC" &
-		sp=$!
-		wait "$sp" 2>/dev/null
-		kill -0 "$CMD_PID" 2>/dev/null && kill -9 "$CMD_PID" 2>/dev/null
-	) &
-	TIMER_PID=$!
-	wait "$CMD_PID" 2>/dev/null
-	EXIT_CODE=$?
-	kill "$TIMER_PID" 2>/dev/null
-	wait "$TIMER_PID" 2>/dev/null
-	return $EXIT_CODE
+	if [ -n "$TIMEOUT_CMD" ]; then
+		$TIMEOUT_CMD "$TIMEOUT_SEC" "$@"
+		return $?
+	else
+		# Fallback: run directly without timeout wrapper
+		"$@"
+		return $?
+	fi
 }
 
 cleanup() {

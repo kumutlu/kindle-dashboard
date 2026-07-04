@@ -88,7 +88,7 @@ sleep 90
 
 # Fetch and apply saved brightness before dashboard display starts
 CONFIG_JSON=$(wget -q -O- "http://${PI_IP}:8767/api/config")
-BRIGHTNESS=$(echo "$CONFIG_JSON" | grep -o '"kindle_frontlight":\s*[0-9]*' | grep -o '[0-9]*')
+BRIGHTNESS=$(echo "$CONFIG_JSON" | grep -o '"kindle_frontlight":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
 if [ -n "$BRIGHTNESS" ]; then
     log "Reapplying persistent front light level: $BRIGHTNESS"
     lipc-set-prop com.lab126.powerd flIntensity "$BRIGHTNESS" 2>/dev/null
@@ -104,7 +104,7 @@ while true; do
     
     # Query configuration for the next sleep interval (fallback to 10 mins if error/missing)
     CONFIG_JSON=$(wget -q -O- "http://${PI_IP}:8767/api/config")
-    REFRESH_MINS=$(echo "$CONFIG_JSON" | grep -o '"refresh_interval_minutes":\s*[0-9]*' | grep -o '[0-9]*')
+    REFRESH_MINS=$(echo "$CONFIG_JSON" | grep -o '"refresh_interval_minutes":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
     if [ -n "$REFRESH_MINS" ]; then
         INTERVAL=$((REFRESH_MINS * 60))
         log "Configured refresh interval: ${REFRESH_MINS}m (${INTERVAL}s)"

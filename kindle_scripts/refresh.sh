@@ -8,38 +8,15 @@ IMG="/mnt/us/dashboard/weather.png"
 TMP="/mnt/us/dashboard/weather.tmp"
 LOCK_FILE="/tmp/kindle-refresh.lock"
 
-# Detect if a native timeout command is available
-TIMEOUT_CMD=""
-if command -v timeout >/dev/null 2>&1; then
-	if timeout 1 true >/dev/null 2>&1; then
-		TIMEOUT_CMD="timeout"
-	elif timeout -t 1 true >/dev/null 2>&1; then
-		TIMEOUT_CMD="timeout -t"
-	fi
-elif busybox | grep -q "\btimeout\b" >/dev/null 2>&1; then
-	if busybox timeout 1 true >/dev/null 2>&1; then
-		TIMEOUT_CMD="busybox timeout"
-	elif busybox timeout -t 1 true >/dev/null 2>&1; then
-		TIMEOUT_CMD="busybox timeout -t"
-	fi
-fi
-
-# POSIX sh compatible timeout helper
-# Note: On Kindle BusyBox ash, spawning a background watchdog subshell leaves
-# orphaned processes and leaks shell wrappers. We only use native timeout if available;
-# otherwise, we execute directly without custom timeout wrappers.
-timeout_cmd() {
-	TIMEOUT_SEC=$1
-	shift
-	if [ -n "$TIMEOUT_CMD" ]; then
-		$TIMEOUT_CMD "$TIMEOUT_SEC" "$@"
-		return $?
-	else
-		# Fallback: run directly without timeout wrapper
-		"$@"
-		return $?
-	fi
-}
+# Note: On Kindle BusyBox ash, using custom background watchdogs, command evaluations,
+# or even the shell built-in 'sleep' command forces the shell to fork duplicate child
+# processes named 'refresh.sh' that pollute the process table.
+# To keep exactly one 'refresh.sh' daemon process active:
+#   1. We do not use any custom timeout wrapper or subshell.
+#   2. We run all utilities (lipc, eips, wget, curl) directly in the foreground.
+#   3. For curl, we rely on its native --connect-timeout and --max-time flags.
+#   4. We execute the external '/bin/sleep' binary instead of the built-in 'sleep'
+#      so that wait intervals run as a separate 'sleep' process name.
 
 cleanup() {
 	rm -f "$LOCK_FILE"
@@ -64,29 +41,31 @@ do
 		OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null)
 		if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
 			echo "$(date '+%Y-%m-%d %H:%M:%S') another active refresh process ($OLD_PID) is running, skipping cycle"
-			sleep "$INTERVAL"
+			/bin/sleep "$INTERVAL"
 			continue
 		fi
 	fi
 	echo $$ > "$LOCK_FILE"
 
-	CONFIG_JSON=$(timeout_cmd 5 wget -q -O- "$CONFIG_URL")
+	# Get config json directly (local LAN request is fast)
+	CONFIG_JSON=$(wget -q -O- "$CONFIG_URL" 2>/dev/null)
 
 	LIGHT=$(echo "$CONFIG_JSON" | grep -o '"kindle_frontlight":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
 	if [ -n "$LIGHT" ] && { [ "$LIGHT" -eq 0 ] || [ "$LIGHT" -eq 1 ] || [ "$LIGHT" -eq 4 ] || [ "$LIGHT" -eq 8 ] || [ "$LIGHT" -eq 12 ] || [ "$LIGHT" -eq 18 ]; }; then
 		echo "$(date '+%Y-%m-%d %H:%M:%S') frontlight: $LIGHT"
-		timeout_cmd 5 lipc-set-prop com.lab126.powerd flIntensity "$LIGHT" 2>/dev/null
+		lipc-set-prop com.lab126.powerd flIntensity "$LIGHT" 2>/dev/null
 	else
 		echo "$(date '+%Y-%m-%d %H:%M:%S') config unavailable, using fallback frontlight $FALLBACK_LIGHT"
-		timeout_cmd 5 lipc-set-prop com.lab126.powerd flIntensity "$FALLBACK_LIGHT" 2>/dev/null
+		lipc-set-prop com.lab126.powerd flIntensity "$FALLBACK_LIGHT" 2>/dev/null
 	fi
 
-	timeout_cmd 5 lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
+	lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
 
 	SOURCE=""
 	rm -f "$TMP"
 
-	if timeout_cmd 20 wget -q -O "$TMP" "$LOCAL_URL" && [ -s "$TMP" ]; then
+	# Download local image
+	if wget -q -O "$TMP" "$LOCAL_URL" 2>/dev/null && [ -s "$TMP" ]; then
 		SOURCE="local"
 	else
 		rm -f "$TMP"
@@ -95,12 +74,12 @@ do
 			TOKEN=$(sed -n '1p' "$TOKEN_FILE")
 
 			if [ -n "$TOKEN" ] &&
-				timeout_cmd 50 /mnt/us/usbnet/bin/curl -fsS \
+				/mnt/us/usbnet/bin/curl -fsS \
 					--connect-timeout 15 \
 					--max-time 45 \
 					-H "Authorization: Bearer $TOKEN" \
 					-o "$TMP" \
-					"$PUBLIC_URL" &&
+					"$PUBLIC_URL" 2>/dev/null &&
 				[ -s "$TMP" ]; then
 				SOURCE="public"
 			fi
@@ -118,11 +97,11 @@ do
 	fi
 
 	if [ -s "$IMG" ]; then
-		if ! timeout_cmd 15 /usr/sbin/eips -c; then
+		if ! /usr/sbin/eips -c; then
 			echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed/timed out (eips -c)"
-		elif ! timeout_cmd 15 /usr/sbin/eips -f; then
+		elif ! /usr/sbin/eips -f; then
 			echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed/timed out (eips -f)"
-		elif ! timeout_cmd 20 /usr/sbin/eips -g "$IMG"; then
+		elif ! /usr/sbin/eips -g "$IMG"; then
 			echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed/timed out (eips -g)"
 		fi
 	fi
@@ -139,5 +118,6 @@ do
 		echo "$(date '+%Y-%m-%d %H:%M:%S') config unavailable, using fallback refresh interval 600 sec"
 	fi
 
-	sleep "$INTERVAL"
+	# Call the external /bin/sleep binary to avoid shell built-in process forking
+	/bin/sleep "$INTERVAL"
 done

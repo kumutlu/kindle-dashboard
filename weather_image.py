@@ -2055,39 +2055,45 @@ def render_compact_dashboard(config):
         txt(d, 280, y + 115, f"{feels}°C / {data['weather_desc_localized'].upper()}", FB18, anchor="mm")
 
         # Stats on right
-        col1_x = 410
-        val1_x = 555
-        col2_x = 568
-        val2_x = 718
+        left_metric_x = 420
+        left_value_x = 475
+        right_metric_x = 575
+        right_value_x = 635
         
-        hi_lo_lbl = "Hi" if lang == "en" else "Der"
+        hi_lo_lbl = "H/L" if lang == "en" else "Der"
         humid_lbl = "Hum" if lang == "en" else "Nem"
         press_lbl = "Pres" if lang == "en" else "Bas"
         
         wind_lbl = "Wind" if lang == "en" else "Rüz"
         sunset_lbl = "Set" if lang == "en" else "Bat"
         sr_lbl = "Rise" if lang == "en" else "Doğ"
+
+        # Format values cleanly to prevent any potential overflow
+        hl_val = f"{hi}/{lo}"
+        hum_val = f"%{humidity}" if lang == "tr" else f"{humidity}%"
+        pres_val = f"{pressure}"
+        wind_val = f"{wind}"
         
         # Row 1
-        txt(d, col1_x, y + 25, hi_lo_lbl, FR16)
-        txt(d, val1_x, y + 23, f"{hi}°/{lo}°", FB18, anchor="ra")
+        txt(d, left_metric_x, y + 25, hi_lo_lbl, FR16)
+        txt(d, left_value_x, y + 23, hl_val, FB18)
         
-        txt(d, col2_x, y + 25, wind_lbl, FR16)
-        txt(d, val2_x, y + 23, f"{wind} mph", FB18, anchor="ra")
+        txt(d, right_metric_x, y + 25, wind_lbl, FR16)
+        txt(d, right_value_x, y + 23, wind_val, FB18)
         
         # Row 2
-        txt(d, col1_x, y + 75, humid_lbl, FR16)
-        txt(d, val1_x, y + 73, f"%{humidity}" if lang == "tr" else f"{humidity}%", FB18, anchor="ra")
+        txt(d, left_metric_x, y + 75, humid_lbl, FR16)
+        txt(d, left_value_x, y + 73, hum_val, FB18)
         
-        txt(d, col2_x, y + 75, sunset_lbl, FR16)
-        txt(d, val2_x, y + 73, sunset, FB18, anchor="ra")
+        txt(d, right_metric_x, y + 75, sunset_lbl, FR16)
+        txt(d, right_value_x, y + 73, sunset, FB18)
         
         # Row 3 (Sunrise / Sunset or Pressure)
-        txt(d, col1_x, y + 125, press_lbl, FR16)
-        txt(d, val1_x, y + 123, f"{pressure}", FB18, anchor="ra")
+        txt(d, left_metric_x, y + 125, press_lbl, FR16)
+        txt(d, left_value_x, y + 123, pres_val, FB18)
         
-        txt(d, col2_x, y + 125, sr_lbl, FR16)
-        txt(d, val2_x, y + 123, sunrise, FB18, anchor="ra")
+        txt(d, right_metric_x, y + 125, sr_lbl, FR16)
+        txt(d, right_value_x, y + 123, sunrise, FB18)
 
         y += 170
 
@@ -2312,39 +2318,45 @@ def render_family_dashboard(config):
         txt(d, 280, y + 115, f"{feels}°C / {data['weather_desc_localized'].upper()}", FB18, anchor="mm")
 
         # Stats on right
-        col1_x = 410
-        val1_x = 555
-        col2_x = 568
-        val2_x = 718
+        left_metric_x = 420
+        left_value_x = 475
+        right_metric_x = 575
+        right_value_x = 635
         
-        hi_lo_lbl = "Hi" if lang == "en" else "Der"
+        hi_lo_lbl = "H/L" if lang == "en" else "Der"
         humid_lbl = "Hum" if lang == "en" else "Nem"
         press_lbl = "Pres" if lang == "en" else "Bas"
         
         wind_lbl = "Wind" if lang == "en" else "Rüz"
         sunset_lbl = "Set" if lang == "en" else "Bat"
         sr_lbl = "Rise" if lang == "en" else "Doğ"
+
+        # Format values cleanly to prevent any potential overflow
+        hl_val = f"{hi}/{lo}"
+        hum_val = f"%{humidity}" if lang == "tr" else f"{humidity}%"
+        pres_val = f"{pressure}"
+        wind_val = f"{wind}"
         
         # Row 1
-        txt(d, col1_x, y + 25, hi_lo_lbl, FR16)
-        txt(d, val1_x, y + 23, f"{hi}°/{lo}°", FB18, anchor="ra")
+        txt(d, left_metric_x, y + 25, hi_lo_lbl, FR16)
+        txt(d, left_value_x, y + 23, hl_val, FB18)
         
-        txt(d, col2_x, y + 25, wind_lbl, FR16)
-        txt(d, val2_x, y + 23, f"{wind} mph", FB18, anchor="ra")
+        txt(d, right_metric_x, y + 25, wind_lbl, FR16)
+        txt(d, right_value_x, y + 23, wind_val, FB18)
         
         # Row 2
-        txt(d, col1_x, y + 75, humid_lbl, FR16)
-        txt(d, val1_x, y + 73, f"%{humidity}" if lang == "tr" else f"{humidity}%", FB18, anchor="ra")
+        txt(d, left_metric_x, y + 75, humid_lbl, FR16)
+        txt(d, left_value_x, y + 73, hum_val, FB18)
         
-        txt(d, col2_x, y + 75, sunset_lbl, FR16)
-        txt(d, val2_x, y + 73, sunset, FB18, anchor="ra")
+        txt(d, right_metric_x, y + 75, sunset_lbl, FR16)
+        txt(d, right_value_x, y + 73, sunset, FB18)
         
         # Row 3 (Sunrise / Sunset or Pressure)
-        txt(d, col1_x, y + 125, press_lbl, FR16)
-        txt(d, val1_x, y + 123, f"{pressure}", FB18, anchor="ra")
+        txt(d, left_metric_x, y + 125, press_lbl, FR16)
+        txt(d, left_value_x, y + 123, pres_val, FB18)
         
-        txt(d, col2_x, y + 125, sr_lbl, FR16)
-        txt(d, val2_x, y + 123, sunrise, FB18, anchor="ra")
+        txt(d, right_metric_x, y + 125, sr_lbl, FR16)
+        txt(d, right_value_x, y + 123, sunrise, FB18)
 
         y += 170
 

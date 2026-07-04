@@ -208,6 +208,56 @@ class FamilyDashboardTests(unittest.TestCase):
                 if test_out.exists():
                     test_out.unlink()
 
+    @patch("weather_image.collect_dashboard_data")
+    def test_rendering_worst_case_layout(self, mock_collect):
+        # worst-case weather metrics values for layout overflow validation
+        mock_collect.return_value = {
+            "now": datetime(2026, 7, 4, 12, 0),
+            "temp": 29,
+            "feels": 32,
+            "desc": "Heavy Rain",
+            "humidity": 100,
+            "wind": 18,
+            "wind_dir": "WSW",
+            "pressure": 1029,
+            "hi": 29,
+            "lo": 18,
+            "sunrise": "04:31",
+            "sunset": "21:59",
+            "cpu": 99,
+            "ram": 99,
+            "disk": 99,
+            "ph": {"blocked": 99999, "queries": 999999},
+            "ts": {"online": 99, "total": 99},
+            "day_name_localized": "Saturday",
+            "weather_desc_localized": "Heavy Rain",
+            "current": {"weatherCode": 1243},
+            "days": [
+                {
+                    "date": "2026-07-04",
+                    "maxtempC": 29,
+                    "mintempC": 18,
+                    "hourly": [{"chanceofrain": 90}] * 8
+                }
+            ]
+        }
+
+        config = dict(weather_image.DEFAULT_CONFIG, theme="family_dashboard")
+        test_out = Path(__file__).resolve().parent / "test_family_worst_case.png"
+        
+        with patch("weather_image.OUT", test_out):
+            if test_out.exists():
+                test_out.unlink()
+            try:
+                weather_image.render_family_dashboard(config)
+                self.assertTrue(test_out.exists())
+                from PIL import Image
+                with Image.open(test_out) as img:
+                    self.assertEqual(img.size, (758, 1024))
+            finally:
+                if test_out.exists():
+                    test_out.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

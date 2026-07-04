@@ -15,7 +15,7 @@ timeout_cmd() {
 	"$@" &
 	CMD_PID=$!
 	(
-		trap 'kill -9 $sp 2>/dev/null' EXIT
+		trap 'kill -9 $sp 2>/dev/null; exit 0' EXIT TERM INT HUP
 		sleep "$TIMEOUT_SEC" &
 		sp=$!
 		wait "$sp" 2>/dev/null
@@ -24,7 +24,7 @@ timeout_cmd() {
 	TIMER_PID=$!
 	wait "$CMD_PID" 2>/dev/null
 	EXIT_CODE=$?
-	kill -0 "$TIMER_PID" 2>/dev/null && kill -9 "$TIMER_PID" 2>/dev/null
+	kill "$TIMER_PID" 2>/dev/null
 	wait "$TIMER_PID" 2>/dev/null
 	return $EXIT_CODE
 }

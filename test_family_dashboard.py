@@ -258,6 +258,163 @@ class FamilyDashboardTests(unittest.TestCase):
                 if test_out.exists():
                     test_out.unlink()
 
+    def test_start_date_and_extended_recurrence(self):
+        # 1. start_date hides reminder before start date
+        # 2. start_date allows reminder on start date
+        # 3. start_date allows reminder after start date
+        notes = {
+            "items": [
+                {
+                    "id": "start-future",
+                    "enabled": True,
+                    "title": "Future task",
+                    "start_date": "2026-07-10",
+                    "date": None,
+                    "recurrence": None,
+                },
+                {
+                    "id": "start-today",
+                    "enabled": True,
+                    "title": "Today task",
+                    "start_date": "2026-07-04",
+                    "date": None,
+                    "recurrence": None,
+                },
+                {
+                    "id": "start-past",
+                    "enabled": True,
+                    "title": "Past task",
+                    "start_date": "2026-07-01",
+                    "date": None,
+                    "recurrence": None,
+                },
+                {
+                    "id": "weekly-future",
+                    "enabled": True,
+                    "title": "Weekly future",
+                    "start_date": "2026-07-10",
+                    "date": None,
+                    "recurrence": {"type": "weekly", "days": ["SAT"]},
+                },
+                {
+                    "id": "weekly-active",
+                    "enabled": True,
+                    "title": "Weekly active",
+                    "start_date": "2026-07-01",
+                    "date": None,
+                    "recurrence": {"type": "weekly", "days": ["SAT"]},
+                },
+                {
+                    "id": "fortnightly-ok",
+                    "enabled": True,
+                    "title": "Fortnightly",
+                    "date": None,
+                    "recurrence": {
+                        "type": "fortnightly",
+                        "days": ["MON"],
+                        "anchor_date": "2026-07-06"
+                    }
+                },
+                {
+                    "id": "fortnightly-start",
+                    "enabled": True,
+                    "title": "Fortnightly start restricted",
+                    "start_date": "2026-07-15",
+                    "date": None,
+                    "recurrence": {
+                        "type": "fortnightly",
+                        "days": ["MON"],
+                        "anchor_date": "2026-07-06"
+                    }
+                },
+                {
+                    "id": "monthly-regular",
+                    "enabled": True,
+                    "title": "Monthly day 5",
+                    "date": None,
+                    "recurrence": {
+                        "type": "monthly",
+                        "day_of_month": 5
+                    }
+                },
+                {
+                    "id": "monthly-overflow",
+                    "enabled": True,
+                    "title": "Monthly day 31",
+                    "date": None,
+                    "recurrence": {
+                        "type": "monthly",
+                        "day_of_month": 31
+                    }
+                },
+                {
+                    "id": "expired-reminder",
+                    "enabled": True,
+                    "title": "Expired",
+                    "date": None,
+                    "recurrence": None,
+                    "expires_after_date": "2026-07-03"
+                },
+                {
+                    "id": "malformed-start",
+                    "enabled": True,
+                    "title": "Malformed start",
+                    "start_date": "invalid-date-string",
+                    "date": None,
+                    "recurrence": None,
+                }
+            ]
+        }
+
+        # SAT July 4, 2026
+        active_04 = weather_image.get_active_reminders(notes, "2026-07-04")
+        ids_04 = [item["id"] for item in active_04]
+        self.assertIn("start-today", ids_04)
+        self.assertIn("start-past", ids_04)
+        self.assertIn("weekly-active", ids_04)
+        self.assertIn("malformed-start", ids_04)
+        self.assertNotIn("start-future", ids_04)
+        self.assertNotIn("weekly-future", ids_04)
+        self.assertNotIn("expired-reminder", ids_04)
+
+        # MON July 6, 2026 (Fortnightly anchor, Monday)
+        active_06 = weather_image.get_active_reminders(notes, "2026-07-06")
+        ids_06 = [item["id"] for item in active_06]
+        self.assertIn("fortnightly-ok", ids_06)
+        self.assertNotIn("fortnightly-start", ids_06)
+
+        # MON July 13, 2026 (Fortnightly off-week Monday)
+        active_13 = weather_image.get_active_reminders(notes, "2026-07-13")
+        ids_13 = [item["id"] for item in active_13]
+        self.assertNotIn("fortnightly-ok", ids_13)
+
+        # MON July 20, 2026 (Fortnightly on-week Monday after start date)
+        active_20 = weather_image.get_active_reminders(notes, "2026-07-20")
+        ids_20 = [item["id"] for item in active_20]
+        self.assertIn("fortnightly-ok", ids_20)
+        self.assertIn("fortnightly-start", ids_20)
+
+        # MON July 5, 2026 (Monthly test day 5)
+        active_05 = weather_image.get_active_reminders(notes, "2026-07-05")
+        ids_05 = [item["id"] for item in active_05]
+        self.assertIn("monthly-regular", ids_05)
+
+        # THU April 30, 2026 (Monthly test day 31 overflow to last day of April)
+        active_apr30 = weather_image.get_active_reminders(notes, "2026-04-30")
+        ids_apr30 = [item["id"] for item in active_apr30]
+        self.assertIn("monthly-overflow", ids_apr30)
+
+        # FRI May 1, 2026 (Should NOT match monthly day 31 overflow)
+        active_may01 = weather_image.get_active_reminders(notes, "2026-05-01")
+        ids_may01 = [item["id"] for item in active_may01]
+        self.assertNotIn("monthly-overflow", ids_may01)
+
+    def test_settings_server_html_contains_recurrence_options(self):
+        html_content = settings_server.render_settings(weather_image.DEFAULT_CONFIG, "test-csrf-token")
+        self.assertIn("Start Date", html_content)
+        self.assertIn("Fortnightly Repeat", html_content)
+        self.assertIn("Monthly Repeat", html_content)
+
 
 if __name__ == "__main__":
     unittest.main()

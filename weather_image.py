@@ -2222,9 +2222,19 @@ def get_active_reminders(notes_data, local_date_str):
         if not item.get("enabled", True):
             continue
             
+        start_date = item.get("start_date")
+        if start_date:
+            try:
+                datetime.strptime(start_date, "%Y-%m-%d")
+                if current_date_str < start_date:
+                    continue
+            except Exception:
+                pass
+
         expires = item.get("expires_after_date")
         if expires:
             try:
+                datetime.strptime(expires, "%Y-%m-%d")
                 if current_date_str > expires:
                     continue
             except Exception:
@@ -2237,10 +2247,34 @@ def get_active_reminders(notes_data, local_date_str):
             continue
             
         recurrence = item.get("recurrence")
-        if recurrence and recurrence.get("type") == "weekly":
-            days = recurrence.get("days", [])
-            if current_weekday in days:
-                active_items.append(item)
+        if recurrence:
+            rec_type = recurrence.get("type")
+            if rec_type == "weekly":
+                days = recurrence.get("days", [])
+                if current_weekday in days:
+                    active_items.append(item)
+            elif rec_type == "fortnightly":
+                days = recurrence.get("days", [])
+                anchor_str = recurrence.get("anchor_date")
+                if anchor_str and current_weekday in days:
+                    try:
+                        anchor_dt = datetime.strptime(anchor_str, "%Y-%m-%d").date()
+                        if dt >= anchor_dt and (dt - anchor_dt).days % 14 == 0:
+                            active_items.append(item)
+                    except Exception:
+                        pass
+            elif rec_type == "monthly":
+                day_of_month = recurrence.get("day_of_month")
+                if day_of_month is not None:
+                    try:
+                        import calendar
+                        day_of_month = int(day_of_month)
+                        last_day = calendar.monthrange(dt.year, dt.month)[1]
+                        target_day = min(day_of_month, last_day)
+                        if dt.day == target_day:
+                            active_items.append(item)
+                    except Exception:
+                        pass
             continue
             
         if not item_date and not recurrence:

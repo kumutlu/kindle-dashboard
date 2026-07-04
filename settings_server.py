@@ -588,9 +588,16 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
       <input type="text" id="note-detail" placeholder="16:30, Put out tonight, Take library books...">
     </label>
 
+    <!-- Start Date Input -->
+    <label class="field">
+      <span>Start Date (Optional)</span>
+      <input type="date" id="note-start-date" style="width: 100%; min-height: 46px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-size: 0.95rem;">
+      <span style="display: block; font-size: 0.75rem; color: var(--muted); margin-top: 4px;">Reminder will not appear before this date.</span>
+    </label>
+
     <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 18px; background: var(--soft);">
       <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Schedule Type</span>
-      <div style="display: flex; gap: 16px; margin-bottom: 12px;">
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 12px;">
         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
           <input type="radio" name="schedule_type" value="always" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Always Active
         </label>
@@ -599,6 +606,12 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
         </label>
         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
           <input type="radio" name="schedule_type" value="recurring" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Weekly Repeat
+        </label>
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+          <input type="radio" name="schedule_type" value="fortnightly" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Fortnightly Repeat
+        </label>
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+          <input type="radio" name="schedule_type" value="monthly" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Monthly Repeat
         </label>
       </div>
 
@@ -610,7 +623,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
         </label>
       </div>
 
-      <!-- Weekly Weekday Checkboxes -->
+      <!-- Weekly / Fortnightly Weekday Checkboxes -->
       <div id="schedule-weekly-box" style="display: none; margin-bottom: 10px;">
         <span style="display: block; font-weight: 650; font-size: 0.85rem; margin-bottom: 6px; color: var(--muted);">Select Days</span>
         <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;">
@@ -622,6 +635,22 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
           <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="SAT" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Sat</label>
           <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;"><input type="checkbox" name="weekly_days" value="SUN" style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> Sun</label>
         </div>
+      </div>
+
+      <!-- Fortnightly Cycle Box -->
+      <div id="schedule-fortnightly-box" style="display: none; margin-top: 10px;">
+        <label class="field" style="margin-bottom: 0;">
+          <span>Every two weeks from (Anchor Date)</span>
+          <input type="date" id="note-anchor-date" style="width: 100%; min-height: 46px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-size: 0.95rem;">
+        </label>
+      </div>
+
+      <!-- Monthly Box -->
+      <div id="schedule-monthly-box" style="display: none; margin-top: 10px;">
+        <label class="field" style="margin-bottom: 0;">
+          <span>Day of Month (1-31)</span>
+          <input type="number" id="note-day-of-month" min="1" max="31" placeholder="e.g. 5, 28, 31" style="width: 100%; min-height: 46px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-size: 0.95rem;">
+        </label>
       </div>
     </div>
 
@@ -931,16 +960,22 @@ const notePriorityInput = document.getElementById("note-priority");
 const noteTitleInput = document.getElementById("note-title");
 const noteDetailInput = document.getElementById("note-detail");
 const noteDateInput = document.getElementById("note-date");
-const noteExpiresInput = document.getElementById("note-expires");
+const noteStartDateInput = document.getElementById("note-start-date");
+const noteAnchorDateInput = document.getElementById("note-anchor-date");
+const noteDayOfMonthInput = document.getElementById("note-day-of-month");
 
 const scheduleTypeRadios = document.querySelectorAll('input[name="schedule_type"]');
 const scheduleDateBox = document.getElementById("schedule-date-box");
 const scheduleWeeklyBox = document.getElementById("schedule-weekly-box");
+const scheduleFortnightlyBox = document.getElementById("schedule-fortnightly-box");
+const scheduleMonthlyBox = document.getElementById("schedule-monthly-box");
 
 function updateScheduleVisibility() {{
   const selectedType = document.querySelector('input[name="schedule_type"]:checked').value;
   scheduleDateBox.style.display = selectedType === "oneoff" ? "block" : "none";
-  scheduleWeeklyBox.style.display = selectedType === "recurring" ? "block" : "none";
+  scheduleWeeklyBox.style.display = (selectedType === "recurring" || selectedType === "fortnightly") ? "block" : "none";
+  scheduleFortnightlyBox.style.display = selectedType === "fortnightly" ? "block" : "none";
+  scheduleMonthlyBox.style.display = selectedType === "monthly" ? "block" : "none";
 }}
 scheduleTypeRadios.forEach(radio => radio.addEventListener("change", updateScheduleVisibility));
 
@@ -1027,10 +1062,19 @@ function renderRemindersList() {{
     let schedStr = "Always Active";
     if (item.date) {{
       schedStr = `One-off: ${{item.date}}`;
-    }} else if (item.recurrence && item.recurrence.type === "weekly") {{
-      schedStr = `Weekly: ${{item.recurrence.days.join(", ")}}`;
+    }} else if (item.recurrence) {{
+      if (item.recurrence.type === "weekly") {{
+        schedStr = `Weekly: ${{item.recurrence.days.join(", ")}}`;
+      }} else if (item.recurrence.type === "fortnightly") {{
+        schedStr = `Fortnightly: ${{item.recurrence.days.join(", ")}} (from ${{item.recurrence.anchor_date}})`;
+      }} else if (item.recurrence.type === "monthly") {{
+        schedStr = `Monthly: Day ${{item.recurrence.day_of_month}}`;
+      }}
     }}
     
+    if (item.start_date) {{
+      schedStr = `(Starts: ${{item.start_date}}) ` + schedStr;
+    }}
     if (item.expires_after_date) {{
       schedStr += ` (Expires: ${{item.expires_after_date}})`;
     }}
@@ -1058,6 +1102,10 @@ function renderRemindersPreview() {{
   const activeItems = remindersCache.filter(item => {{
     if (item.enabled === false) return false;
     
+    if (item.start_date && currentDateStr < item.start_date) {{
+      return false;
+    }}
+    
     if (item.expires_after_date && currentDateStr > item.expires_after_date) {{
       return false;
     }}
@@ -1066,8 +1114,38 @@ function renderRemindersPreview() {{
       return item.date === currentDateStr;
     }}
     
-    if (item.recurrence && item.recurrence.type === "weekly") {{
-      return item.recurrence.days.includes(currentWeekday);
+    if (item.recurrence) {{
+      const recType = item.recurrence.type;
+      if (recType === "weekly") {{
+        return item.recurrence.days.includes(currentWeekday);
+      }} else if (recType === "fortnightly") {{
+        if (!item.recurrence.anchor_date || !item.recurrence.days.includes(currentWeekday)) {{
+          return false;
+        }}
+        try {{
+          const anchorDate = new Date(item.recurrence.anchor_date + "T00:00:00");
+          const todayDate = new Date(currentDateStr + "T00:00:00");
+          if (todayDate < anchorDate) {{
+            return false;
+          }}
+          const diffTime = Math.abs(todayDate - anchorDate);
+          const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+          return diffDays % 14 === 0;
+        }} catch (e) {{
+          return false;
+        }}
+      }} else if (recType === "monthly") {{
+        const dayOfMonth = parseInt(item.recurrence.day_of_month, 10);
+        if (isNaN(dayOfMonth)) {{
+          return false;
+        }}
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        const lastDay = new Date(year, month + 1, 0).getDate();
+        const targetDay = Math.min(dayOfMonth, lastDay);
+        return now.getDate() === targetDay;
+      }}
+      return false;
     }}
     
     return true;
@@ -1151,7 +1229,10 @@ function resetNoteForm() {{
   notePriorityInput.value = "normal";
   noteTitleInput.value = "";
   noteDetailInput.value = "";
+  noteStartDateInput.value = "";
   noteDateInput.value = "";
+  noteAnchorDateInput.value = "";
+  noteDayOfMonthInput.value = "";
   noteExpiresInput.value = "";
   
   document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
@@ -1184,17 +1265,31 @@ function editReminderForm(item) {{
   notePriorityInput.value = item.priority || "normal";
   noteTitleInput.value = item.title || "";
   noteDetailInput.value = item.detail || "";
+  noteStartDateInput.value = item.start_date || "";
   noteExpiresInput.value = item.expires_after_date || "";
   
   if (item.date) {{
     document.querySelector('input[name="schedule_type"][value="oneoff"]').checked = true;
     noteDateInput.value = item.date;
-  }} else if (item.recurrence && item.recurrence.type === "weekly") {{
-    document.querySelector('input[name="schedule_type"][value="recurring"]').checked = true;
-    const days = item.recurrence.days || [];
-    document.querySelectorAll('input[name="weekly_days"]').forEach(cb => {{
-      cb.checked = days.includes(cb.value);
-    }});
+  }} else if (item.recurrence) {{
+    const rec = item.recurrence;
+    if (rec.type === "weekly") {{
+      document.querySelector('input[name="schedule_type"][value="recurring"]').checked = true;
+      const days = rec.days || [];
+      document.querySelectorAll('input[name="weekly_days"]').forEach(cb => {{
+        cb.checked = days.includes(cb.value);
+      }});
+    }} else if (rec.type === "fortnightly") {{
+      document.querySelector('input[name="schedule_type"][value="fortnightly"]').checked = true;
+      const days = rec.days || [];
+      document.querySelectorAll('input[name="weekly_days"]').forEach(cb => {{
+        cb.checked = days.includes(cb.value);
+      }});
+      noteAnchorDateInput.value = rec.anchor_date || "";
+    }} else if (rec.type === "monthly") {{
+      document.querySelector('input[name="schedule_type"][value="monthly"]').checked = true;
+      noteDayOfMonthInput.value = rec.day_of_month || "";
+    }}
   }} else {{
     document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
   }}
@@ -1233,6 +1328,35 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
       type: "weekly",
       days: selectedDays
     }};
+  }} else if (scheduleType === "fortnightly") {{
+    const selectedDays = [];
+    document.querySelectorAll('input[name="weekly_days"]:checked').forEach(cb => {{
+      selectedDays.push(cb.value);
+    }});
+    if (selectedDays.length === 0) {{
+      alert("Please select at least one day!");
+      return;
+    }}
+    const anchorDate = noteAnchorDateInput.value;
+    if (!anchorDate) {{
+      alert("Please select an anchor date for the fortnightly cycle!");
+      return;
+    }}
+    recurrence = {{
+      type: "fortnightly",
+      days: selectedDays,
+      anchor_date: anchorDate
+    }};
+  }} else if (scheduleType === "monthly") {{
+    const dayVal = parseInt(noteDayOfMonthInput.value, 10);
+    if (isNaN(dayVal) || dayVal < 1 || dayVal > 31) {{
+      alert("Please enter a valid day of month (1-31)!");
+      return;
+    }}
+    recurrence = {{
+      type: "monthly",
+      day_of_month: dayVal
+    }};
   }}
   
   const body = {{
@@ -1242,6 +1366,7 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
     priority: notePriorityInput.value,
     title: title,
     detail: noteDetailInput.value.trim(),
+    start_date: noteStartDateInput.value || null,
     date: date,
     recurrence: recurrence,
     expires_after_date: noteExpiresInput.value || null
@@ -1477,6 +1602,7 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                                 "title": title,
                                 "detail": candidate.get("detail", "").strip(),
                                 "priority": priority,
+                                "start_date": candidate.get("start_date") or None,
                                 "date": candidate.get("date") or None,
                                 "recurrence": candidate.get("recurrence") or None,
                                 "expires_after_date": candidate.get("expires_after_date") or None,
@@ -1496,6 +1622,7 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                         "title": title,
                         "detail": candidate.get("detail", "").strip(),
                         "priority": priority,
+                        "start_date": candidate.get("start_date") or None,
                         "date": candidate.get("date") or None,
                         "recurrence": candidate.get("recurrence") or None,
                         "expires_after_date": candidate.get("expires_after_date") or None,

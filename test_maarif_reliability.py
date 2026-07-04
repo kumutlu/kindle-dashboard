@@ -160,7 +160,7 @@ class MaarifReliabilityTests(unittest.TestCase):
         
         # Cache directory and cache file should now exist
         self.assertTrue(cache_dir.exists())
-        cache_files = list(cache_dir.glob("prayer_*.json"))
+        cache_files = list(cache_dir.glob("*.json"))
         self.assertEqual(len(cache_files), 1)
         
         # Read and check cache content
@@ -178,15 +178,12 @@ class MaarifReliabilityTests(unittest.TestCase):
         cache_dir = self.project_path / "cache" / "prayer_times"
         cache_dir.mkdir(parents=True, exist_ok=True)
         
-        now_tz = datetime.now(ZoneInfo("Europe/London"))
-        date_str = now_tz.strftime("%d-%m-%Y")
-        
-        import hashlib
-        key_string = f"{date_str}_52.9536_-1.1505_Europe/London_13_0_3"
-        cache_filename = f"prayer_{hashlib.md5(key_string.encode('utf-8')).hexdigest()}.json"
+        local_date = datetime.now(ZoneInfo("Europe/London")).date().isoformat()
+        tz_safe = "Europe_London"
+        cache_filename = f"{local_date}_52.9536_-1.1505_{tz_safe}_13_0_3.json"
         
         cache_data = {
-            "date": now_tz.strftime("%Y-%m-%d"),
+            "date": local_date,
             "location_display": "Nottingham, UK",
             "latitude": 52.9536,
             "longitude": -1.1505,
@@ -297,3 +294,94 @@ class MaarifReliabilityTests(unittest.TestCase):
         config_tr = dict(self.config, location_label="Istanbul, Turkey")
         weather_image.render_maarif_calendar(config_tr)
         self.assertTrue((self.project_path / "kindle_weather.png").exists())
+
+    @mock.patch("weather_image.get_now")
+    def test_get_local_date_calculation(self, mock_now):
+        # 1. Europe/London local date calculation
+        # 2026-07-03 23:59:50 BST (UTC+1)
+        mock_now.return_value = datetime(2026, 7, 3, 23, 59, 50, tzinfo=ZoneInfo("Europe/London"))
+        
+        cfg = {"timezone": "Europe/London"}
+        self.assertEqual(weather_image.get_local_date(cfg), "2026-07-03")
+        
+        # 00:00:10 next day
+        mock_now.return_value = datetime(2026, 7, 4, 0, 0, 10, tzinfo=ZoneInfo("Europe/London"))
+        self.assertEqual(weather_image.get_local_date(cfg), "2026-07-04")
+
+        # 2. Timezone fallback if config timezone invalid/missing
+        mock_now.side_effect = lambda tz: datetime(2026, 7, 5, 12, 0, 0, tzinfo=tz) if tz else datetime(2026, 7, 5, 12, 0, 0)
+        
+        cfg_invalid = {"timezone": "Invalid/Timezone"}
+        self.assertEqual(weather_image.get_local_date(cfg_invalid), "2026-07-05")
+        
+        cfg_missing = {}
+        self.assertEqual(weather_image.get_local_date(cfg_missing), "2026-07-05")
+
+    @mock.patch("weather_image.get_local_date")
+    def test_maarif_regenerates_when_local_date_changes(self, mock_local_date):
+        cfg = dict(self.config)
+        
+        # If image/state file does not exist, should regenerate
+        self.assertTrue(weather_image.should_regenerate_maarif(cfg))
+        
+        # Write image and initial state
+        (self.project_path / "kindle_weather.png").write_text("fake image", encoding="utf-8")
+        
+        mock_local_date.return_value = "2026-07-03"
+        state = {
+            "theme": "maarif_calendar",
+            "timezone": "Europe/London",
+            "local_date": "2026-07-03",
+            "latitude": 52.9536,
+            "longitude": -1.1505,
+            "config_hash": weather_image.compute_config_hash(cfg),
+            "rendered_at": "2026-07-03T23:59:00"
+        }
+        state_dir = self.project_path / "cache"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "render_state.json").write_text(json.dumps(state), encoding="utf-8")
+        
+        # When local date is the same, should NOT regenerate
+        self.assertFalse(weather_image.should_regenerate_maarif(cfg))
+        
+        # When local date changes, should regenerate
+        mock_local_date.return_value = "2026-07-04"
+        self.assertTrue(weather_image.should_regenerate_maarif(cfg))
+
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_prayer_cache_key_includes_date_and_timezone(self, mock_http, mock_fetch):
+        mock_fetch.return_value = self.mock_weather_data()
+        mock_http.return_value = {"code": 200, "data": {
+            "timings": {
+                "Fajr": "02:58",
+                "Sunrise": "04:45",
+                "Dhuhr": "13:10",
+                "Asr": "17:30",
+                "Maghrib": "21:30",
+                "Isha": "23:05",
+                "Imsak": "02:48"
+            },
+            "date": {
+                "hijri": {
+                    "day": "18",
+                    "month": {"number": 1},
+                    "year": "1448"
+                }
+            }
+        }}
+        
+        cfg = dict(self.config)
+        local_date = weather_image.get_local_date(cfg)
+        
+        # Call collect_dashboard_data
+        weather_image.collect_dashboard_data(cfg)
+        
+        # Verify the created cache file has the YYYY-MM-DD_lat_lon_timezone_method_school_highlat.json structure
+        cache_dir = self.project_path / "cache" / "prayer_times"
+        self.assertTrue(cache_dir.exists())
+        
+        tz_safe = cfg["timezone"].replace("/", "_")
+        expected_filename = f"{local_date}_52.9536_-1.1505_{tz_safe}_13_0_3.json"
+        self.assertTrue((cache_dir / expected_filename).exists())
+

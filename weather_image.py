@@ -83,6 +83,76 @@ BOOLEAN_FIELDS = {
 }
 
 
+def get_now(tz=None):
+    if tz is None:
+        return datetime.now().astimezone()
+    return datetime.now(tz)
+
+
+def get_local_date(config):
+    tz_name = config.get("timezone")
+    tz = None
+    if tz_name:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            pass
+    now = get_now(tz)
+    return now.date().isoformat()
+
+
+def compute_config_hash(config):
+    import hashlib
+    serializable = {k: v for k, v in sorted(config.items()) if k in DEFAULT_CONFIG}
+    return hashlib.sha256(json.dumps(serializable).encode("utf-8")).hexdigest()
+
+
+def should_regenerate_maarif(config):
+    img_file = PROJECT_DIR / "kindle_weather.png"
+    if not img_file.exists():
+        print("Maarif image file missing; regenerating image")
+        return True
+
+    state_file = PROJECT_DIR / "cache" / "render_state.json"
+    if not state_file.exists():
+        print("Maarif render state file missing; regenerating image")
+        return True
+
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:
+        print("Maarif render state file corrupted; regenerating image")
+        return True
+
+    if state.get("theme") != config.get("theme"):
+        print("Maarif theme changed; regenerating image")
+        return True
+
+    if state.get("timezone") != config.get("timezone"):
+        print("Maarif timezone changed; regenerating image")
+        return True
+
+    if state.get("latitude") != config.get("latitude") or state.get("longitude") != config.get("longitude"):
+        print("Maarif coordinates changed; regenerating image")
+        return True
+
+    current_hash = compute_config_hash(config)
+    if state.get("config_hash") != current_hash:
+        print("Maarif config hash changed; regenerating image")
+        return True
+
+    local_date = get_local_date(config)
+    last_date = state.get("local_date")
+    print(f"Maarif local date: {local_date} {config.get('timezone')}")
+    print(f"Maarif render state date: {last_date}")
+    if local_date != last_date:
+        print("Maarif date changed; regenerating image")
+        return True
+
+    return False
+
+
+
 def validate_config(value):
     if not isinstance(value, dict):
         raise ValueError("configuration must be a JSON object")
@@ -1105,9 +1175,7 @@ def build_layout(config):
 
 
 def main():
-    with LOCK_PATH.open("w") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        generate_dashboard()
+    generate_dashboard_safe()
 
 
 def collect_dashboard_data(config):
@@ -1119,7 +1187,7 @@ def collect_dashboard_data(config):
     )
     current = weather["current_condition"][0]
     days = weather["weather"]
-    now = datetime.now(ZoneInfo(config["timezone"]))
+    now = get_now(ZoneInfo(config["timezone"]))
     
     # Auto-detect language
     lang = get_dashboard_lang(config)
@@ -1138,16 +1206,18 @@ def collect_dashboard_data(config):
     import json
     from datetime import datetime as dt_class
 
-    date_str = now.strftime("%d-%m-%Y")
+    local_date = get_local_date(config)
+    parts = local_date.split("-")
+    date_str = f"{parts[2]}-{parts[1]}-{parts[0]}"
     method = config.get("prayer_method", 13)
     school = config.get("prayer_school", 0)
     high_latitude = config.get("prayer_high_latitude", 3)
     hijri_adj = config.get("hijri_adjustment", 0)
 
-    key_string = f"{date_str}_{lat:.4f}_{lng:.4f}_{config['timezone']}_{method}_{school}_{high_latitude}"
+    tz_safe = config.get("timezone", "local").replace("/", "_")
     cache_dir = PROJECT_DIR / "cache" / "prayer_times"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"prayer_{hashlib.md5(key_string.encode('utf-8')).hexdigest()}.json"
+    cache_file = cache_dir / f"{local_date}_{lat:.4f}_{lng:.4f}_{tz_safe}_{method}_{school}_{high_latitude}.json"
 
     def load_from_cache():
         if cache_file.exists():
@@ -1194,7 +1264,7 @@ def collect_dashboard_data(config):
                 hijri_year = int(hijri["year"])
 
                 norm_data = {
-                    "date": now.strftime("%Y-%m-%d"),
+                    "date": local_date,
                     "location_display": config.get("location_display", ""),
                     "latitude": float(lat),
                     "longitude": float(lng),
@@ -1223,6 +1293,9 @@ def collect_dashboard_data(config):
         cached = load_from_cache()
         if cached:
             timings, hijri_year, hijri_month_num, hijri_day = cached
+
+    if timings is not None:
+        print(f"Prayer times loaded for {local_date} {config['timezone']}")
 
     if timings is None:
         hijri_year, hijri_month_num, hijri_day = gregorian_to_hijri(now.year, now.month, now.day)
@@ -1929,6 +2002,30 @@ def generate_dashboard():
     if renderer is None:
         raise ValueError("theme renderer is not available")
     renderer(config)
+    
+    try:
+        local_date = get_local_date(config)
+        rendered_at = get_now().isoformat()
+        state = {
+            "theme": config.get("theme"),
+            "timezone": config.get("timezone"),
+            "local_date": local_date,
+            "latitude": config.get("latitude"),
+            "longitude": config.get("longitude"),
+            "config_hash": compute_config_hash(config),
+            "rendered_at": rendered_at
+        }
+        state_file = PROJECT_DIR / "cache" / "render_state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"Warning: Failed to save render state: {e}")
+
+
+def generate_dashboard_safe():
+    with LOCK_PATH.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        generate_dashboard()
 
 
 if __name__ == "__main__":

@@ -37,6 +37,17 @@ def make_handler(image_path, token):
                 return
 
             try:
+                import sys
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                import weather_image
+                config = weather_image.load_config()
+                if config.get("theme") == "maarif_calendar":
+                    if weather_image.should_regenerate_maarif(config):
+                        weather_image.generate_dashboard_safe()
+            except Exception as e:
+                pass
+
+            try:
                 image = image_path.read_bytes()
             except FileNotFoundError:
                 self.send_response(404)

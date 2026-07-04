@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import public_image_server
 
@@ -82,6 +83,41 @@ class PublicImageServerTests(unittest.TestCase):
     def test_project_file_path_returns_404_even_with_token(self):
         status, _, _ = self.request("/serve_image.py", self.TOKEN)
         self.assertEqual(status, 404)
+
+    @mock.patch("weather_image.load_config")
+    @mock.patch("weather_image.should_regenerate_maarif")
+    @mock.patch("weather_image.generate_dashboard_safe")
+    def test_weather_request_triggers_maarif_regeneration_if_needed(self, mock_gen, mock_should, mock_load):
+        # 1. Maarif Calendar theme with date change triggers regeneration
+        mock_load.return_value = {"theme": "maarif_calendar", "timezone": "Europe/London"}
+        mock_should.return_value = True
+        
+        status, _, _ = self.request("/weather.png", self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertTrue(mock_should.called)
+        self.assertTrue(mock_gen.called)
+        
+        # Reset mocks
+        mock_gen.reset_mock()
+        mock_should.reset_mock()
+        
+        # 2. Maarif Calendar theme with same date does NOT trigger regeneration
+        mock_should.return_value = False
+        status, _, _ = self.request("/weather.png", self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertTrue(mock_should.called)
+        self.assertFalse(mock_gen.called)
+
+        # Reset mocks
+        mock_gen.reset_mock()
+        mock_should.reset_mock()
+
+        # 3. Non-maarif theme does not call should_regenerate_maarif
+        mock_load.return_value = {"theme": "home_dashboard"}
+        status, _, _ = self.request("/weather.png", self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertFalse(mock_should.called)
+        self.assertFalse(mock_gen.called)
 
 
 if __name__ == "__main__":

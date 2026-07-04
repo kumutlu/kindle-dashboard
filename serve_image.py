@@ -22,6 +22,15 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_image(self, include_body=True):
         raw_path = self.path
         route_path = raw_path.split("?", 1)[0]
+        if route_path == "/weather.png":
+            try:
+                import weather_image
+                config = weather_image.load_config()
+                if config.get("theme") == "maarif_calendar":
+                    if weather_image.should_regenerate_maarif(config):
+                        weather_image.generate_dashboard_safe()
+            except Exception as e:
+                print(f"Error checking/regenerating Maarif Calendar: {e}")
         if include_body:
             m = re.search(r"[?&]batt=(\d{1,3})", raw_path)
             if m:

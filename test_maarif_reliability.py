@@ -385,3 +385,76 @@ class MaarifReliabilityTests(unittest.TestCase):
         expected_filename = f"{local_date}_52.9536_-1.1505_{tz_safe}_13_0_3.json"
         self.assertTrue((cache_dir / expected_filename).exists())
 
+    def test_sunset_formatting_helper(self):
+        self.assertEqual(weather_image.format_to_24h("09:32 PM"), "21:32")
+        self.assertEqual(weather_image.format_to_24h("04:45 AM"), "04:45")
+        self.assertEqual(weather_image.format_to_24h("21:32"), "21:32")
+        self.assertEqual(weather_image.format_to_24h("12:15 PM"), "12:15")
+        self.assertEqual(weather_image.format_to_24h("12:05 AM"), "00:05")
+        self.assertEqual(weather_image.format_to_24h(""), "12:00")
+        self.assertEqual(weather_image.format_to_24h(None), "12:00")
+
+    @mock.patch("weather_image.get_now")
+    @mock.patch("weather_image.fetch_weather")
+    @mock.patch("weather_image.http_json")
+    def test_maarif_after_midnight_date_rollover_and_name(self, mock_http, mock_fetch, mock_now):
+        # 2026-07-05 00:05:00 BST (Europe/London)
+        mock_now.return_value = datetime(2026, 7, 5, 0, 5, 0, tzinfo=ZoneInfo("Europe/London"))
+        
+        # Mock weather with AM/PM sunset/sunrise
+        mock_fetch.return_value = {
+            "current_condition": [{
+                "temp_C": "20",
+                "FeelsLikeC": "20",
+                "humidity": "65",
+                "windspeedMiles": "10",
+                "winddir16Point": "W",
+                "pressure": "1015",
+                "weatherCode": "2",
+                "weatherDesc": [{"value": "Partly Cloudy"}]
+            }],
+            "weather": [{
+                "maxtempC": "23",
+                "mintempC": "14",
+                "astronomy": [{
+                    "sunrise": "04:46 AM",
+                    "sunset": "09:32 PM"
+                }],
+                "hourly": []
+            }]
+        }
+        
+        # Mock Aladhan API timings
+        mock_http.return_value = {"code": 200, "data": {
+            "timings": {
+                "Fajr": "03:00",
+                "Sunrise": "04:46",
+                "Dhuhr": "13:12",
+                "Asr": "17:32",
+                "Maghrib": "21:32",
+                "Isha": "23:07",
+                "Imsak": "02:50"
+            },
+            "date": {
+                "hijri": {
+                    "day": "20",
+                    "month": {"number": 1},
+                    "year": "1448"
+                }
+            }
+        }}
+        
+        # Verify date rollover and formatted sunset in collect_dashboard_data
+        data = weather_image.collect_dashboard_data(self.config)
+        self.assertEqual(data["now"].date().isoformat(), "2026-07-05")
+        self.assertEqual(data["day_name_localized"], "SUNDAY") # July 5 2026 is Sunday (English locale)
+        self.assertEqual(data["sunset"], "21:32") # Converted PM format correctly
+        self.assertEqual(data["sunrise"], "04:46")
+        
+        # Render check
+        weather_image.render_maarif_calendar(self.config)
+        self.assertTrue((self.project_path / "kindle_weather.png").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

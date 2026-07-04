@@ -89,6 +89,25 @@ def get_now(tz=None):
     return datetime.now(tz)
 
 
+def format_to_24h(time_str):
+    if not time_str:
+        return "12:00"
+    time_str = time_str.strip().upper()
+    if "AM" in time_str or "PM" in time_str:
+        try:
+            parts = time_str.replace("AM", "").replace("PM", "").strip().split(":")
+            h = int(parts[0])
+            m = int(parts[1])
+            if "PM" in time_str and h < 12:
+                h += 12
+            if "AM" in time_str and h == 12:
+                h = 0
+            return f"{h:02d}:{m:02d}"
+        except Exception:
+            pass
+    return time_str[:5]
+
+
 def get_local_date(config):
     tz_name = config.get("timezone")
     tz = None
@@ -1241,58 +1260,60 @@ def collect_dashboard_data(config):
     timings = None
     hijri_year, hijri_month_num, hijri_day = None, None, None
 
-    prayer_data = None
-    try:
-        url = (
-            f"http://api.aladhan.com/v1/timings/{date_str}?"
-            f"latitude={lat}&longitude={lng}&method={method}&school={school}"
-            f"&latitudeAdjustmentMethod={high_latitude}"
-        )
-        prayer_data = http_json(url, timeout=7)
-    except Exception as e:
-        print(f"Failed to fetch prayer times: {e}")
-
-    if prayer_data and prayer_data.get("code") == 200:
+    cached = load_from_cache()
+    if cached:
+        print(f"Prayer times cache HIT for date: {local_date}, tz: {config.get('timezone')}, method: {method}")
+        timings, hijri_year, hijri_month_num, hijri_day = cached
+    else:
+        print(f"Prayer times cache MISS for date: {local_date}, tz: {config.get('timezone')}, method: {method}. Fetching from Aladhan API...")
+        prayer_data = None
         try:
-            p_data = prayer_data["data"]
-            timings_api = p_data["timings"]
-            if validate_prayer_times(timings_api):
-                timings = timings_api
-                hijri = p_data["date"]["hijri"]
-                hijri_day = int(hijri["day"])
-                hijri_month_num = int(hijri["month"]["number"])
-                hijri_year = int(hijri["year"])
-
-                norm_data = {
-                    "date": local_date,
-                    "location_display": config.get("location_display", ""),
-                    "latitude": float(lat),
-                    "longitude": float(lng),
-                    "timezone": config["timezone"],
-                    "method": method,
-                    "school": school,
-                    "high_latitude_adjustment": high_latitude,
-                    "fajr": timings["Fajr"],
-                    "sunrise": timings["Sunrise"],
-                    "dhuhr": timings["Dhuhr"],
-                    "asr": timings["Asr"],
-                    "maghrib": timings["Maghrib"],
-                    "isha": timings["Isha"],
-                    "imsak": timings.get("Imsak", "03:42"),
-                    "hijri_day": hijri_day,
-                    "hijri_month_num": hijri_month_num,
-                    "hijri_year": hijri_year,
-                    "source": "aladhan",
-                    "fetched_at": dt_class.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                cache_file.write_text(json.dumps(norm_data, indent=2), encoding="utf-8")
+            url = (
+                f"https://api.aladhan.com/v1/timings/{date_str}?"
+                f"latitude={lat}&longitude={lng}&method={method}&school={school}"
+                f"&latitudeAdjustmentMethod={high_latitude}"
+            )
+            print(f"Aladhan API request URL: {url}")
+            prayer_data = http_json(url, timeout=7)
         except Exception as e:
-            print(f"Error processing Aladhan API response: {e}")
+            print(f"Failed to fetch prayer times: {e}")
 
-    if timings is None:
-        cached = load_from_cache()
-        if cached:
-            timings, hijri_year, hijri_month_num, hijri_day = cached
+        if prayer_data and prayer_data.get("code") == 200:
+            try:
+                p_data = prayer_data["data"]
+                timings_api = p_data["timings"]
+                if validate_prayer_times(timings_api):
+                    timings = timings_api
+                    hijri = p_data["date"]["hijri"]
+                    hijri_day = int(hijri["day"])
+                    hijri_month_num = int(hijri["month"]["number"])
+                    hijri_year = int(hijri["year"])
+
+                    norm_data = {
+                        "date": local_date,
+                        "location_display": config.get("location_display", ""),
+                        "latitude": float(lat),
+                        "longitude": float(lng),
+                        "timezone": config["timezone"],
+                        "method": method,
+                        "school": school,
+                        "high_latitude_adjustment": high_latitude,
+                        "fajr": timings["Fajr"],
+                        "sunrise": timings["Sunrise"],
+                        "dhuhr": timings["Dhuhr"],
+                        "asr": timings["Asr"],
+                        "maghrib": timings["Maghrib"],
+                        "isha": timings["Isha"],
+                        "imsak": timings.get("Imsak", "03:42"),
+                        "hijri_day": hijri_day,
+                        "hijri_month_num": hijri_month_num,
+                        "hijri_year": hijri_year,
+                        "source": "aladhan",
+                        "fetched_at": dt_class.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    cache_file.write_text(json.dumps(norm_data, indent=2), encoding="utf-8")
+            except Exception as e:
+                print(f"Error processing Aladhan API response: {e}")
 
     if timings is not None:
         print(f"Prayer times loaded for {local_date} {config['timezone']}")
@@ -1317,8 +1338,15 @@ def collect_dashboard_data(config):
     season_name = locale["seasons"].get(season_key, "Hızır")
     
     # Daylight calculations
-    sunrise_time = days[0]["astronomy"][0]["sunrise"][:5]
-    sunset_time = days[0]["astronomy"][0]["sunset"][:5]
+    raw_sunrise = days[0]["astronomy"][0]["sunrise"]
+    raw_sunset = days[0]["astronomy"][0]["sunset"]
+    sunrise_time = format_to_24h(raw_sunrise)
+    sunset_time = format_to_24h(raw_sunset)
+    print(f"[Maarif Debug] Selected local date: {local_date}")
+    print(f"[Maarif Debug] Timezone: {config.get('timezone')}")
+    print(f"[Maarif Debug] Prayer date requested: {date_str}")
+    print(f"[Maarif Debug] Sunrise raw: '{raw_sunrise}', Formatted: '{sunrise_time}'")
+    print(f"[Maarif Debug] Sunset raw: '{raw_sunset}', Formatted: '{sunset_time}'")
     try:
         sr_h, sr_m = map(int, sunrise_time.split(":"))
         ss_h, ss_m = map(int, sunset_time.split(":"))

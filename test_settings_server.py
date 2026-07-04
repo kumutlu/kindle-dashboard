@@ -871,6 +871,189 @@ class SettingsServerTests(unittest.TestCase):
         location = headers["Location"]
         self.assertIn("invalid%20value%20for%20refresh_interval_minutes", location)
 
+    def test_notes_endpoint_saving_and_validation(self):
+        # Override path to temp dir
+        test_notes_path = Path(self.tempdir.name) / "daily_notes.json"
+        settings_server.DAILY_NOTES_PATH = test_notes_path
+        if test_notes_path.exists():
+            test_notes_path.unlink()
+
+        csrf = self.csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+        }
+
+        # 1. Add always-active reminder writes daily_notes.json
+        payload_always = {
+            "title": "Always active task",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "start_date": "2026-07-04",
+            "date": None,
+            "recurrence": None,
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_always),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        self.assertTrue(res["ok"])
+        
+        # Verify file written
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(notes["items"]), 1)
+        self.assertEqual(notes["items"][0]["title"], "Always active task")
+        self.assertEqual(notes["items"][0]["start_date"], "2026-07-04")
+        self.assertIsNone(notes["items"][0]["recurrence"])
+
+        # 2. Add one-off reminder writes date field
+        payload_oneoff = {
+            "title": "One-off task",
+            "category": "TODO",
+            "priority": "low",
+            "enabled": True,
+            "date": "2026-07-05",
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_oneoff),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(notes["items"]), 2)
+        oneoff_item = next(item for item in notes["items"] if item["title"] == "One-off task")
+        self.assertEqual(oneoff_item["date"], "2026-07-05")
+
+        # 3. Add weekly reminder writes recurrence.type = weekly
+        payload_weekly = {
+            "title": "Weekly task",
+            "category": "SCHOOL",
+            "priority": "normal",
+            "enabled": True,
+            "recurrence": {
+                "type": "weekly",
+                "days": ["MON", "FRI"]
+            }
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_weekly),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        weekly_item = next(item for item in notes["items"] if item["title"] == "Weekly task")
+        self.assertEqual(weekly_item["recurrence"]["type"], "weekly")
+        self.assertEqual(weekly_item["recurrence"]["days"], ["MON", "FRI"])
+
+        # 4. Add fortnightly reminder writes recurrence.type = fortnightly and anchor_date
+        payload_fortnightly = {
+            "title": "Fortnightly task",
+            "category": "BIN",
+            "priority": "high",
+            "enabled": True,
+            "recurrence": {
+                "type": "fortnightly",
+                "days": ["MON"],
+                "anchor_date": "2026-07-06"
+            }
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_fortnightly),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        fort_item = next(item for item in notes["items"] if item["title"] == "Fortnightly task")
+        self.assertEqual(fort_item["recurrence"]["type"], "fortnightly")
+        self.assertEqual(fort_item["recurrence"]["anchor_date"], "2026-07-06")
+
+        # 5. Add monthly reminder writes recurrence.type = monthly and day_of_month
+        payload_monthly = {
+            "title": "Monthly task",
+            "category": "HOME",
+            "priority": "normal",
+            "enabled": True,
+            "recurrence": {
+                "type": "monthly",
+                "day_of_month": 15
+            }
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_monthly),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        mon_item = next(item for item in notes["items"] if item["title"] == "Monthly task")
+        self.assertEqual(mon_item["recurrence"]["type"], "monthly")
+        self.assertEqual(mon_item["recurrence"]["day_of_month"], 15)
+
+        # 6. Missing title is rejected
+        payload_bad = dict(payload_always, title="")
+        status, _, body = self.request("POST", "/api/notes/save", body=json.dumps(payload_bad), headers=headers)
+        self.assertEqual(status, 400)
+        self.assertIn("Title is required", json.loads(body.decode("utf-8"))["error"])
+
+        # 7. Weekly without weekday is rejected
+        payload_bad = {
+            "title": "Bad weekly",
+            "recurrence": {
+                "type": "weekly",
+                "days": []
+            }
+        }
+        status, _, body = self.request("POST", "/api/notes/save", body=json.dumps(payload_bad), headers=headers)
+        self.assertEqual(status, 400)
+        self.assertIn("at least one day selected", json.loads(body.decode("utf-8"))["error"])
+
+        # 8. Fortnightly without anchor_date is rejected
+        payload_bad = {
+            "title": "Bad fort",
+            "recurrence": {
+                "type": "fortnightly",
+                "days": ["MON"],
+                "anchor_date": ""
+            }
+        }
+        status, _, body = self.request("POST", "/api/notes/save", body=json.dumps(payload_bad), headers=headers)
+        self.assertEqual(status, 400)
+        self.assertIn("requires a start cycle anchor date", json.loads(body.decode("utf-8"))["error"])
+
+        # 9. Monthly invalid day is rejected
+        payload_bad = {
+            "title": "Bad month",
+            "recurrence": {
+                "type": "monthly",
+                "day_of_month": 35
+            }
+        }
+        status, _, body = self.request("POST", "/api/notes/save", body=json.dumps(payload_bad), headers=headers)
+        self.assertEqual(status, 400)
+        self.assertIn("between 1 and 31", json.loads(body.decode("utf-8"))["error"])
+
+    def test_malformed_daily_notes_file_handled_safely(self):
+        # Create a malformed json file
+        test_notes_path = Path(self.tempdir.name) / "daily_notes.json"
+        settings_server.DAILY_NOTES_PATH = test_notes_path
+        test_notes_path.write_text("{malformed json", encoding="utf-8")
+        
+        # Should not crash and return empty notes object
+        notes = settings_server.load_daily_notes()
+        self.assertEqual(notes, {"items": []})
+
 
 if __name__ == "__main__":
     unittest.main()

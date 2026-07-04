@@ -963,6 +963,7 @@ const noteDateInput = document.getElementById("note-date");
 const noteStartDateInput = document.getElementById("note-start-date");
 const noteAnchorDateInput = document.getElementById("note-anchor-date");
 const noteDayOfMonthInput = document.getElementById("note-day-of-month");
+const noteExpiresInput = document.getElementById("note-expires");
 
 const scheduleTypeRadios = document.querySelectorAll('input[name="schedule_type"]');
 const scheduleDateBox = document.getElementById("schedule-date-box");
@@ -1587,6 +1588,80 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 if not title:
                     self.send_json(400, {"ok": False, "error": "Title is required"})
                     return
+                    
+                from datetime import datetime
+                # Validate date fields
+                start_date = candidate.get("start_date") or None
+                if start_date:
+                    start_date = start_date.strip()
+                    try:
+                        datetime.strptime(start_date, "%Y-%m-%d")
+                    except Exception:
+                        self.send_json(400, {"ok": False, "error": "Start Date must be in YYYY-MM-DD format"})
+                        return
+                        
+                expires = candidate.get("expires_after_date") or None
+                if expires:
+                    expires = expires.strip()
+                    try:
+                        datetime.strptime(expires, "%Y-%m-%d")
+                    except Exception:
+                        self.send_json(400, {"ok": False, "error": "Expiration Date must be in YYYY-MM-DD format"})
+                        return
+
+                item_date = candidate.get("date") or None
+                if item_date:
+                    item_date = item_date.strip()
+                    try:
+                        datetime.strptime(item_date, "%Y-%m-%d")
+                    except Exception:
+                        self.send_json(400, {"ok": False, "error": "One-off Date must be in YYYY-MM-DD format"})
+                        return
+
+                # Validate recurrence
+                recurrence = candidate.get("recurrence") or None
+                if recurrence:
+                    if not isinstance(recurrence, dict):
+                        self.send_json(400, {"ok": False, "error": "Recurrence must be a JSON object"})
+                        return
+                    rec_type = recurrence.get("type")
+                    if rec_type not in ("weekly", "fortnightly", "monthly"):
+                        self.send_json(400, {"ok": False, "error": f"Invalid recurrence type: {rec_type}"})
+                        return
+                        
+                    if rec_type in ("weekly", "fortnightly"):
+                        days = recurrence.get("days")
+                        if not days or not isinstance(days, list):
+                            self.send_json(400, {"ok": False, "error": "Weekly/Fortnightly recurrence must have at least one day selected"})
+                            return
+                        valid_days = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
+                        if any(d not in valid_days for d in days):
+                            self.send_json(400, {"ok": False, "error": "Invalid weekday selected"})
+                            return
+                            
+                        if rec_type == "fortnightly":
+                            anchor_date = recurrence.get("anchor_date")
+                            if not anchor_date:
+                                self.send_json(400, {"ok": False, "error": "Fortnightly recurrence requires a start cycle anchor date"})
+                                return
+                            try:
+                                datetime.strptime(anchor_date, "%Y-%m-%d")
+                            except Exception:
+                                self.send_json(400, {"ok": False, "error": "Anchor Date must be in YYYY-MM-DD format"})
+                                return
+                                
+                    elif rec_type == "monthly":
+                        day_of_month = recurrence.get("day_of_month")
+                        if day_of_month is None:
+                            self.send_json(400, {"ok": False, "error": "Monthly recurrence requires a day of month"})
+                            return
+                        try:
+                            day_val = int(day_of_month)
+                            if day_val < 1 or day_val > 31:
+                                raise ValueError()
+                        except Exception:
+                            self.send_json(400, {"ok": False, "error": "Monthly day of month must be between 1 and 31"})
+                            return
                     
                 notes = load_daily_notes()
                 items = notes.setdefault("items", [])

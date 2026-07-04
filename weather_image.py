@@ -2055,15 +2055,18 @@ def render_compact_dashboard(config):
         txt(d, 280, y + 115, f"{feels}°C / {data['weather_desc_localized'].upper()}", FB18, anchor="mm")
 
         # Stats on right
-        col1_x = 450
-        val1_x = 550
-        col2_x = 580
-        val2_x = 710
+        col1_x = 410
+        val1_x = 555
+        col2_x = 568
+        val2_x = 718
         
-        hi_lo_lbl = "Hi/Lo" if lang == "en" else "Derece"
-        humid_lbl = "Humid" if lang == "en" else "Nem"
-        wind_lbl = "Wind" if lang == "en" else "Rüzgar"
-        sunset_lbl = "Sunset" if lang == "en" else "Batış"
+        hi_lo_lbl = "Hi" if lang == "en" else "Der"
+        humid_lbl = "Hum" if lang == "en" else "Nem"
+        press_lbl = "Pres" if lang == "en" else "Bas"
+        
+        wind_lbl = "Wind" if lang == "en" else "Rüz"
+        sunset_lbl = "Set" if lang == "en" else "Bat"
+        sr_lbl = "Rise" if lang == "en" else "Doğ"
         
         # Row 1
         txt(d, col1_x, y + 25, hi_lo_lbl, FR16)
@@ -2080,10 +2083,8 @@ def render_compact_dashboard(config):
         txt(d, val2_x, y + 73, sunset, FB18, anchor="ra")
         
         # Row 3 (Sunrise / Sunset or Pressure)
-        press_lbl = "Press" if lang == "en" else "Basınç"
-        sr_lbl = "Rise" if lang == "en" else "Doğuş"
         txt(d, col1_x, y + 125, press_lbl, FR16)
-        txt(d, val1_x, y + 123, f"{pressure}hPa", FB18, anchor="ra")
+        txt(d, val1_x, y + 123, f"{pressure}", FB18, anchor="ra")
         
         txt(d, col2_x, y + 125, sr_lbl, FR16)
         txt(d, val2_x, y + 123, sunrise, FB18, anchor="ra")
@@ -2310,32 +2311,37 @@ def render_family_dashboard(config):
         txt(d, 280, y + 60, f"{temp}°C", FB68, anchor="mm")
         txt(d, 280, y + 115, f"{feels}°C / {data['weather_desc_localized'].upper()}", FB18, anchor="mm")
 
-        col1_x = 450
-        val1_x = 550
-        col2_x = 580
-        val2_x = 710
+        # Stats on right
+        col1_x = 410
+        val1_x = 555
+        col2_x = 568
+        val2_x = 718
         
-        hi_lo_lbl = "Hi/Lo" if lang == "en" else "Derece"
-        humid_lbl = "Humid" if lang == "en" else "Nem"
-        wind_lbl = "Wind" if lang == "en" else "Rüzgar"
-        sunset_lbl = "Sunset" if lang == "en" else "Batış"
+        hi_lo_lbl = "Hi" if lang == "en" else "Der"
+        humid_lbl = "Hum" if lang == "en" else "Nem"
+        press_lbl = "Pres" if lang == "en" else "Bas"
         
+        wind_lbl = "Wind" if lang == "en" else "Rüz"
+        sunset_lbl = "Set" if lang == "en" else "Bat"
+        sr_lbl = "Rise" if lang == "en" else "Doğ"
+        
+        # Row 1
         txt(d, col1_x, y + 25, hi_lo_lbl, FR16)
         txt(d, val1_x, y + 23, f"{hi}°/{lo}°", FB18, anchor="ra")
         
         txt(d, col2_x, y + 25, wind_lbl, FR16)
         txt(d, val2_x, y + 23, f"{wind} mph", FB18, anchor="ra")
         
+        # Row 2
         txt(d, col1_x, y + 75, humid_lbl, FR16)
         txt(d, val1_x, y + 73, f"%{humidity}" if lang == "tr" else f"{humidity}%", FB18, anchor="ra")
         
         txt(d, col2_x, y + 75, sunset_lbl, FR16)
         txt(d, val2_x, y + 73, sunset, FB18, anchor="ra")
         
-        press_lbl = "Press" if lang == "en" else "Basınç"
-        sr_lbl = "Rise" if lang == "en" else "Doğuş"
+        # Row 3 (Sunrise / Sunset or Pressure)
         txt(d, col1_x, y + 125, press_lbl, FR16)
-        txt(d, val1_x, y + 123, f"{pressure}hPa", FB18, anchor="ra")
+        txt(d, val1_x, y + 123, f"{pressure}", FB18, anchor="ra")
         
         txt(d, col2_x, y + 125, sr_lbl, FR16)
         txt(d, val2_x, y + 123, sunrise, FB18, anchor="ra")

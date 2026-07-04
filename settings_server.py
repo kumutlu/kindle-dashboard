@@ -580,7 +580,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
     
     <label class="field">
       <span>Title</span>
-      <input type="text" id="note-title" placeholder="Osman PE kit, Bin collection, Dentist..." required>
+      <input type="text" id="note-title" placeholder="Osman PE kit, Bin collection, Dentist...">
     </label>
     
     <label class="field">

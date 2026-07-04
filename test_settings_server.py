@@ -445,6 +445,114 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIsNone(saved["latitude"])
         self.assertEqual(self.regeneration_calls, 1)
 
+    def test_settings_form_saves_registered_themes_and_regenerates(self):
+        for theme in (
+            "family_dashboard",
+            "compact_dashboard",
+            "maarif_calendar",
+        ):
+            with self.subTest(theme=theme):
+                csrf = self.csrf_token()
+                form = {
+                    "csrf_token": csrf,
+                    "title": "NOTTINGHAM HOME",
+                    "location": "Nottingham",
+                    "country": "United Kingdom",
+                    "latitude": "52.9536",
+                    "longitude": "-1.1505",
+                    "location_display": "Nottingham, England, United Kingdom",
+                    "location_label": "Nottingham, UK",
+                    "weather_query": "Nottingham",
+                    "timezone": "Europe/London",
+                    "theme": theme,
+                    "show_weather": "on",
+                    "show_forecast": "on",
+                    "show_server": "on",
+                    "show_pihole": "on",
+                    "show_tailscale": "on",
+                    "prayer_method": "13",
+                    "prayer_school": "1",
+                    "prayer_high_latitude": "3",
+                    "hijri_adjustment": "1",
+                    "refresh_interval_minutes": "30",
+                }
+                calls_before = self.regeneration_calls
+                status, headers, _ = self.request(
+                    "POST",
+                    "/settings",
+                    body=urlencode(form),
+                    headers={
+                        "Content-Type":
+                            "application/x-www-form-urlencoded",
+                    },
+                )
+                self.assertEqual(status, 303)
+                self.assertEqual(
+                    headers["Location"],
+                    "/settings?status=saved",
+                )
+                saved = json.loads(
+                    self.config_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(saved["theme"], theme)
+                self.assertEqual(
+                    self.regeneration_calls,
+                    calls_before + 1,
+                )
+                self.assertEqual(saved["kindle_frontlight"], 8)
+                self.assertEqual(saved["refresh_interval_minutes"], 30)
+                self.assertEqual(saved["prayer_method"], 13)
+                self.assertEqual(saved["prayer_school"], 1)
+                self.assertEqual(saved["prayer_high_latitude"], 3)
+                self.assertEqual(saved["hijri_adjustment"], 1)
+                for key in (
+                    "show_weather",
+                    "show_forecast",
+                    "show_server",
+                    "show_pihole",
+                    "show_tailscale",
+                ):
+                    self.assertTrue(saved[key])
+
+    def test_settings_form_rejects_invalid_theme_without_changing_config(self):
+        before = self.config_path.read_bytes()
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "title": "NOTTINGHAM HOME",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "not-a-theme",
+            "show_weather": "on",
+            "show_forecast": "on",
+            "show_server": "on",
+            "show_pihole": "on",
+            "show_tailscale": "on",
+        }
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        self.assertEqual(status, 303)
+        self.assertIn("unsupported%20theme", headers["Location"])
+        self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertEqual(self.regeneration_calls, 0)
+
+    def test_daily_notes_fields_do_not_block_main_settings_form(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        note_title = re.search(
+            r'<input[^>]+id="note-title"[^>]*>',
+            text,
+        )
+        self.assertIsNotNone(note_title)
+        self.assertNotRegex(note_title.group(0), r"\brequired\b")
+
     def test_sticky_action_bar_and_push_are_present(self):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")

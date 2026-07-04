@@ -17,6 +17,12 @@ class PublicImageServerTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.image_path = Path(self.tempdir.name) / "kindle_weather.png"
         self.image_path.write_bytes(self.PNG_BYTES)
+        
+        # Patch load_config to default to home_dashboard to bypass Maarif checks in non-Maarif tests
+        self.load_config_patcher = mock.patch("weather_image.load_config")
+        self.mock_load_config = self.load_config_patcher.start()
+        self.mock_load_config.return_value = {"theme": "home_dashboard"}
+        
         self.server = public_image_server.make_server(
             image_path=self.image_path,
             token=self.TOKEN,
@@ -30,6 +36,7 @@ class PublicImageServerTests(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self):
+        self.load_config_patcher.stop()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)

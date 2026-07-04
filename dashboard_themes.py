@@ -38,6 +38,11 @@ THEMES = {
         "status": "active",
         "implemented": True,
     },
+    "compact_dashboard": {
+        "label": "Compact Dashboard",
+        "description": "Narrow, dense information-rich layout",
+        "implemented": True,
+    },
 }
 
 WEATHER_ONLY = {
@@ -68,7 +73,7 @@ def validate_theme(theme):
 
 def effective_visibility(theme, config):
     validate_theme(theme)
-    if theme == "home_dashboard":
+    if theme in ("home_dashboard", "compact_dashboard"):
         return {key: config[key] for key in VISIBILITY_FIELDS}
     if theme in ("minimal_weather", "travel_weather", "maarif_calendar"):
         return dict(WEATHER_ONLY)

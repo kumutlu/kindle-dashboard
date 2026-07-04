@@ -1986,6 +1986,208 @@ def render_maarif_calendar(config):
     save_dashboard(img, data)
 
 
+def render_compact_dashboard(config):
+    data = collect_dashboard_data(config)
+    current = data["current"]
+    days = data["days"]
+    (
+        now, temp, feels, desc, humidity, wind, wind_dir, pressure,
+        hi, lo, sunrise, sunset, cpu, ram, disk, ph, ts,
+    ) = (
+        data[key] for key in (
+            "now", "temp", "feels", "desc", "humidity", "wind",
+            "wind_dir", "pressure", "hi", "lo", "sunrise", "sunset",
+            "cpu", "ram", "disk", "ph", "ts",
+        )
+    )
+    fonts = dashboard_fonts()
+    (
+        FB68, FB28, FB24, FB22, FB20, FB18, FR18, FR16, FR14,
+    ) = (
+        fonts[key] for key in (
+            "FB68", "FB28", "FB24", "FB22", "FB20", "FB18",
+            "FR18", "FR16", "FR14",
+        )
+    )
+
+    img = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(img)
+
+    # Outer border (thin e-ink border)
+    box(d, (10, 10, 748, 1014), 10, 2)
+
+    # Language and Locales
+    lang = get_dashboard_lang(config)
+    locale = LOCALES[lang]
+
+    # Header
+    txt(d, 34, 28, config["title"].upper(), FB24)
+    
+    if lang == "en":
+        date_str = now.strftime("%A, %d %B %Y").upper()
+        updated_str = f"UPDATED: {now.strftime('%H:%M')}"
+    else:
+        date_str = data["day_name_localized"].upper() + ", " + now.strftime("%d ") + locale["months"].get(now.month, "OCAK") + now.strftime(" %Y")
+        updated_str = f"GÜNCELLEME: {now.strftime('%H:%M')}"
+        
+    txt(d, 720, 30, date_str, FB18, anchor="ra")
+    txt(d, 34, 62, updated_str, FR14)
+    txt(d, 720, 60, data["weather_desc_localized"].upper(), FB18, anchor="ra")
+
+    d.line((24, 90, 734, 90), fill=0, width=2)
+
+    visibility = effective_visibility("compact_dashboard", config)
+    y = 110
+
+    # 1. Current Weather Block
+    if visibility["show_weather"]:
+        box(d, (24, y, 734, y + 150), 8, 2)
+        # Weather Icon
+        draw_weather_icon(
+            d,
+            weather_kind(current.get("weatherCode")),
+            110,
+            y + 75,
+            90,
+        )
+        # Temp
+        txt(d, 280, y + 60, f"{temp}°C", FB68, anchor="mm")
+        txt(d, 280, y + 115, f"{feels}°C / {data['weather_desc_localized'].upper()}", FB18, anchor="mm")
+
+        # Stats on right
+        col1_x = 450
+        val1_x = 550
+        col2_x = 580
+        val2_x = 710
+        
+        hi_lo_lbl = "Hi/Lo" if lang == "en" else "Derece"
+        humid_lbl = "Humid" if lang == "en" else "Nem"
+        wind_lbl = "Wind" if lang == "en" else "Rüzgar"
+        sunset_lbl = "Sunset" if lang == "en" else "Batış"
+        
+        # Row 1
+        txt(d, col1_x, y + 25, hi_lo_lbl, FR16)
+        txt(d, val1_x, y + 23, f"{hi}°/{lo}°", FB18, anchor="ra")
+        
+        txt(d, col2_x, y + 25, wind_lbl, FR16)
+        txt(d, val2_x, y + 23, f"{wind} mph", FB18, anchor="ra")
+        
+        # Row 2
+        txt(d, col1_x, y + 75, humid_lbl, FR16)
+        txt(d, val1_x, y + 73, f"%{humidity}" if lang == "tr" else f"{humidity}%", FB18, anchor="ra")
+        
+        txt(d, col2_x, y + 75, sunset_lbl, FR16)
+        txt(d, val2_x, y + 73, sunset, FB18, anchor="ra")
+        
+        # Row 3 (Sunrise / Sunset or Pressure)
+        press_lbl = "Press" if lang == "en" else "Basınç"
+        sr_lbl = "Rise" if lang == "en" else "Doğuş"
+        txt(d, col1_x, y + 125, press_lbl, FR16)
+        txt(d, val1_x, y + 123, f"{pressure}hPa", FB18, anchor="ra")
+        
+        txt(d, col2_x, y + 125, sr_lbl, FR16)
+        txt(d, val2_x, y + 123, sunrise, FB18, anchor="ra")
+
+        y += 170
+
+    # 2. Compact Forecast Block
+    if visibility["show_forecast"]:
+        heading_lbl = "FORECAST" if lang == "en" else "TAHMİN"
+        txt(d, 34, y, heading_lbl, FB18)
+        y += 30
+        
+        num_days = min(5, len(days))
+        col_width = (710 - (num_days - 1) * 12) // num_days
+        
+        today_lbl = "BUGÜN" if lang == "tr" else "TODAY"
+        tomorrow_lbl = "YARIN" if lang == "tr" else "TOMORROW"
+        
+        for i, day in enumerate(days[:num_days]):
+            x = 24 + i * (col_width + 12)
+            box(d, (x, y, x + col_width, y + 155), 6, 1)
+            
+            if i == 0:
+                day_name = today_lbl
+            elif i == 1:
+                day_name = tomorrow_lbl
+            else:
+                try:
+                    dt = datetime.strptime(day["date"], "%Y-%m-%d")
+                    w_day = dt.weekday()
+                    if lang == "tr":
+                        tr_short = {0: "PZT", 1: "SAL", 2: "ÇAR", 3: "PER", 4: "CUM", 5: "CMT", 6: "PAZ"}
+                        day_name = tr_short.get(w_day, "GÜN")
+                    else:
+                        day_name = locale["weekdays"][w_day][:3]
+                except Exception:
+                    day_name = f"DAY {i+1}"
+            
+            txt(d, x + col_width // 2, y + 22, day_name, FB18, anchor="mm")
+            
+            noon = day["hourly"][4]
+            draw_weather_icon(
+                d,
+                weather_kind(noon.get("weatherCode")),
+                x + col_width // 2,
+                y + 65,
+                42,
+            )
+            
+            txt(d, x + col_width // 2, y + 105, f"{day['maxtempC']}°/{day['mintempC']}°", FB18, anchor="mm")
+            txt(d, x + col_width // 2, y + 132, f"%{noon['chanceofrain']}" if lang == "tr" else f"{noon['chanceofrain']}%", FR14, anchor="mm")
+            
+        y += 180
+
+    # 3. Server Status Block
+    if visibility["show_server"]:
+        heading_lbl = "SERVER STATUS" if lang == "en" else "SUNUCU DURUMU"
+        txt(d, 34, y, heading_lbl, FB18)
+        y += 30
+        
+        box(d, (24, y, 734, y + 120), 8, 2)
+        
+        cols = []
+        sys_lbl = "SYSTEM" if lang == "en" else "SİSTEM"
+        sys_rows = [
+            f"CPU: {cpu}%",
+            f"RAM: {ram}%",
+            f"DISK: {disk}%"
+        ]
+        cols.append((sys_lbl, sys_rows))
+        
+        if visibility["show_pihole"]:
+            ph_lbl = "PI-HOLE"
+            ph_rows = [
+                f"Blocked: {fmt(ph['blocked'])}" if lang == "en" else f"Engellenen: {fmt(ph['blocked'])}",
+                f"Queries: {fmt(ph['queries'])}" if lang == "en" else f"Sorgular: {fmt(ph['queries'])}"
+            ]
+            cols.append((ph_lbl, ph_rows))
+            
+        if visibility["show_tailscale"]:
+            ts_lbl = "TAILSCALE"
+            ts_rows = [
+                f"Online: {ts['online']}" if lang == "en" else f"Çevrimiçi: {ts['online']}",
+                f"Total: {ts['total']}" if lang == "en" else f"Toplam: {ts['total']}"
+            ]
+            cols.append((ts_lbl, ts_rows))
+            
+        num_cols = len(cols)
+        col_w = 710 // num_cols
+        for idx, (col_title, col_items) in enumerate(cols):
+            cx_start = 24 + idx * col_w
+            txt(d, cx_start + 15, y + 18, col_title, FB18)
+            for item_idx, item_text in enumerate(col_items):
+                txt(d, cx_start + 15, y + 48 + item_idx * 24, item_text, FR16)
+
+    # 4. Footer
+    d.line((24, 965, 734, 965), fill=0, width=2)
+    
+    interval_minutes = config.get("refresh_interval_minutes", 10)
+    footer_lbl = f"UPDATED: {now.strftime('%Y-%m-%d %H:%M:%S')}  ·  INTERVAL: {interval_minutes} MIN  ·  COMPACT" if lang == "en" else f"GÜNCELLEME: {now.strftime('%Y-%m-%d %H:%M:%S')}  ·  SÜRE: {interval_minutes} DK  ·  KOMPAKT"
+    txt(d, 379, 985, footer_lbl, FR14, anchor="ma")
+
+    save_dashboard(img, data)
+
 
 THEME_RENDERERS = {
     "home_dashboard": render_home_dashboard,
@@ -1993,6 +2195,7 @@ THEME_RENDERERS = {
     "server_monitor": render_server_monitor,
     "travel_weather": render_travel_weather,
     "maarif_calendar": render_maarif_calendar,
+    "compact_dashboard": render_compact_dashboard,
 }
 
 

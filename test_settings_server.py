@@ -329,6 +329,7 @@ class SettingsServerTests(unittest.TestCase):
             "server_monitor",
             "travel_weather",
             "maarif_calendar",
+            "compact_dashboard",
         ):
             self.assertIn(
                 f'type="radio" name="theme" value="{value}"',

@@ -15,7 +15,7 @@ ALL_VISIBLE = {
 
 
 class ThemeRegistryTests(unittest.TestCase):
-    def test_registry_contains_five_implemented_themes(self):
+    def test_registry_contains_six_implemented_themes(self):
         self.assertEqual(
             list(dashboard_themes.THEMES),
             [
@@ -24,6 +24,7 @@ class ThemeRegistryTests(unittest.TestCase):
                 "server_monitor",
                 "travel_weather",
                 "maarif_calendar",
+                "compact_dashboard",
             ],
         )
         self.assertTrue(
@@ -81,6 +82,7 @@ class ThemeRegistryTests(unittest.TestCase):
             "server_monitor",
             "travel_weather",
             "maarif_calendar",
+            "compact_dashboard",
         ):
             with self.subTest(theme=theme):
                 config = dict(weather_image.DEFAULT_CONFIG)
@@ -99,6 +101,7 @@ class ThemeRegistryTests(unittest.TestCase):
                 "server_monitor",
                 "travel_weather",
                 "maarif_calendar",
+                "compact_dashboard",
             },
         )
 

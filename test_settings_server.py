@@ -443,7 +443,78 @@ class SettingsServerTests(unittest.TestCase):
         saved = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["weather_query"], "London")
         self.assertIsNone(saved["latitude"])
+        self.assertEqual(saved["theme"], "home_dashboard")
         self.assertEqual(self.regeneration_calls, 1)
+
+    def test_theme_saving_via_form(self):
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "title": "TEST DASHBOARD",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "family_dashboard",
+        }
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "family_dashboard")
+
+        # Test saving compact_dashboard
+        form["theme"] = "compact_dashboard"
+        status, _, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "compact_dashboard")
+
+        # Test saving maarif_calendar
+        form["theme"] = "maarif_calendar"
+        status, _, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "maarif_calendar")
+
+        # Test invalid theme rejection
+        form["theme"] = "invalid_theme_name"
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        self.assertIn("status=unsupported%20theme", headers["Location"])
+        # Config should NOT be updated with invalid theme (should remain maarif_calendar)
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "maarif_calendar")
+        
+        # Test missing theme fallback (preserves existing theme)
+        del form["theme"]
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 303)
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "maarif_calendar")
 
     def test_sticky_action_bar_and_push_are_present(self):
         _, _, body = self.request("GET", "/settings")

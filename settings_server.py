@@ -1686,11 +1686,28 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 supplied_csrf = form.get("csrf_token", [""])[0]
                 if not hmac.compare_digest(supplied_csrf, csrf_token):
                     raise ValueError("invalid form token")
+
+                submitted_theme = (
+                    form.get("theme", [""])[0]
+                    or form.get("selected_theme", [""])[0]
+                    or form.get("dashboard_theme", [""])[0]
+                )
+                if not submitted_theme:
+                    try:
+                        current_config = load_config(config_path)
+                        submitted_theme = current_config.get("theme", "home_dashboard")
+                    except Exception:
+                        submitted_theme = "home_dashboard"
+
+                from dashboard_themes import validate_theme
+                validate_theme(submitted_theme)
+
                 candidate = {
                     key: form.get(key, [""])[0]
                     for key in ("title", "location_label", "weather_query",
-                                "timezone", "theme")
+                                "timezone")
                 }
+                candidate["theme"] = submitted_theme
                 candidate.update({
                     "location": form.get(
                         "location",

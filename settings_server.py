@@ -45,15 +45,21 @@ def public_device_config(device, config):
         "name": device.name,
         "type": device.type,
         "resolution": list(device.resolution),
-        "theme": config["theme"],
-        "refresh_interval_minutes": config[
-            "refresh_interval_minutes"
-        ],
-        "image_url": f"/device/{device.id}/image.png",
         "enabled": device.enabled,
     }
-    if device.type == "kindle_pw1":
-        payload["kindle_frontlight"] = config["kindle_frontlight"]
+    if "theme" in config:
+        payload["theme"] = config["theme"]
+    if "refresh_interval_minutes" in config:
+        payload["refresh_interval_minutes"] = config["refresh_interval_minutes"]
+    if "deep_sleep_minutes" in config:
+        payload["deep_sleep_minutes"] = config["deep_sleep_minutes"]
+    
+    payload["image_url"] = f"/device/{device.id}/image.png"
+    if device.type == "esp32_epaper":
+        payload["bmp_url"] = f"/device/{device.id}/image.bmp"
+    elif device.type == "kindle_pw1":
+        if "kindle_frontlight" in config:
+            payload["kindle_frontlight"] = config["kindle_frontlight"]
     return payload
 
 
@@ -72,7 +78,7 @@ def public_devices(registry, legacy_config_path):
             "type": device.type,
             "enabled": device.enabled,
             "resolution": list(device.resolution),
-            "theme": config["theme"],
+            "theme": config.get("theme") or "",
             "image_url": f"/device/{device.id}/image.png",
             "config_url": f"/api/device/{device.id}/config",
         }
@@ -389,7 +395,7 @@ def render_settings(
     for listed_device in devices:
         connection = listed_device.get("connection") or {}
         connection_items = []
-        for key in ("host", "user", "ssh_profile", "port"):
+        for key in ("host", "user", "ssh_profile", "port", "method"):
             if key in connection:
                 connection_items.append(
                     f"<span><strong>{html.escape(key)}:</strong> "
@@ -406,6 +412,33 @@ def render_settings(
         enabled_label = (
             "Enabled" if listed_device["enabled"] else "Disabled"
         )
+        
+        links = []
+        links.append(
+            f'<a href="{html.escape(listed_device["image_url"], quote=True)}" '
+            'target="_blank" rel="noopener">Open PNG preview</a>'
+        )
+        
+        esp_warning = ""
+        if listed_device["type"] == "esp32_epaper":
+            bmp_url = f'/device/{listed_device["id"]}/image.bmp'
+            links.append(
+                f'<a href="{html.escape(bmp_url, quote=True)}" '
+                'target="_blank" rel="noopener">Open BMP endpoint</a>'
+            )
+            esp_warning = (
+                '<div style="margin-top: 10px; padding: 8px 12px; background: var(--danger-soft, #fff5f5); border: 1px solid var(--line, #fed7d7); color: var(--danger, #c53030); border-radius: 6px; font-size: 0.8rem; font-weight: 600; display: flex; align-items: center; gap: 6px;">'
+                '<span style="font-size: 1.1rem; line-height: 1;">⚠️</span> Push is unsupported for this device type'
+                '</div>'
+            )
+            
+        links.append(
+            f'<a href="{html.escape(listed_device["config_url"], quote=True)}" '
+            'target="_blank" rel="noopener">Open config endpoint</a>'
+        )
+        
+        links_html = '<div class="device-links">' + "".join(links) + '</div>'
+        
         device_cards.append(
             '<article class="registered-device" '
             f'data-device-id="{html.escape(listed_device["id"], quote=True)}">'
@@ -420,12 +453,9 @@ def render_settings(
             f'<div><dt>Theme</dt><dd>{html.escape(listed_device["theme"])}</dd></div>'
             "</dl>"
             + connection_html
-            + '<div class="device-links">'
-            f'<a href="{html.escape(listed_device["image_url"], quote=True)}" '
-            'target="_blank" rel="noopener">Open image preview</a>'
-            f'<a href="{html.escape(listed_device["config_url"], quote=True)}" '
-            'target="_blank" rel="noopener">Open config endpoint</a>'
-            "</div></article>"
+            + esp_warning
+            + links_html
+            + "</article>"
         )
     devices_html = (
         "".join(device_cards)
@@ -2414,6 +2444,24 @@ def make_handler(
                 device_id = "default-kindle"
             try:
                 selected = registry.get(device_id)
+                action_suffix = path.split("/")[-1]
+                if "autostart" in path:
+                    action_suffix = "autostart/" + action_suffix
+
+                if selected.type == "esp32_epaper":
+                    if action_suffix == "push":
+                        self.send_json(
+                            400,
+                            {"ok": False, "error": "Push is not implemented for esp32_epaper devices"},
+                        )
+                        return
+                    else:
+                        self.send_json(
+                            400,
+                            {"ok": False, "error": "unsupported device type"},
+                        )
+                        return
+
                 if selected.type != "kindle_pw1":
                     self.send_json(
                         400,

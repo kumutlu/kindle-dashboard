@@ -1496,6 +1496,58 @@ class SettingsServerTests(unittest.TestCase):
         dev_ids = [d["id"] for d in res["devices"]]
         self.assertIn("default-kindle", dev_ids)
 
+    def test_esp32_device_config_and_push_rejection(self):
+        self.registry.add({
+            "id": "office-esp32",
+            "name": "Office ESP32",
+            "type": "esp32_epaper",
+            "enabled": True,
+            "resolution": [800, 480],
+            "config_path": "devices/office-esp32/config.json",
+            "image_path": "devices/office-esp32/image.png",
+            "connection": {
+                "method": "http",
+                "host": "192.168.68.200",
+                "port": 80
+            }
+        })
+
+        status, _, body = self.request("GET", "/api/device/office-esp32/config")
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        self.assertEqual(res["device_id"], "office-esp32")
+        self.assertEqual(res["type"], "esp32_epaper")
+        self.assertEqual(res["bmp_url"], "/device/office-esp32/image.bmp")
+        self.assertEqual(res["image_url"], "/device/office-esp32/image.png")
+        self.assertIn("theme", res)
+        self.assertNotIn("connection", res)
+        self.assertNotIn("host", res)
+        self.assertNotIn("method", res)
+
+        csrf = self.csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/device/office-esp32/push",
+            headers=headers
+        )
+        self.assertEqual(status, 400)
+        res_push = json.loads(body.decode("utf-8"))
+        self.assertFalse(res_push["ok"])
+        self.assertEqual(res_push["error"], "Push is not implemented for esp32_epaper devices")
+
+        status_ui, _, body_ui = self.request("GET", "/settings")
+        self.assertEqual(status_ui, 200)
+        text_ui = body_ui.decode("utf-8")
+        self.assertIn("Office ESP32", text_ui)
+        self.assertIn("esp32_epaper", text_ui)
+        self.assertIn("800×480", text_ui)
+        self.assertIn("Open BMP endpoint", text_ui)
+        self.assertIn("Push is unsupported for this device type", text_ui)
+
 
 class DeviceConfigEndpointTests(unittest.TestCase):
     def setUp(self):

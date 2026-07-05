@@ -19,6 +19,9 @@ PORT = 8765
 DEVICE_IMAGE_RE = re.compile(
     r"^/device/([a-z0-9][a-z0-9-]{0,63})/image\.png$"
 )
+DEVICE_BMP_RE = re.compile(
+    r"^/device/([a-z0-9][a-z0-9-]{0,63})/image\.bmp$"
+)
 
 
 def make_handler(
@@ -95,6 +98,28 @@ def make_handler(
             route_path = urlsplit(raw_path).path
             if include_body and route_path == "/weather.png":
                 self._record_battery(raw_path)
+            bmp_match = DEVICE_BMP_RE.fullmatch(route_path)
+            if bmp_match is not None:
+                device_id = bmp_match.group(1)
+                try:
+                    device = registry.get(device_id, require_enabled=True)
+                except DeviceNotFoundError:
+                    self._send_empty(404)
+                    return
+                if device.type == "esp32_epaper":
+                    err_msg = b"BMP output for ESP32 e-paper devices is not implemented yet\n"
+                    self.send_response(501)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_msg)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if include_body:
+                        self.wfile.write(err_msg)
+                    return
+                else:
+                    self._send_empty(400)
+                    return
+
             try:
                 image_path = self._resolve_image(route_path)
                 image = image_path.read_bytes()

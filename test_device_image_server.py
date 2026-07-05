@@ -119,6 +119,25 @@ class DeviceImageServerTests(unittest.TestCase):
             "73",
         )
 
+    def test_esp32_bmp_returns_501(self):
+        self.registry.add({
+            "id": "office-esp32",
+            "name": "Office ESP32",
+            "type": "esp32_epaper",
+            "enabled": True,
+            "resolution": [800, 480],
+            "config_path": "devices/office-esp32/config.json",
+            "image_path": "devices/office-esp32/image.png",
+        })
+        status, headers, body = self.request("/device/office-esp32/image.bmp")
+        self.assertEqual(status, 501)
+        self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(body, b"BMP output for ESP32 e-paper devices is not implemented yet\n")
+
+    def test_non_esp32_bmp_returns_400(self):
+        status, _, _ = self.request("/device/default-kindle/image.bmp")
+        self.assertEqual(status, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

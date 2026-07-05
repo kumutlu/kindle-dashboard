@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 import settings_server
 import weather_image
+from device_registry import DeviceRegistry
 
 
 class ConfigTests(unittest.TestCase):
@@ -1064,6 +1065,118 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn('data-theme-val="system"', text)
         self.assertIn('[data-theme="dark"]', text)
         self.assertIn('kindle_dashboard_ui_theme', text)
+
+
+class DeviceConfigEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.config_path = self.root / "dashboard_config.json"
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "theme": "family_dashboard",
+            "refresh_interval_minutes": 30,
+            "kindle_frontlight": 12,
+        })
+        settings_server.atomic_write_config(self.config_path, config)
+        (self.root / "kindle_weather.png").write_bytes(
+            b"\x89PNG\r\n\x1a\nconfig-endpoint-test"
+        )
+        self.registry = DeviceRegistry(self.root)
+        self.registry.get("default-kindle")
+        self.server = settings_server.make_server(
+            host="127.0.0.1",
+            port=0,
+            config_path=self.config_path,
+            regenerate=lambda: None,
+            device=mock.MagicMock(),
+            restart_settings=lambda: None,
+            geocode=lambda query: [],
+            registry=self.registry,
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.tempdir.cleanup()
+
+    def request(self, path):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        connection.close()
+        return status, body
+
+    def test_default_device_config_returns_safe_allowlisted_json(self):
+        status, body = self.request(
+            "/api/device/default-kindle/config"
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            set(payload),
+            {
+                "device_id",
+                "name",
+                "type",
+                "resolution",
+                "theme",
+                "refresh_interval_minutes",
+                "kindle_frontlight",
+                "image_url",
+                "enabled",
+            },
+        )
+        self.assertEqual(payload["device_id"], "default-kindle")
+        self.assertEqual(payload["type"], "kindle_pw1")
+        self.assertEqual(payload["resolution"], [758, 1024])
+        self.assertEqual(payload["theme"], "family_dashboard")
+        self.assertEqual(payload["refresh_interval_minutes"], 30)
+        self.assertEqual(payload["kindle_frontlight"], 12)
+        self.assertEqual(
+            payload["image_url"],
+            "/device/default-kindle/image.png",
+        )
+
+        serialized = body.decode("utf-8").lower()
+        for forbidden in (
+            "key_path",
+            "known_hosts",
+            "password",
+            "token",
+            "private_key",
+            "/home/user/.ssh",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_invalid_unknown_and_traversal_device_config_is_404(self):
+        for path in (
+            "/api/device/missing/config",
+            "/api/device/../config",
+            "/api/device/%2e%2e/config",
+            "/api/device/default-kindle/../../dashboard_config.json",
+            "/api/device/UPPERCASE/config",
+        ):
+            with self.subTest(path=path):
+                status, body = self.request(path)
+                self.assertEqual(status, 404)
+                self.assertNotIn(
+                    str(self.root).encode("utf-8"),
+                    body,
+                )
 
 
 if __name__ == "__main__":

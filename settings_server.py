@@ -3,6 +3,7 @@ import hmac
 import html
 import json
 import os
+import re
 import secrets
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
 from dashboard_themes import THEMES
+from device_registry import DeviceNotFoundError, DeviceRegistry
 from kindle_device import DeviceError, KindleDevice
 from weather_image import (
     DEFAULT_CONFIG,
@@ -27,6 +29,27 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
+DEVICE_CONFIG_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/config$"
+)
+
+
+def public_device_config(device, config):
+    payload = {
+        "device_id": device.id,
+        "name": device.name,
+        "type": device.type,
+        "resolution": list(device.resolution),
+        "theme": config["theme"],
+        "refresh_interval_minutes": config[
+            "refresh_interval_minutes"
+        ],
+        "image_url": f"/device/{device.id}/image.png",
+        "enabled": device.enabled,
+    }
+    if device.type == "kindle_pw1":
+        payload["kindle_frontlight"] = config["kindle_frontlight"]
+    return payload
 
 
 def load_daily_notes():
@@ -1515,7 +1538,14 @@ loadDeviceState();
 </html>"""
 
 
-def make_handler(config_path, regenerate, device, restart_settings, geocode):
+def make_handler(
+    config_path,
+    regenerate,
+    device,
+    restart_settings,
+    geocode,
+    registry,
+):
     config_path = Path(config_path)
     csrf_token = secrets.token_urlsafe(32)
     update_lock = threading.Lock()
@@ -1571,6 +1601,29 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 return
             if parsed.path == "/api/config":
                 self.send_json(200, load_config(config_path))
+                return
+            device_config_match = DEVICE_CONFIG_RE.fullmatch(parsed.path)
+            if device_config_match is not None:
+                try:
+                    selected = registry.get(
+                        device_config_match.group(1),
+                        require_enabled=True,
+                    )
+                except DeviceNotFoundError:
+                    self.send_bytes(404, b"", "text/plain")
+                    return
+                selected_config_path = (
+                    config_path
+                    if selected.id == "default-kindle"
+                    else selected.config_path
+                )
+                self.send_json(
+                    200,
+                    public_device_config(
+                        selected,
+                        load_config(selected_config_path),
+                    ),
+                )
                 return
             if parsed.path == "/api/notes":
                 self.send_json(200, load_daily_notes())
@@ -2083,9 +2136,11 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
 def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
                 regenerate=regenerate_dashboard, device=None,
                 restart_settings=schedule_settings_restart,
-                geocode=geocode_locations):
+                geocode=geocode_locations, registry=None):
     if device is None:
         device = KindleDevice()
+    if registry is None:
+        registry = DeviceRegistry(Path(config_path).resolve().parent)
     return ThreadingHTTPServer(
         (host, port),
         make_handler(
@@ -2094,6 +2149,7 @@ def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
             device,
             restart_settings,
             geocode,
+            registry,
         ),
     )
 

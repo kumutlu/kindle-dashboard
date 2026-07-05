@@ -1915,12 +1915,19 @@ def make_handler(
                         },
                     )
                 return
+            device_control_get_match = re.match(
+                r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(status|light|log)$",
+                parsed.path,
+            )
             if parsed.path in (
                 "/api/device/status",
                 "/api/device/light",
                 "/api/device/log",
             ):
                 self.handle_device_get(parsed.path)
+                return
+            elif device_control_get_match is not None:
+                self.handle_device_get(parsed.path, device_id=device_control_get_match.group(1))
                 return
             if parsed.path == "/settings":
                 query = parse_qs(parsed.query)
@@ -1973,10 +1980,17 @@ def make_handler(
                     "/api/device/push",
                     "/api/device/restart",
                 }
-                if parsed.path not in known_paths:
-                    self.send_bytes(404, b"", "text/plain")
+                if parsed.path in known_paths:
+                    self.handle_device_post(parsed.path)
                     return
-                self.handle_device_post(parsed.path)
+                device_control_post_match = re.match(
+                    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(light|push|restart|start-dashboard|home|refresh|autostart/enable|autostart/disable)$",
+                    parsed.path,
+                )
+                if device_control_post_match is not None:
+                    self.handle_device_post(parsed.path, device_id=device_control_post_match.group(1))
+                    return
+                self.send_bytes(404, b"", "text/plain")
                 return
             self.send_bytes(404, b"", "text/plain")
 
@@ -2210,53 +2224,98 @@ def make_handler(
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": str(e)})
 
-        def handle_device_get(self, path):
+        def handle_device_get(self, path, device_id=None):
+            if device_id is None:
+                device_id = "default-kindle"
             try:
-                if path == "/api/device/status":
-                    payload = device.get_status()
-                elif path == "/api/device/light":
+                selected = registry.get(device_id)
+                if selected.type != "kindle_pw1":
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "unsupported device type"},
+                    )
+                    return
+                if path.endswith("/status"):
+                    payload = device.get_status(
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
+                elif path.endswith("/light"):
                     payload = {
                         "connected": True,
-                        "brightness": device.get_light(),
+                        "brightness": device.get_light(
+                            connection=selected.connection,
+                            device_id=selected.id,
+                            device_type=selected.type,
+                        ),
                     }
                 else:
                     payload = {
                         "connected": True,
-                        "log": device.get_log(),
+                        "log": device.get_log(
+                            connection=selected.connection,
+                            device_id=selected.id,
+                            device_type=selected.type,
+                        ),
                     }
                 self.send_json(200, payload)
-            except DeviceError:
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except DeviceError as exc:
                 self.send_json(
                     503,
-                    {"ok": False, "error": "Kindle is unavailable"},
+                    {"ok": False, "error": str(exc)},
                 )
-            except Exception:
+            except Exception as exc:
                 self.send_json(
                     500,
-                    {"ok": False, "error": "Device status failed"},
+                    {"ok": False, "error": str(exc)},
                 )
 
-        def handle_device_post(self, path):
+        def handle_device_post(self, path, device_id=None):
             if not self.device_csrf_valid():
                 self.send_json(
                     403,
                     {"ok": False, "error": "invalid request token"},
                 )
                 return
-            action_paths = {
-                "/api/device/start-dashboard": "start",
-                "/api/device/home": "home",
-                "/api/device/refresh": "refresh",
-                "/api/device/autostart/enable": "autostart_enable",
-                "/api/device/autostart/disable": "autostart_disable",
-            }
+            if device_id is None:
+                device_id = "default-kindle"
             try:
-                if path in action_paths:
-                    message = device.run_action(action_paths[path])
+                selected = registry.get(device_id)
+                if selected.type != "kindle_pw1":
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "unsupported device type"},
+                    )
+                    return
+                action_paths = {
+                    "start-dashboard": "start",
+                    "home": "home",
+                    "refresh": "refresh",
+                    "autostart/enable": "autostart_enable",
+                    "autostart/disable": "autostart_disable",
+                }
+                action_suffix = path.split("/")[-1]
+                if "autostart" in path:
+                    action_suffix = "autostart/" + action_suffix
+                if action_suffix in action_paths:
+                    message = device.run_action(
+                        action_paths[action_suffix],
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
                     payload = {"ok": True, "message": message}
-                elif path == "/api/device/push":
-                    payload = {"ok": True, "message": device.push()}
-                elif path == "/api/device/light":
+                elif action_suffix == "push":
+                    message = device.push(
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
+                    payload = {"ok": True, "message": message}
+                elif action_suffix == "light":
                     candidate = self.read_json()
                     level = candidate.get("level")
                     if level is None or isinstance(level, bool) or not isinstance(level, int) or level not in (0, 1, 4, 8, 12, 18):
@@ -2266,38 +2325,56 @@ def make_handler(
                         )
                         return
                     try:
-                        current_config = load_config(config_path)
+                        selected_config_path = (
+                            config_path
+                            if selected.id == "default-kindle"
+                            else selected.config_path
+                        )
+                        current_config = load_config(selected_config_path)
                         current_config["kindle_frontlight"] = level
-                        atomic_write_config(config_path, current_config)
+                        atomic_write_config(selected_config_path, current_config)
                     except Exception as e:
                         print(f"Warning: Failed to save kindle_frontlight to config: {e}")
-                    brightness = device.set_light(level)
+                    brightness = device.set_light(
+                        level,
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
                     payload = {
                         "ok": True,
                         "message": f"Brightness set to {brightness}",
                         "brightness": brightness,
                     }
-                elif path == "/api/device/restart":
+                elif action_suffix == "restart":
                     candidate = self.read_json()
+                    message = device.restart(
+                        candidate.get("confirm"),
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
                     payload = {
                         "ok": True,
-                        "message": device.restart(candidate.get("confirm")),
+                        "message": message,
                     }
                 else:
                     self.send_bytes(404, b"", "text/plain")
                     return
                 self.send_json(200, payload)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
-            except DeviceError:
+            except DeviceError as exc:
                 self.send_json(
                     503,
-                    {"ok": False, "error": "Kindle command failed"},
+                    {"ok": False, "error": str(exc)},
                 )
-            except Exception:
+            except Exception as exc:
                 self.send_json(
                     500,
-                    {"ok": False, "error": "Device action failed"},
+                    {"ok": False, "error": str(exc)},
                 )
 
         def handle_api_post(self):

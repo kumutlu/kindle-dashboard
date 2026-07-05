@@ -2663,7 +2663,7 @@ def _atomic_copy(source, destination):
         temporary_path.unlink(missing_ok=True)
 
 
-def render_device(device_id, registry=None):
+def render_device(device_id, force=False, registry=None):
     if registry is None:
         registry = DeviceRegistry(PROJECT_DIR)
     device = registry.get(device_id, require_enabled=True)

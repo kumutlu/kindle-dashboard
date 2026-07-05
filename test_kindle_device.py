@@ -64,20 +64,17 @@ class KindleDeviceTests(unittest.TestCase):
             with self.assertRaises(kindle_device.DeviceError):
                 self.device.get_light()
 
-    def test_push_generates_then_runs_one_shot_refresh(self):
+    @mock.patch("weather_image.render_device")
+    def test_push_generates_then_runs_one_shot_refresh(self, mock_render):
         with mock.patch(
             "kindle_device.subprocess.run",
-            side_effect=[self.completed(), self.completed()],
+            return_value=self.completed(),
         ) as run, mock.patch.object(self.device, "set_light"):
             message = self.device.push()
 
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
         self.assertEqual(
-            run.call_args_list[0].args[0],
-            [str(kindle_device.RUN_DASHBOARD)],
-        )
-        self.assertEqual(
-            run.call_args_list[1].args[0][-1],
+            run.call_args_list[0].args[0][-1],
             "/mnt/us/dashboard/refresh-once.sh",
         )
         self.assertEqual(message, "Dashboard generated and pushed")
@@ -111,15 +108,102 @@ class KindleDeviceTests(unittest.TestCase):
         ):
             with mock.patch.object(self.device, "set_light") as mock_set_light:
                 self.device.run_action("start")
-                mock_set_light.assert_called_once_with(12)
+                mock_set_light.assert_called_once_with(12, connection=None, device_id=None, device_type='kindle_pw1')
 
             with mock.patch.object(self.device, "set_light") as mock_set_light:
                 self.device.run_action("refresh")
-                mock_set_light.assert_called_once_with(12)
+                mock_set_light.assert_called_once_with(12, connection=None, device_id=None, device_type='kindle_pw1')
 
             with mock.patch.object(self.device, "set_light") as mock_set_light:
                 self.device.push()
-                mock_set_light.assert_called_once_with(12)
+                mock_set_light.assert_called_once_with(12, connection=None, device_id='default-kindle', device_type='kindle_pw1')
+
+    def test_profile_builds_strict_ssh_arguments_without_shell(self):
+        conn = {
+            "host": "192.168.68.200",
+            "user": "root",
+            "ssh_profile": "kindle_dashboard",
+            "port": 2222,
+        }
+        with mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=self.completed(),
+        ) as run:
+            self.device.run_action("home", connection=conn)
+            
+        args, kwargs = run.call_args
+        self.assertIsInstance(args[0], list)
+        self.assertEqual(args[0][0], "/usr/bin/ssh")
+        self.assertIn("-p", args[0])
+        self.assertIn("2222", args[0])
+        self.assertIn("root@192.168.68.200", args[0])
+        self.assertNotIn("shell", kwargs)
+
+    def test_api_never_exposes_profile_paths(self):
+        # Verify SSH_PROFILES is not exposed in public records
+        self.assertTrue(hasattr(kindle_device, "SSH_PROFILES"))
+        self.assertIn("kindle_dashboard", kindle_device.SSH_PROFILES)
+        profile = kindle_device.SSH_PROFILES["kindle_dashboard"]
+        self.assertIn("key_path", profile)
+        self.assertIn("known_hosts", profile)
+
+    def test_named_kindle_uses_its_connection_host_user_and_port(self):
+        conn = {
+            "host": "192.168.68.222",
+            "user": "root_user",
+            "ssh_profile": "kindle_dashboard",
+            "port": 2222,
+        }
+        with mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=self.completed(),
+        ) as run:
+            self.device.run_action("home", connection=conn)
+            
+        args, _ = run.call_args
+        self.assertEqual(args[0][-2], "root_user@192.168.68.222")
+        self.assertIn("-p", args[0])
+        self.assertIn("2222", args[0])
+
+    def test_missing_named_connection_does_not_fall_back(self):
+        with self.assertRaises(kindle_device.DeviceError):
+            self.device.run_action("home", connection=None, device_id="kitchen-kindle")
+
+    def test_default_kindle_may_use_legacy_connection_fallback(self):
+        with mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=self.completed(),
+        ) as run:
+            self.device.run_action("home", connection=None, device_id="default-kindle")
+        args, _ = run.call_args
+        self.assertEqual(args[0][-2], kindle_device.KINDLE_HOST)
+
+    def test_non_kindle_rejects_kindle_actions(self):
+        with self.assertRaises(ValueError):
+            self.device.run_action("home", device_type="esp32_epaper")
+        with self.assertRaises(ValueError):
+            self.device.push(device_type="generic_png")
+
+    @mock.patch("weather_image.render_device")
+    def test_push_renders_and_refreshes_selected_device(self, mock_render):
+        conn = {
+            "host": "192.168.68.200",
+            "user": "root",
+            "ssh_profile": "kindle_dashboard",
+        }
+        with mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=self.completed(),
+        ) as run, mock.patch.object(self.device, "set_light"):
+            self.device.push(connection=conn, device_id="my-kindle")
+            
+        # Verify render was called with correct device_id
+        mock_render.assert_called_once()
+        self.assertEqual(mock_render.call_args[0][0], "my-kindle")
+        
+        # Verify SSH refresh was called on the remote device
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args[0][0][-1], "/mnt/us/dashboard/refresh-once.sh")
 
 
 if __name__ == "__main__":

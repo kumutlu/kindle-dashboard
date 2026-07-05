@@ -132,42 +132,70 @@ class SettingsServerTests(unittest.TestCase):
         }]
 
         class FakeDevice:
-            def run_action(inner_self, action):
-                self.device_calls.append(("action", action))
+            def run_action(inner_self, action, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("action", action))
+                else:
+                    self.device_calls.append(("action", action, dev_id))
                 return f"{action} complete"
 
-            def push(inner_self):
-                self.device_calls.append(("push",))
+            def push(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("push",))
+                else:
+                    self.device_calls.append(("push", dev_id))
                 return "Dashboard generated and pushed"
 
-            def get_light(inner_self):
-                self.device_calls.append(("get_light",))
+            def get_light(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("get_light",))
+                else:
+                    self.device_calls.append(("get_light", dev_id))
                 return 8
 
-            def set_light(inner_self, level):
+            def set_light(inner_self, level, *args, **kwargs):
                 if isinstance(level, bool) or not isinstance(level, int):
                     raise ValueError("brightness must be an integer")
                 if level < 0 or level > 24:
                     raise ValueError("brightness must be between 0 and 24")
-                self.device_calls.append(("set_light", level))
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("set_light", level))
+                else:
+                    self.device_calls.append(("set_light", level, dev_id))
                 return level
 
-            def get_status(inner_self):
-                self.device_calls.append(("status",))
+            def get_status(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("status",))
+                else:
+                    self.device_calls.append(("status", dev_id))
                 return {
                     "connected": True,
                     "autostart": "enabled",
                     "brightness": 8,
                 }
 
-            def get_log(inner_self):
-                self.device_calls.append(("log",))
+            def get_log(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("log",))
+                else:
+                    self.device_calls.append(("log", dev_id))
                 return "safe dashboard log"
 
-            def restart(inner_self, confirmation):
+            def restart(inner_self, confirmation, *args, **kwargs):
                 if confirmation != "RESTART":
                     raise ValueError("restart confirmation is required")
-                self.device_calls.append(("restart",))
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("restart",))
+                else:
+                    self.device_calls.append(("restart", dev_id))
                 return "Kindle restart requested"
 
         self.device = FakeDevice()
@@ -1255,6 +1283,76 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn('data-theme-val="system"', text)
         self.assertIn('[data-theme="dark"]', text)
         self.assertIn('kindle_dashboard_ui_theme', text)
+
+    def test_push_named_device_renders_and_refreshes(self):
+        # Add a named Kindle PW1 device
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.150",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            }
+        })
+        
+        csrf = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/device/kitchen-kindle/push",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("push", [call[0] for call in self.device_calls])
+        # Find the push call for kitchen-kindle
+        push_calls = [call for call in self.device_calls if call[0] == "push"]
+        self.assertEqual(push_calls[-1], ("push", "kitchen-kindle"))
+
+    def test_push_non_kindle_is_rejected(self):
+        # Add a generic PNG display
+        panel = self.registry.add({
+            "id": "living-panel",
+            "name": "Living Panel",
+            "type": "generic_png",
+            "resolution": [800, 600],
+            "enabled": True,
+            "config_path": "devices/living-panel/config.json",
+            "image_path": "devices/living-panel/image.png",
+        })
+        
+        csrf = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/device/living-panel/push",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("unsupported device type", json.loads(body.decode("utf-8"))["error"])
+
+    def test_device_qualified_get_status(self):
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.150",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            }
+        })
+        status, _, body = self.request("GET", "/api/device/kitchen-kindle/status")
+        self.assertEqual(status, 200)
+        status_calls = [call for call in self.device_calls if call[0] == "status"]
+        self.assertEqual(status_calls[-1], ("status", "kitchen-kindle"))
 
 
 class DeviceConfigEndpointTests(unittest.TestCase):

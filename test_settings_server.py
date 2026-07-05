@@ -768,8 +768,14 @@ class SettingsServerTests(unittest.TestCase):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")
         self.assertIn('class="action-bar"', text)
-        self.assertIn('type="submit">Save &amp; Regenerate</button>', text)
-        self.assertIn('<button type="button" id="push-kindle">Push to Kindle</button>', text)
+        self.assertIn(
+            'type="submit" data-settings-action="save">Save &amp; Regenerate</button>',
+            text,
+        )
+        self.assertIn(
+            'id="push-kindle" data-settings-action="push">Push to Kindle</button>',
+            text,
+        )
 
     def test_device_get_endpoints_return_safe_data(self):
         status, _, body = self.request("GET", "/api/device/status")
@@ -1571,6 +1577,66 @@ class SettingsServerTests(unittest.TestCase):
                 os.environ.pop("IMAGE_SERVER_URL", None)
             else:
                 os.environ["IMAGE_SERVER_URL"] = old_env
+
+    def test_visible_apple_actions_use_shared_action_contract(self):
+        status, _, body = self.request("GET", "/settings")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+
+        self.assertGreaterEqual(
+            text.count('data-settings-action="save"'),
+            2,
+        )
+        self.assertGreaterEqual(
+            text.count('data-settings-action="push"'),
+            3,
+        )
+        self.assertGreaterEqual(
+            text.count('data-preview-action="open"'),
+            2,
+        )
+        self.assertGreaterEqual(text.count('type="submit"'), 2)
+        self.assertIn(
+            """querySelectorAll('[data-settings-action="push"]')""",
+            text,
+        )
+        self.assertIn("triggerSelectedDevicePush(button)", text)
+        self.assertIn("let remindersPreviewReady = false;", text)
+        self.assertIn(
+            "if (remindersPreviewReady) {\n    renderRemindersPreview();",
+            text,
+        )
+        self.assertIn("remindersPreviewReady = true;", text)
+
+    def test_preview_resolver_uses_image_server_base_for_relative_urls(self):
+        status, _, body = self.request("GET", "/settings")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+
+        self.assertIn("function resolveDeviceImageUrl(imageUrl, deviceId)", text)
+        self.assertIn("new URL(safePath, imageServerUrl)", text)
+        self.assertIn(
+            "const resolvedImageUrl = resolveDeviceImageUrl(imageUrl, selected);",
+            text,
+        )
+        self.assertIn(
+            """document.querySelectorAll('[data-preview-action="open"]')""",
+            text,
+        )
+
+    def test_selected_device_controls_and_required_tabs_remain_present(self):
+        status, _, body = self.request("GET", "/settings")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+
+        self.assertIn('id="selected-device-id"', text)
+        self.assertIn('id="selected-device"', text)
+        self.assertIn('id="top-selected-device"', text)
+        self.assertIn("kindle_dashboard_selected_device", text)
+        for tab_id in ("devices", "daily_notes", "theme"):
+            self.assertIn(f'data-tab="{tab_id}"', text)
+        for theme_value in ("light", "dark", "system"):
+            self.assertIn(f'data-theme-val="{theme_value}"', text)
 
 
 class DeviceConfigEndpointTests(unittest.TestCase):

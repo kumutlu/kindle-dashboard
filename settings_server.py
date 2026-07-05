@@ -1778,8 +1778,8 @@ button:disabled {{
       </div>
       
       <div class="top-bar-right">
-        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" id="top-bar-preview-btn" class="btn btn-outline">Preview</a>
-        <button type="button" id="top-bar-push-btn" class="btn btn-primary">Push to Kindle</button>
+        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" id="top-bar-preview-btn" class="btn btn-outline" data-preview-action="open">Preview</a>
+        <button type="button" id="top-bar-push-btn" class="btn btn-primary" data-settings-action="push">Push to Kindle</button>
         
         <!-- More Actions Dropdown -->
         <div class="more-dropdown">
@@ -1866,7 +1866,7 @@ button:disabled {{
         <div class="preview-container">
           <img id="live-dashboard-preview" src="{image_server_url}/device/default-kindle/image.png" alt="Dashboard PNG preview">
         </div>
-        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" class="btn btn-block" id="btn-open-preview">Open Full Preview</a>
+        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" class="btn btn-block" id="btn-open-preview" data-preview-action="open">Open Full Preview</a>
       </div>
     </div>
     
@@ -1877,7 +1877,7 @@ button:disabled {{
           <h3>Quick Actions</h3>
         </div>
         <div class="action-list">
-          <button type="submit" class="action-item" style="border:1px solid var(--line); min-height:auto;">
+          <button type="submit" class="action-item" style="border:1px solid var(--line); min-height:auto;" data-settings-action="save">
             <span class="action-icon">💾</span>
             <div class="action-body">
               <strong>Save &amp; Regenerate</strong>
@@ -1886,7 +1886,7 @@ button:disabled {{
             <span class="action-chevron">›</span>
           </button>
           
-          <button type="button" class="action-item" id="overview-push-kindle-btn" style="border:1px solid var(--line); min-height:auto;">
+          <button type="button" class="action-item" id="overview-push-kindle-btn" style="border:1px solid var(--line); min-height:auto;" data-settings-action="push">
             <span class="action-icon">📤</span>
             <div class="action-body">
               <strong>Push to Kindle</strong>
@@ -2353,8 +2353,8 @@ button:disabled {{
 
 <div class="action-bar">
   <p class="editing-device">Editing device: <strong id="editing-device-name">Default Kindle</strong></p>
-  <button type="submit">Save &amp; Regenerate</button>
-  <button type="button" id="push-kindle">Push to Kindle</button>
+  <button type="submit" data-settings-action="save">Save &amp; Regenerate</button>
+  <button type="button" id="push-kindle" data-settings-action="push">Push to Kindle</button>
 </div>
 </div>
 </form>
@@ -2376,6 +2376,18 @@ async function deviceApi(path, options = {{}}) {{
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "Device request failed");
   return data;
+}}
+
+function resolveDeviceImageUrl(imageUrl, deviceId) {{
+  let safePath = `/device/${{encodeURIComponent(deviceId)}}/image.png`;
+  if (
+    typeof imageUrl === "string"
+    && imageUrl.startsWith("/")
+    && !imageUrl.startsWith("//")
+  ) {{
+    safePath = imageUrl;
+  }}
+  return new URL(safePath, imageServerUrl).toString();
 }}
 
 const themeToggleButtons = document.querySelectorAll(".theme-toggle-btn");
@@ -2421,6 +2433,7 @@ const selectedDeviceControl=document.getElementById("selected-device");
 const selectedDeviceField=document.getElementById("selected-device-id");
 const editingDeviceName=document.getElementById("editing-device-name");
 const registeredDeviceCards=document.querySelectorAll("[data-device-id]");
+let remindersPreviewReady = false;
 
 async function loadDeviceState() {{
   const selected = localStorage.getItem(selectedDeviceKey) || "default-kindle";
@@ -2439,18 +2452,17 @@ async function loadDeviceState() {{
     console.error("Failed to load device config:", e);
   }}
   
-  // Resolve against imageServerUrl
-  const resolvedImageUrl = imageServerUrl.replace(/\/$/, "") + "/" + imageUrl.replace(/^\//, "");
+  // Relative image paths belong to the image server, never the settings port.
+  const resolvedImageUrl = resolveDeviceImageUrl(imageUrl, selected);
   
   // Update UI previews / config links / info values
   const previewImg = document.getElementById("live-dashboard-preview");
-  const openPreviewBtn = document.getElementById("btn-open-preview");
-  const topBarPreviewBtn = document.getElementById("top-bar-preview-btn");
   const actionViewConfig = document.getElementById("action-view-config");
   
   if (previewImg) previewImg.src = resolvedImageUrl + `?t=${{new Date().getTime()}}`;
-  if (openPreviewBtn) openPreviewBtn.href = resolvedImageUrl;
-  if (topBarPreviewBtn) topBarPreviewBtn.href = resolvedImageUrl;
+  document.querySelectorAll('[data-preview-action="open"]').forEach(link => {{
+    link.href = resolvedImageUrl;
+  }});
   if (actionViewConfig) actionViewConfig.href = `/api/device/${{selected}}/config`;
   
   // Find registered card for selected device to copy details to Info list
@@ -2544,7 +2556,7 @@ function applySelectedDevice(deviceId) {{
   
   localStorage.setItem(selectedDeviceKey, selected);
   
-  if (typeof renderRemindersPreview === "function") {{
+  if (remindersPreviewReady) {{
     renderRemindersPreview();
   }}
   
@@ -2608,10 +2620,6 @@ window.addEventListener("hashchange",()=>{{
 }});
 
 // Device push hook
-const topBarPushBtn = document.getElementById("top-bar-push-btn");
-const overviewPushKindleBtn = document.getElementById("overview-push-kindle-btn");
-const hiddenPushKindle = document.getElementById("push-kindle");
-
 async function triggerSelectedDevicePush(button) {{
   const selected = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
   const origText = button.textContent;
@@ -2635,18 +2643,9 @@ async function triggerSelectedDevicePush(button) {{
   }}
 }}
 
-if (topBarPushBtn) {{
-  topBarPushBtn.addEventListener("click", () => triggerSelectedDevicePush(topBarPushBtn));
-}}
-if (overviewPushKindleBtn) {{
-  overviewPushKindleBtn.addEventListener("click", () => triggerSelectedDevicePush(overviewPushKindleBtn));
-}}
-if (hiddenPushKindle) {{
-  hiddenPushKindle.addEventListener("click", (e) => {{
-    e.preventDefault();
-    triggerSelectedDevicePush(hiddenPushKindle);
-  }});
-}}
+document.querySelectorAll('[data-settings-action="push"]').forEach(button => {{
+  button.addEventListener("click", () => triggerSelectedDevicePush(button));
+}});
 
 // Push to All Kindles action triggers
 const sidebarPushAllBtn = document.getElementById("sidebar-push-all-btn");
@@ -3556,6 +3555,7 @@ if (btnPushAllSpecial) {{
   }});
 }}
 
+remindersPreviewReady = true;
 fetchReminders();
 renderSpecialEvents();
 loadDeviceState();

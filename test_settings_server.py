@@ -1548,6 +1548,30 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn("Open BMP endpoint", text_ui)
         self.assertIn("Push is unsupported for this device type", text_ui)
 
+    def test_settings_image_server_port_and_url_resolution(self):
+        # 1. Test image_server_port default is reflected in the /settings page response
+        status, _, body = self.request("GET", "/settings")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        self.assertIn("const imageServerUrl = \"http://127.0.0.1:8765\";", text)
+        self.assertIn("http://127.0.0.1:8765/device/default-kindle/image.png", text)
+
+        # 2. Test environment variable IMAGE_SERVER_URL override
+        import os
+        old_env = os.environ.get("IMAGE_SERVER_URL")
+        try:
+            os.environ["IMAGE_SERVER_URL"] = "http://dashboard-images.local:9000"
+            status2, _, body2 = self.request("GET", "/settings")
+            self.assertEqual(status2, 200)
+            text2 = body2.decode("utf-8")
+            self.assertIn("const imageServerUrl = \"http://dashboard-images.local:9000\";", text2)
+            self.assertIn("http://dashboard-images.local:9000/device/default-kindle/image.png", text2)
+        finally:
+            if old_env is None:
+                os.environ.pop("IMAGE_SERVER_URL", None)
+            else:
+                os.environ["IMAGE_SERVER_URL"] = old_env
+
 
 class DeviceConfigEndpointTests(unittest.TestCase):
     def setUp(self):

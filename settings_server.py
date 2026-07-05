@@ -325,6 +325,7 @@ def render_settings(
     csrf_token,
     status_message="",
     devices=None,
+    image_server_url="http://localhost:8765",
 ):
     escaped = {key: html.escape(str(value), quote=True)
                for key, value in config.items()}
@@ -1777,7 +1778,7 @@ button:disabled {{
       </div>
       
       <div class="top-bar-right">
-        <a href="/device/default-kindle/image.png" target="_blank" id="top-bar-preview-btn" class="btn btn-outline">Preview</a>
+        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" id="top-bar-preview-btn" class="btn btn-outline">Preview</a>
         <button type="button" id="top-bar-push-btn" class="btn btn-primary">Push to Kindle</button>
         
         <!-- More Actions Dropdown -->
@@ -1863,9 +1864,9 @@ button:disabled {{
           <h3>Dashboard Preview</h3>
         </div>
         <div class="preview-container">
-          <img id="live-dashboard-preview" src="/device/default-kindle/image.png" alt="Dashboard PNG preview">
+          <img id="live-dashboard-preview" src="{image_server_url}/device/default-kindle/image.png" alt="Dashboard PNG preview">
         </div>
-        <a href="/device/default-kindle/image.png" target="_blank" class="btn btn-block" id="btn-open-preview">Open Full Preview</a>
+        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" class="btn btn-block" id="btn-open-preview">Open Full Preview</a>
       </div>
     </div>
     
@@ -2360,6 +2361,23 @@ button:disabled {{
 </div>
 </div>
 <script>
+const imageServerUrl = "{image_server_url}";
+const csrfToken = document.querySelector('[name="csrf_token"]').value;
+const deviceMessage = document.getElementById("device-message");
+const connectionValue = document.getElementById("kindle-connection");
+const brightnessValue = document.getElementById("kindle-brightness");
+const autostartValue = document.getElementById("kindle-autostart");
+const deviceLog = document.getElementById("device-log");
+
+async function deviceApi(path, options = {{}}) {{
+  const headers = {{ ... (options.headers || {{}}) }};
+  if ((options.method || "GET") !== "GET") headers["X-CSRF-Token"] = csrfToken;
+  const response = await fetch(path, {{ ...options, headers }});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Device request failed");
+  return data;
+}}
+
 const themeToggleButtons = document.querySelectorAll(".theme-toggle-btn");
 
 function applyTheme(themeVal) {{
@@ -2407,15 +2425,32 @@ const registeredDeviceCards=document.querySelectorAll("[data-device-id]");
 async function loadDeviceState() {{
   const selected = localStorage.getItem(selectedDeviceKey) || "default-kindle";
   
+  // Fetch config dynamically to get the relative image_url
+  let imageUrl = `/device/${{selected}}/image.png`;
+  try {{
+    const configResp = await fetch(`/api/device/${{selected}}/config`);
+    if (configResp.ok) {{
+      const configData = await configResp.json();
+      if (configData.image_url) {{
+        imageUrl = configData.image_url;
+      }}
+    }}
+  }} catch (e) {{
+    console.error("Failed to load device config:", e);
+  }}
+  
+  // Resolve against imageServerUrl
+  const resolvedImageUrl = imageServerUrl.replace(/\/$/, "") + "/" + imageUrl.replace(/^\//, "");
+  
   // Update UI previews / config links / info values
   const previewImg = document.getElementById("live-dashboard-preview");
   const openPreviewBtn = document.getElementById("btn-open-preview");
   const topBarPreviewBtn = document.getElementById("top-bar-preview-btn");
   const actionViewConfig = document.getElementById("action-view-config");
   
-  if (previewImg) previewImg.src = `/device/${{selected}}/image.png?t=${{new Date().getTime()}}`;
-  if (openPreviewBtn) openPreviewBtn.href = `/device/${{selected}}/image.png`;
-  if (topBarPreviewBtn) topBarPreviewBtn.href = `/device/${{selected}}/image.png`;
+  if (previewImg) previewImg.src = resolvedImageUrl + `?t=${{new Date().getTime()}}`;
+  if (openPreviewBtn) openPreviewBtn.href = resolvedImageUrl;
+  if (topBarPreviewBtn) topBarPreviewBtn.href = resolvedImageUrl;
   if (actionViewConfig) actionViewConfig.href = `/api/device/${{selected}}/config`;
   
   // Find registered card for selected device to copy details to Info list
@@ -3537,6 +3572,7 @@ def make_handler(
     restart_settings,
     geocode,
     registry,
+    image_server_port=8765,
 ):
     config_path = Path(config_path)
     csrf_token = secrets.token_urlsafe(32)
@@ -3689,11 +3725,25 @@ def make_handler(
                     devices = public_devices(registry, config_path)
                 except (RegistryValidationError, OSError, ValueError):
                     devices = []
+                # Construct the image server URL dynamically
+                host_header = self.headers.get("Host", f"localhost:{image_server_port}")
+                parts = host_header.split(":")
+                hostname = parts[0]
+                proto = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
+                image_server_url = f"{proto}://{hostname}:{image_server_port}"
+                
+                # Check for explicit IMAGE_SERVER_URL environment override
+                import os
+                env_url = os.environ.get("IMAGE_SERVER_URL")
+                if env_url:
+                    image_server_url = env_url
+
                 body = render_settings(
                     load_config(config_path),
                     csrf_token,
                     message,
                     devices=devices,
+                    image_server_url=image_server_url,
                 ).encode("utf-8")
                 self.send_bytes(200, body, "text/html; charset=utf-8")
                 return
@@ -4379,7 +4429,7 @@ def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
                 regenerate=regenerate_dashboard, device=None,
                 restart_settings=schedule_settings_restart,
                 geocode=geocode_locations, registry=None,
-                render_selected=None):
+                render_selected=None, image_server_port=8765):
     if device is None:
         device = KindleDevice()
     if registry is None:
@@ -4399,6 +4449,7 @@ def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
             restart_settings,
             geocode,
             registry,
+            image_server_port=image_server_port,
         ),
     )
 

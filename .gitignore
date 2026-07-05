@@ -18,13 +18,9 @@ dashboard_config.json.*
 *_backup_*.py
 *_old.py
 
-<<<<<<< HEAD
 # Runtime battery value written by serve_image.py
 battery.txt
 
-# Local data cache
-cache/
-=======
 # Logs / cache / generated files
 *.log
 cache/
@@ -39,7 +35,10 @@ authorized_keys
 
 # Generated dashboard output
 kindle_weather.png
->>>>>>> 607ac11 (Remove local config and backup files from repository)
+
+# Runtime multi-device registry, configs, and generated images
+devices.json
+devices/
 
 # Local run scripts with private env values
 run_dashboard.sh

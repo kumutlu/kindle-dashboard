@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
+import argparse
+import contextvars
 import fcntl
 import json
 import os
+import shutil
 import subprocess
+import sys
+import tempfile
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -11,12 +16,21 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from dashboard_themes import effective_visibility, validate_theme
+from device_registry import (
+    DeviceNotFoundError,
+    DeviceRegistry,
+    RegistryValidationError,
+)
 
 W, H = 758, 1024
 PROJECT_DIR = Path(__file__).resolve().parent
 OUT = PROJECT_DIR / "kindle_weather.png"
 CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 LOCK_PATH = PROJECT_DIR / ".dashboard-generation.lock"
+ACTIVE_OUTPUT = contextvars.ContextVar(
+    "dashboard_output",
+    default=None,
+)
 
 WTTR_BASE = "https://wttr.in"
 OPEN_METEO_GEOCODING = "https://geocoding-api.open-meteo.com/v1/search"
@@ -1193,8 +1207,33 @@ def build_layout(config):
     return layout
 
 
-def main():
-    generate_dashboard_safe()
+def main(argv=None, registry=None):
+    parser = argparse.ArgumentParser(
+        description="Generate a Kindle dashboard image",
+    )
+    parser.add_argument(
+        "--device",
+        help="render a registered device instead of the legacy dashboard",
+    )
+    args = parser.parse_args(argv)
+    try:
+        if args.device:
+            render_device(args.device, registry=registry)
+        else:
+            generate_dashboard_safe()
+    except (
+        DeviceNotFoundError,
+        RegistryValidationError,
+        ValueError,
+        OSError,
+    ):
+        print(
+            "Render failed: device is unavailable or configuration"
+            " is invalid",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
 
 
 def collect_dashboard_data(config):
@@ -1464,13 +1503,16 @@ def dashboard_fonts():
 
 def save_dashboard(img, data):
     img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
-    temporary_output = Path(f"{OUT}.tmp")
+    output_path = ACTIVE_OUTPUT.get() or Path(OUT)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_output = Path(f"{output_path}.tmp")
     try:
         img.save(temporary_output, format="PNG")
-        os.replace(temporary_output, OUT)
+        os.replace(temporary_output, output_path)
     finally:
         temporary_output.unlink(missing_ok=True)
-    print(f"Saved: {OUT}")
+    print(f"Saved: {output_path}")
     print(f"Pi-hole: {data['ph']}")
     print(
         f"Tailscale: online={data['ts']['online']}"
@@ -2551,13 +2593,7 @@ THEME_RENDERERS = {
 }
 
 
-def generate_dashboard():
-    config = load_config()
-    renderer = THEME_RENDERERS.get(config["theme"])
-    if renderer is None:
-        raise ValueError("theme renderer is not available")
-    renderer(config)
-    
+def _write_render_state(config, state_file):
     try:
         local_date = get_local_date(config)
         rendered_at = get_now().isoformat()
@@ -2568,13 +2604,109 @@ def generate_dashboard():
             "latitude": config.get("latitude"),
             "longitude": config.get("longitude"),
             "config_hash": compute_config_hash(config),
-            "rendered_at": rendered_at
+            "rendered_at": rendered_at,
         }
-        state_file = PROJECT_DIR / "cache" / "render_state.json"
+        state_file = Path(state_file)
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"Warning: Failed to save render state: {e}")
+        state_file.write_text(
+            json.dumps(state, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"Warning: Failed to save render state: {exc}")
+
+
+def render_dashboard(
+    config,
+    output_path,
+    resolution=(W, H),
+    state_file=None,
+):
+    resolution = tuple(resolution or (W, H))
+    if resolution != (W, H):
+        raise ValueError(
+            "existing dashboard themes currently require 758x1024"
+        )
+    renderer = THEME_RENDERERS.get(config["theme"])
+    if renderer is None:
+        raise ValueError("theme renderer is not available")
+    token = ACTIVE_OUTPUT.set(Path(output_path))
+    try:
+        renderer(config)
+    finally:
+        ACTIVE_OUTPUT.reset(token)
+    with Image.open(output_path) as generated:
+        if generated.size != resolution:
+            raise ValueError(
+                "generated image does not match device resolution"
+            )
+    if state_file is not None:
+        _write_render_state(config, state_file)
+    return Path(output_path)
+
+
+def _atomic_copy(source, destination):
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        shutil.copyfile(source, temporary_path)
+        os.replace(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def render_device(device_id, registry=None):
+    if registry is None:
+        registry = DeviceRegistry(PROJECT_DIR)
+    device = registry.get(device_id, require_enabled=True)
+    resolution = tuple(device.resolution or (W, H))
+    config_path = device.config_path
+    if (
+        device.id == "default-kindle"
+        and not config_path.exists()
+    ):
+        config_path = registry.legacy_config_path
+    config = load_config(config_path)
+    lock_path = device.image_path.with_name(".render.lock")
+    state_path = device.image_path.with_name("render_state.json")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        output_path = render_dashboard(
+            config,
+            device.image_path,
+            resolution=resolution,
+            state_file=state_path,
+        )
+        if device.id == "default-kindle":
+            _atomic_copy(
+                output_path,
+                registry.legacy_image_path,
+            )
+    return {
+        "device_id": device.id,
+        "output_path": output_path,
+        "resolution": list(resolution),
+        "theme": config["theme"],
+    }
+
+
+def generate_dashboard():
+    config = load_config()
+    return render_dashboard(
+        config,
+        Path(OUT),
+        resolution=(W, H),
+        state_file=PROJECT_DIR / "cache" / "render_state.json",
+    )
 
 
 def generate_dashboard_safe():
@@ -2584,4 +2716,4 @@ def generate_dashboard_safe():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

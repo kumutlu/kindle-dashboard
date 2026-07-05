@@ -415,6 +415,59 @@ class FamilyDashboardTests(unittest.TestCase):
         self.assertIn("Fortnightly Repeat", html_content)
         self.assertIn("Monthly Repeat", html_content)
 
+    def test_active_reminders_device_filtering(self):
+        notes = {
+            "items": [
+                {
+                    "id": "global-reminder",
+                    "enabled": True,
+                    "title": "Global note",
+                },
+                {
+                    "id": "empty-devices",
+                    "enabled": True,
+                    "title": "Empty list note",
+                    "devices": []
+                },
+                {
+                    "id": "default-only",
+                    "enabled": True,
+                    "title": "Default only note",
+                    "devices": ["default-kindle"]
+                },
+                {
+                    "id": "kitchen-only",
+                    "enabled": True,
+                    "title": "Kitchen only note",
+                    "devices": ["kitchen-kindle"]
+                }
+            ]
+        }
+
+        # 1. Render for default-kindle
+        active_default = weather_image.get_active_reminders(notes, "2026-07-04", device_id="default-kindle")
+        ids_default = [item["id"] for item in active_default]
+        self.assertIn("global-reminder", ids_default)
+        self.assertIn("empty-devices", ids_default)
+        self.assertIn("default-only", ids_default)
+        self.assertNotIn("kitchen-only", ids_default)
+
+        # 2. Render for kitchen-kindle
+        active_kitchen = weather_image.get_active_reminders(notes, "2026-07-04", device_id="kitchen-kindle")
+        ids_kitchen = [item["id"] for item in active_kitchen]
+        self.assertIn("global-reminder", ids_kitchen)
+        self.assertIn("empty-devices", ids_kitchen)
+        self.assertIn("kitchen-only", ids_kitchen)
+        self.assertNotIn("default-only", ids_kitchen)
+
+        # 3. Render legacy (None device_id defaults to default-kindle)
+        active_legacy = weather_image.get_active_reminders(notes, "2026-07-04", device_id=None)
+        ids_legacy = [item["id"] for item in active_legacy]
+        self.assertIn("global-reminder", ids_legacy)
+        self.assertIn("empty-devices", ids_legacy)
+        self.assertIn("default-only", ids_legacy)
+        self.assertNotIn("kitchen-only", ids_legacy)
+
 
 if __name__ == "__main__":
     unittest.main()

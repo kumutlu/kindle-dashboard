@@ -18,7 +18,23 @@ INTERVAL=1800              # seconds between updates (1800 = 30 min)
 WIFI_WAIT=8                # seconds to wait after enabling WiFi
 # ─────────────────────────────────────────────────────────────────
 
-IMG_URL="http://${PI_IP}:${PI_PORT}/weather.png"
+DASHBOARD_DIR="/mnt/us/dashboard"
+DEVICE_ID="default-kindle"
+DEVICE_ID_FILE="$DASHBOARD_DIR/device-id"
+
+if [ -s "$DEVICE_ID_FILE" ]; then
+    CANDIDATE=$(sed -n '1p' "$DEVICE_ID_FILE" | tr -d '\r\n')
+    case "$CANDIDATE" in
+        *[!a-zA-Z0-9_-]*|"") ;;
+        *) DEVICE_ID="$CANDIDATE" ;;
+    esac
+fi
+
+IMG_URL="http://${PI_IP}:${PI_PORT}/device/$DEVICE_ID/image.png"
+LEGACY_IMG_URL="http://${PI_IP}:${PI_PORT}/weather.png"
+CONFIG_URL="http://${PI_IP}:8767/api/device/$DEVICE_ID/config"
+LEGACY_CONFIG_URL="http://${PI_IP}:8767/api/config"
+
 TMP_IMG="/tmp/weather.png"
 LOG="/mnt/us/kindle_display.log"
 RTC="/sys/class/rtc/rtc1/wakealarm"
@@ -32,7 +48,7 @@ update_screen() {
     $LIPC com.lab126.wifid enable 1 2>/dev/null
     sleep "$WIFI_WAIT"
     rm -f "$TMP_IMG"
-    if wget -q -O "$TMP_IMG" "$IMG_URL"; then
+    if wget -q -O "$TMP_IMG" "$IMG_URL" || wget -q -O "$TMP_IMG" "$LEGACY_IMG_URL"; then
         log "Downloaded"
         $LIPC com.lab126.wifid enable 0 2>/dev/null
         # Clear, let e-ink settle
@@ -87,7 +103,10 @@ log "=== Daemon started (PID=$$) ==="
 sleep 90
 
 # Fetch and apply saved brightness before dashboard display starts
-CONFIG_JSON=$(wget -q -O- "http://${PI_IP}:8767/api/config")
+CONFIG_JSON=$(wget -q -O- "$CONFIG_URL" 2>/dev/null)
+if [ -z "$CONFIG_JSON" ]; then
+    CONFIG_JSON=$(wget -q -O- "$LEGACY_CONFIG_URL" 2>/dev/null)
+fi
 BRIGHTNESS=$(echo "$CONFIG_JSON" | grep -o '"kindle_frontlight":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
 if [ -n "$BRIGHTNESS" ]; then
     log "Reapplying persistent front light level: $BRIGHTNESS"
@@ -103,7 +122,10 @@ while true; do
     update_screen
     
     # Query configuration for the next sleep interval (fallback to 10 mins if error/missing)
-    CONFIG_JSON=$(wget -q -O- "http://${PI_IP}:8767/api/config")
+    CONFIG_JSON=$(wget -q -O- "$CONFIG_URL" 2>/dev/null)
+    if [ -z "$CONFIG_JSON" ]; then
+        CONFIG_JSON=$(wget -q -O- "$LEGACY_CONFIG_URL" 2>/dev/null)
+    fi
     REFRESH_MINS=$(echo "$CONFIG_JSON" | grep -o '"refresh_interval_minutes":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
     if [ -n "$REFRESH_MINS" ]; then
         INTERVAL=$((REFRESH_MINS * 60))

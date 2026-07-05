@@ -3,6 +3,7 @@ import hmac
 import html
 import json
 import os
+import re
 import secrets
 import subprocess
 import tempfile
@@ -12,11 +13,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
 from dashboard_themes import THEMES
+from device_registry import (
+    DeviceNotFoundError,
+    DeviceRegistry,
+    RegistryValidationError,
+)
 from kindle_device import DeviceError, KindleDevice
 from weather_image import (
     DEFAULT_CONFIG,
     geocode_locations,
     load_config,
+    render_device,
     validate_config,
 )
 
@@ -27,6 +34,58 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
+DEVICE_CONFIG_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/config$"
+)
+
+
+def public_device_config(device, config):
+    payload = {
+        "device_id": device.id,
+        "name": device.name,
+        "type": device.type,
+        "resolution": list(device.resolution),
+        "enabled": device.enabled,
+    }
+    if "theme" in config:
+        payload["theme"] = config["theme"]
+    if "refresh_interval_minutes" in config:
+        payload["refresh_interval_minutes"] = config["refresh_interval_minutes"]
+    if "deep_sleep_minutes" in config:
+        payload["deep_sleep_minutes"] = config["deep_sleep_minutes"]
+    
+    payload["image_url"] = f"/device/{device.id}/image.png"
+    if device.type == "esp32_epaper":
+        payload["bmp_url"] = f"/device/{device.id}/image.bmp"
+    elif device.type == "kindle_pw1":
+        if "kindle_frontlight" in config:
+            payload["kindle_frontlight"] = config["kindle_frontlight"]
+    return payload
+
+
+def public_devices(registry, legacy_config_path):
+    devices = []
+    for device in registry.load():
+        selected_config_path = (
+            Path(legacy_config_path)
+            if device.id == "default-kindle"
+            else device.config_path
+        )
+        config = load_config(selected_config_path)
+        value = {
+            "id": device.id,
+            "name": device.name,
+            "type": device.type,
+            "enabled": device.enabled,
+            "resolution": list(device.resolution),
+            "theme": config.get("theme") or "",
+            "image_url": f"/device/{device.id}/image.png",
+            "config_url": f"/api/device/{device.id}/config",
+        }
+        if device.connection is not None:
+            value["connection"] = dict(device.connection)
+        devices.append(value)
+    return devices
 
 
 def load_daily_notes():
@@ -166,6 +225,70 @@ def update_config(config_path, candidate, regenerate):
     return validated
 
 
+def update_device_config(
+    registry,
+    device_id,
+    legacy_config_path,
+    candidate,
+    render_selected,
+):
+    try:
+        device = registry.get(device_id, require_enabled=True)
+    except DeviceNotFoundError as exc:
+        raise ValueError("selected device is unavailable") from exc
+
+    target_path = device.config_path
+    legacy_config_path = Path(legacy_config_path)
+    target_existed = target_path.exists()
+    target_before = (
+        target_path.read_bytes() if target_existed else None
+    )
+    legacy_existed = legacy_config_path.exists()
+    legacy_before = (
+        legacy_config_path.read_bytes() if legacy_existed else None
+    )
+    current_path = target_path
+    if (
+        device.id == "default-kindle"
+        and not current_path.exists()
+    ):
+        current_path = legacy_config_path
+    current = load_config(current_path)
+    candidate = dict(candidate)
+    for field in (
+        "kindle_frontlight",
+        "prayer_method",
+        "prayer_school",
+        "prayer_high_latitude",
+        "hijri_adjustment",
+        "refresh_interval_minutes",
+    ):
+        if field not in candidate and field in current:
+            candidate[field] = current[field]
+
+    validated = validate_config(candidate)
+    atomic_write_config(target_path, validated)
+    if device.id == "default-kindle":
+        atomic_write_config(legacy_config_path, validated)
+    try:
+        render_selected(device.id)
+    except Exception:
+        if target_existed:
+            atomic_write_bytes(target_path, target_before)
+        else:
+            target_path.unlink(missing_ok=True)
+        if device.id == "default-kindle":
+            if legacy_existed:
+                atomic_write_bytes(
+                    legacy_config_path,
+                    legacy_before,
+                )
+            else:
+                legacy_config_path.unlink(missing_ok=True)
+        raise
+    return validated
+
+
 def get_prayer_cache_status(config):
     try:
         import hashlib
@@ -197,7 +320,12 @@ def get_prayer_cache_status(config):
     return "Not cached / Pending fetch", "Never"
 
 
-def render_settings(config, csrf_token, status_message=""):
+def render_settings(
+    config,
+    csrf_token,
+    status_message="",
+    devices=None,
+):
     escaped = {key: html.escape(str(value), quote=True)
                for key, value in config.items()}
     latitude_value = (
@@ -246,6 +374,97 @@ def render_settings(config, csrf_token, status_message=""):
         )
     )
     saved_brightness = str(config.get("kindle_frontlight", 8))
+    if devices is None:
+        devices = [{
+            "id": "default-kindle",
+            "name": "Default Kindle",
+            "type": "kindle_pw1",
+            "enabled": True,
+            "resolution": [758, 1024],
+            "theme": config["theme"],
+            "image_url": "/device/default-kindle/image.png",
+            "config_url": "/api/device/default-kindle/config",
+        }]
+    device_options = "".join(
+        f'<option value="{html.escape(device["id"], quote=True)}">'
+        f'{html.escape(device["name"])}'
+        f' ({html.escape(device["id"])})</option>'
+        for device in devices
+    )
+    device_cards = []
+    for listed_device in devices:
+        connection = listed_device.get("connection") or {}
+        connection_items = []
+        for key in ("host", "user", "ssh_profile", "port", "method"):
+            if key in connection:
+                connection_items.append(
+                    f"<span><strong>{html.escape(key)}:</strong> "
+                    f"{html.escape(str(connection[key]))}</span>"
+                )
+        connection_html = (
+            '<div class="device-connection">'
+            + "".join(connection_items)
+            + "</div>"
+            if connection_items
+            else '<p class="device-unconfigured">Connection not configured</p>'
+        )
+        width, height = listed_device["resolution"]
+        enabled_label = (
+            "Enabled" if listed_device["enabled"] else "Disabled"
+        )
+        
+        links = []
+        links.append(
+            f'<a href="{html.escape(listed_device["image_url"], quote=True)}" '
+            'target="_blank" rel="noopener">Open PNG preview</a>'
+        )
+        
+        esp_warning = ""
+        if listed_device["type"] == "esp32_epaper":
+            bmp_url = f'/device/{listed_device["id"]}/image.bmp'
+            links.append(
+                f'<a href="{html.escape(bmp_url, quote=True)}" '
+                'target="_blank" rel="noopener">Open BMP endpoint</a>'
+            )
+            esp_warning = (
+                '<div style="margin-top: 10px; padding: 8px 12px; background: var(--danger-soft, #fff5f5); border: 1px solid var(--line, #fed7d7); color: var(--danger, #c53030); border-radius: 6px; font-size: 0.8rem; font-weight: 600; display: flex; align-items: center; gap: 6px;">'
+                '<span style="font-size: 1.1rem; line-height: 1;">⚠️</span> Push is unsupported for this device type'
+                '</div>'
+            )
+            
+        links.append(
+            f'<a href="{html.escape(listed_device["config_url"], quote=True)}" '
+            'target="_blank" rel="noopener">Open config endpoint</a>'
+        )
+        
+        links_html = '<div class="device-links">' + "".join(links) + '</div>'
+        
+        device_cards.append(
+            '<article class="registered-device" '
+            f'data-device-id="{html.escape(listed_device["id"], quote=True)}">'
+            '<div class="registered-device-heading">'
+            f'<h3>{html.escape(listed_device["name"])}</h3>'
+            f'<span class="device-enabled">{enabled_label}</span>'
+            "</div>"
+            '<dl class="device-details">'
+            f'<div><dt>ID</dt><dd>{html.escape(listed_device["id"])}</dd></div>'
+            f'<div><dt>Type</dt><dd>{html.escape(listed_device["type"])}</dd></div>'
+            f"<div><dt>Resolution</dt><dd>{width}×{height}</dd></div>"
+            f'<div><dt>Theme</dt><dd>{html.escape(listed_device["theme"])}</dd></div>'
+            "</dl>"
+            + connection_html
+            + esp_warning
+            + links_html
+            + "</article>"
+        )
+    devices_html = (
+        "".join(device_cards)
+        if device_cards
+        else (
+            '<p class="device-registry-unavailable">'
+            "Device registry is currently unavailable.</p>"
+        )
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -388,6 +607,23 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 .stat-item strong{{display:block;font-size:1.05rem;font-weight:700}}
 .match{{margin:-4px 0 14px;padding:11px 12px;border-radius:12px;background:var(--soft);color:var(--muted);font-size:0.9rem;border:1px solid var(--line)}}
 
+/* Registered Devices */
+.registered-devices{{display:grid;grid-template-columns:1fr;gap:14px;margin-top:18px}}
+.registered-device{{padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);transition:border-color .2s ease,background .2s ease}}
+.registered-device.selected{{border:2px solid var(--accent);padding:15px;background:var(--soft)}}
+.registered-device-heading{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}}
+.registered-device-heading h3{{margin:0;font-size:1.05rem}}
+.device-enabled{{padding:4px 8px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted);font-size:.75rem;font-weight:700}}
+.device-details{{display:grid;gap:7px;margin:0}}
+.device-details div{{display:flex;justify-content:space-between;gap:14px}}
+.device-details dt{{color:var(--muted);font-size:.86rem}}
+.device-details dd{{margin:0;text-align:right;font-size:.86rem;font-weight:700;overflow-wrap:anywhere}}
+.device-connection{{display:flex;flex-wrap:wrap;gap:7px 12px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line);color:var(--muted);font-size:.8rem}}
+.device-unconfigured,.device-registry-unavailable{{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--soft);color:var(--muted)}}
+.device-links{{display:grid;grid-template-columns:1fr;gap:8px;margin-top:14px}}
+.device-links a{{display:flex;align-items:center;justify-content:center;min-height:44px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;color:var(--ink);text-decoration:none;font-size:.86rem;font-weight:650}}
+.device-links a:hover{{border-color:var(--button-hover-border);background:var(--button-hover)}}
+
 /* City Results */
 .city-results{{display:grid;gap:8px;margin:0 0 14px}}
 .city-result{{display:grid;gap:3px;width:100%;min-height:58px;text-align:left;padding:10px 12px;border-color:var(--line)}}
@@ -432,6 +668,8 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 
 /* Action Bar */
 .action-bar{{position:fixed;z-index:100;left:0;right:0;bottom:0;display:grid;grid-template-columns:1.35fr 1fr;gap:12px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:var(--action-bar-bg);border-top:1px solid var(--line);box-shadow:0 -8px 30px rgba(0, 0, 0, 0.08);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}
+.editing-device{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;text-align:center}}
+.editing-device strong{{color:var(--ink)}}
 .action-bar button{{margin:0;width:100%}}
 .action-bar button[type=submit],.overview-actions button[type=submit]{{background:var(--ink);color:var(--card);border-color:var(--ink)}}
 .action-bar button[type=submit]:hover:not(:disabled),.overview-actions button[type=submit]:hover:not(:disabled){{background:var(--primary-hover);border-color:var(--primary-hover)}}
@@ -449,6 +687,8 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   .overview-stats{{grid-template-columns:repeat(3,1fr)}}
   .toggle-list{{grid-template-columns:1fr 1fr}}
   .city-results{{grid-template-columns:1fr 1fr}}
+  .registered-devices{{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  .device-links{{grid-template-columns:1fr 1fr}}
   .action-bar{{left:50%;right:auto;bottom:24px;width:min(600px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:10px;box-shadow:0 8px 30px rgba(0,0,0,0.12)}}
 }}
 </style>
@@ -470,6 +710,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 
 <nav class="tabs-nav" aria-label="Dashboard sections">
   <button type="button" class="tab-btn active" data-tab="overview">Overview</button>
+  <button type="button" class="tab-btn" data-tab="devices">Devices</button>
   <button type="button" class="tab-btn" data-tab="location">Location</button>
   <button type="button" class="tab-btn" data-tab="theme">Theme</button>
   <button type="button" class="tab-btn" data-tab="display">Display</button>
@@ -481,6 +722,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 
 <form method="post" action="/settings">
 <input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">
+<input type="hidden" name="selected_device_id" id="selected-device-id" value="default-kindle">
 
 <!-- TAB CONTENTS -->
 
@@ -516,7 +758,20 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   </div>
 </section>
 
-<!-- 2. Location Tab -->
+<!-- 2. Devices Tab -->
+<section class="card tab-content" id="devices">
+  <h2>Devices</h2>
+  <p class="section-note">View registered displays and choose the active device for this browser. Settings still save to Default Kindle during this checkpoint.</p>
+  <label class="field">
+    <span>Selected device</span>
+    <select id="selected-device">{device_options}</select>
+  </label>
+  <div class="registered-devices" id="registered-devices">
+    {devices_html}
+  </div>
+</section>
+
+<!-- 3. Location Tab -->
 <section class="card tab-content" id="location">
   <h2>Location</h2>
   <p class="section-note">Search for a city, then select the correct result.</p>
@@ -743,6 +998,18 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
       <span style="display: block; font-size: 0.75rem; color: var(--muted); margin-top: 4px;">Reminder will automatically hide after this date.</span>
     </label>
 
+    <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 18px; background: var(--soft);">
+      <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Show on devices</span>
+      <div style="display: grid; gap: 8px;">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+          <input type="checkbox" id="note-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> All Devices
+        </label>
+        <div id="note-individual-devices" style="display: none; grid-gap: 8px; padding-left: 20px; border-left: 2px solid var(--line); margin-top: 4px;">
+          <!-- Dynamically populated checkboxes -->
+        </div>
+      </div>
+    </div>
+
     <div class="button-grid" style="margin-top: 20px;">
       <button type="button" id="btn-save-note" style="background: var(--ink); color: var(--card); border-color: var(--ink);">Save Reminder</button>
       <button type="button" id="btn-cancel-note">Cancel</button>
@@ -802,6 +1069,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   <a href="#status">Status</a>
 </nav>
 <div class="action-bar">
+  <p class="editing-device">Editing device: <strong id="editing-device-name">Default Kindle</strong></p>
   <button type="submit">Save &amp; Regenerate</button>
   <button type="button" id="push-kindle">Push to Kindle</button>
 </div>
@@ -846,6 +1114,47 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e =
 }});
 
 applyTheme(localStorage.getItem("kindle_dashboard_ui_theme") || "system");
+
+const selectedDeviceKey="kindle_dashboard_selected_device";
+const selectedDeviceControl=document.getElementById("selected-device");
+const selectedDeviceField=document.getElementById("selected-device-id");
+const editingDeviceName=document.getElementById("editing-device-name");
+const registeredDeviceCards=document.querySelectorAll("[data-device-id]");
+function applySelectedDevice(deviceId){{
+  if(!selectedDeviceControl) return;
+  const available=Array.from(selectedDeviceControl.options).map(option=>option.value);
+  const selected=available.includes(deviceId)
+    ?deviceId
+    :(available.includes("default-kindle")?"default-kindle":available[0]);
+  if(!selected) return;
+  selectedDeviceControl.value=selected;
+  if(selectedDeviceField) selectedDeviceField.value=selected;
+  const selectedOption=selectedDeviceControl.options[
+    selectedDeviceControl.selectedIndex
+  ];
+  if(editingDeviceName && selectedOption){{
+    editingDeviceName.textContent=selectedOption.textContent
+      .replace(` (${{selected}})`,"");
+  }}
+  registeredDeviceCards.forEach(card=>{{
+    const active=card.dataset.deviceId===selected;
+    card.classList.toggle("selected",active);
+    if(active) card.setAttribute("aria-current","true");
+    else card.removeAttribute("aria-current");
+  }});
+  localStorage.setItem(selectedDeviceKey,selected);
+  if (typeof renderRemindersPreview === "function") {{
+    renderRemindersPreview();
+  }}
+}}
+if(selectedDeviceControl){{
+  selectedDeviceControl.addEventListener("change",()=>{{
+    applySelectedDevice(selectedDeviceControl.value);
+  }});
+  applySelectedDevice(
+    localStorage.getItem(selectedDeviceKey)||"default-kindle"
+  );
+}}
 
 const tabBtns=document.querySelectorAll(".tab-btn");
 const tabContents=document.querySelectorAll(".tab-content");
@@ -1085,12 +1394,55 @@ const noteStartDateInput = document.getElementById("note-start-date");
 const noteAnchorDateInput = document.getElementById("note-anchor-date");
 const noteDayOfMonthInput = document.getElementById("note-day-of-month");
 const noteExpiresInput = document.getElementById("note-expires");
+const noteDeviceAllCb = document.getElementById("note-device-all");
+const noteIndividualDevicesBox = document.getElementById("note-individual-devices");
 
 const scheduleTypeRadios = document.querySelectorAll('input[name="schedule_type"]');
 const scheduleDateBox = document.getElementById("schedule-date-box");
 const scheduleWeeklyBox = document.getElementById("schedule-weekly-box");
 const scheduleFortnightlyBox = document.getElementById("schedule-fortnightly-box");
 const scheduleMonthlyBox = document.getElementById("schedule-monthly-box");
+
+if (noteDeviceAllCb) {{
+  noteDeviceAllCb.addEventListener("change", () => {{
+    if (noteDeviceAllCb.checked) {{
+      noteIndividualDevicesBox.style.display = "none";
+      document.querySelectorAll('input[name="note_device"]').forEach(cb => cb.checked = false);
+    }} else {{
+      noteIndividualDevicesBox.style.display = "grid";
+    }}
+  }});
+}}
+
+let allDevicesList = [];
+async function initNoteFormDevices() {{
+  try {{
+    const response = await fetch("/api/devices", {{ cache: "no-store" }});
+    const data = await response.json();
+    allDevicesList = data.devices || [];
+    
+    if (noteIndividualDevicesBox) {{
+      noteIndividualDevicesBox.innerHTML = "";
+      allDevicesList.forEach(dev => {{
+        const lbl = document.createElement("label");
+        lbl.style.cssText = "display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 600;";
+        
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.name = "note_device";
+        cb.value = dev.id;
+        cb.style.cssText = "width: 18px; height: 18px; accent-color: var(--ink); margin: 0;";
+        
+        lbl.append(cb);
+        lbl.append(document.createTextNode(" " + dev.name + " (" + dev.id + ")"));
+        noteIndividualDevicesBox.append(lbl);
+      }});
+    }}
+  }} catch (e) {{
+    console.error("Failed to load device list for note form:", e);
+  }}
+}}
+initNoteFormDevices();
 
 function updateScheduleVisibility() {{
   const selectedType = document.querySelector('input[name="schedule_type"]:checked').value;
@@ -1221,8 +1573,15 @@ function renderRemindersPreview() {{
   const currentDate = String(now.getDate()).padStart(2, '0');
   const currentDateStr = `${{currentYear}}-${{currentMonth}}-${{currentDate}}`;
   
+  const selectedDevice = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
   const activeItems = remindersCache.filter(item => {{
     if (item.enabled === false) return false;
+
+    if (item.devices && item.devices.length > 0) {{
+      if (!item.devices.includes(selectedDevice)) {{
+        return false;
+      }}
+    }}
     
     if (item.start_date && currentDateStr < item.start_date) {{
       return false;
@@ -1356,6 +1715,13 @@ function resetNoteForm() {{
   noteAnchorDateInput.value = "";
   noteDayOfMonthInput.value = "";
   noteExpiresInput.value = "";
+  if (noteDeviceAllCb) {{
+    noteDeviceAllCb.checked = true;
+  }}
+  if (noteIndividualDevicesBox) {{
+    noteIndividualDevicesBox.style.display = "none";
+  }}
+  document.querySelectorAll('input[name="note_device"]').forEach(cb => cb.checked = false);
   
   document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
   document.querySelectorAll('input[name="weekly_days"]').forEach(cb => cb.checked = false);
@@ -1414,6 +1780,20 @@ function editReminderForm(item) {{
     }}
   }} else {{
     document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
+  }}
+  
+  if (item.devices && item.devices.length > 0) {{
+    if (noteDeviceAllCb) noteDeviceAllCb.checked = false;
+    if (noteIndividualDevicesBox) noteIndividualDevicesBox.style.display = "grid";
+    document.querySelectorAll('input[name="note_device"]').forEach(cb => {{
+      cb.checked = item.devices.includes(cb.value);
+    }});
+  }} else {{
+    if (noteDeviceAllCb) noteDeviceAllCb.checked = true;
+    if (noteIndividualDevicesBox) noteIndividualDevicesBox.style.display = "none";
+    document.querySelectorAll('input[name="note_device"]').forEach(cb => {{
+      cb.checked = false;
+    }});
   }}
   
   updateScheduleVisibility();
@@ -1481,6 +1861,17 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
     }};
   }}
   
+  let devices = null;
+  if (noteDeviceAllCb && !noteDeviceAllCb.checked) {{
+    const selectedDevices = [];
+    document.querySelectorAll('input[name="note_device"]:checked').forEach(cb => {{
+      selectedDevices.push(cb.value);
+    }});
+    if (selectedDevices.length > 0) {{
+      devices = selectedDevices;
+    }}
+  }}
+
   const body = {{
     id: noteIdInput.value || null,
     enabled: true,
@@ -1491,7 +1882,8 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
     start_date: noteStartDateInput.value || null,
     date: date,
     recurrence: recurrence,
-    expires_after_date: noteExpiresInput.value || null
+    expires_after_date: noteExpiresInput.value || null,
+    devices: devices
   }};
   
   try {{
@@ -1515,7 +1907,15 @@ loadDeviceState();
 </html>"""
 
 
-def make_handler(config_path, regenerate, device, restart_settings, geocode):
+def make_handler(
+    config_path,
+    regenerate,
+    render_selected,
+    device,
+    restart_settings,
+    geocode,
+    registry,
+):
     config_path = Path(config_path)
     csrf_token = secrets.token_urlsafe(32)
     update_lock = threading.Lock()
@@ -1572,6 +1972,43 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
             if parsed.path == "/api/config":
                 self.send_json(200, load_config(config_path))
                 return
+            if parsed.path == "/api/devices":
+                try:
+                    devices = public_devices(registry, config_path)
+                except (RegistryValidationError, OSError, ValueError):
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "error": "Device registry is unavailable",
+                        },
+                    )
+                    return
+                self.send_json(200, {"devices": devices})
+                return
+            device_config_match = DEVICE_CONFIG_RE.fullmatch(parsed.path)
+            if device_config_match is not None:
+                try:
+                    selected = registry.get(
+                        device_config_match.group(1),
+                        require_enabled=True,
+                    )
+                except DeviceNotFoundError:
+                    self.send_bytes(404, b"", "text/plain")
+                    return
+                selected_config_path = (
+                    config_path
+                    if selected.id == "default-kindle"
+                    else selected.config_path
+                )
+                self.send_json(
+                    200,
+                    public_device_config(
+                        selected,
+                        load_config(selected_config_path),
+                    ),
+                )
+                return
             if parsed.path == "/api/notes":
                 self.send_json(200, load_daily_notes())
                 return
@@ -1606,6 +2043,10 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                         },
                     )
                 return
+            device_control_get_match = re.match(
+                r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(status|light|log)$",
+                parsed.path,
+            )
             if parsed.path in (
                 "/api/device/status",
                 "/api/device/light",
@@ -1613,13 +2054,21 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
             ):
                 self.handle_device_get(parsed.path)
                 return
+            elif device_control_get_match is not None:
+                self.handle_device_get(parsed.path, device_id=device_control_get_match.group(1))
+                return
             if parsed.path == "/settings":
                 query = parse_qs(parsed.query)
                 message = query.get("status", [""])[0]
+                try:
+                    devices = public_devices(registry, config_path)
+                except (RegistryValidationError, OSError, ValueError):
+                    devices = []
                 body = render_settings(
                     load_config(config_path),
                     csrf_token,
                     message,
+                    devices=devices,
                 ).encode("utf-8")
                 self.send_bytes(200, body, "text/html; charset=utf-8")
                 return
@@ -1659,10 +2108,17 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                     "/api/device/push",
                     "/api/device/restart",
                 }
-                if parsed.path not in known_paths:
-                    self.send_bytes(404, b"", "text/plain")
+                if parsed.path in known_paths:
+                    self.handle_device_post(parsed.path)
                     return
-                self.handle_device_post(parsed.path)
+                device_control_post_match = re.match(
+                    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(light|push|restart|start-dashboard|home|refresh|autostart/enable|autostart/disable)$",
+                    parsed.path,
+                )
+                if device_control_post_match is not None:
+                    self.handle_device_post(parsed.path, device_id=device_control_post_match.group(1))
+                    return
+                self.send_bytes(404, b"", "text/plain")
                 return
             self.send_bytes(404, b"", "text/plain")
 
@@ -1784,6 +2240,28 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                             self.send_json(400, {"ok": False, "error": "Monthly day of month must be between 1 and 31"})
                             return
                     
+                devices = candidate.get("devices")
+                if devices is not None:
+                    if not isinstance(devices, list):
+                        self.send_json(400, {"ok": False, "error": "Devices must be a JSON array of device IDs"})
+                        return
+                    for dev_id in devices:
+                        if not isinstance(dev_id, str):
+                            self.send_json(400, {"ok": False, "error": "Device ID must be a string"})
+                            return
+                        import re
+                        if not re.match(r"^[a-zA-Z0-9_-]+$", dev_id):
+                            self.send_json(400, {"ok": False, "error": f"Invalid device ID format: {dev_id}"})
+                            return
+                        if registry is not None:
+                            try:
+                                registry.get(dev_id)
+                            except DeviceNotFoundError:
+                                self.send_json(400, {"ok": False, "error": f"Unknown device ID: {dev_id}"})
+                                return
+                            except Exception:
+                                pass
+
                 notes = load_daily_notes()
                 items = notes.setdefault("items", [])
                 
@@ -1792,7 +2270,7 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                     found = False
                     for item in items:
                         if item.get("id") == item_id:
-                            item.update({
+                            update_dict = {
                                 "enabled": bool(candidate.get("enabled", True)),
                                 "category": category,
                                 "title": title,
@@ -1802,7 +2280,13 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                                 "date": candidate.get("date") or None,
                                 "recurrence": candidate.get("recurrence") or None,
                                 "expires_after_date": candidate.get("expires_after_date") or None,
-                            })
+                            }
+                            devs = candidate.get("devices")
+                            if devs:
+                                update_dict["devices"] = devs
+                            elif "devices" in item:
+                                del item["devices"]
+                            item.update(update_dict)
                             found = True
                             break
                     if not found:
@@ -1811,7 +2295,7 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 else:
                     import uuid
                     item_id = str(uuid.uuid4())
-                    items.append({
+                    new_item = {
                         "id": item_id,
                         "enabled": bool(candidate.get("enabled", True)),
                         "category": category,
@@ -1822,7 +2306,11 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                         "date": candidate.get("date") or None,
                         "recurrence": candidate.get("recurrence") or None,
                         "expires_after_date": candidate.get("expires_after_date") or None,
-                    })
+                    }
+                    devs = candidate.get("devices")
+                    if devs:
+                        new_item["devices"] = devs
+                    items.append(new_item)
                     
                 save_daily_notes(notes)
                 try:
@@ -1896,53 +2384,116 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": str(e)})
 
-        def handle_device_get(self, path):
+        def handle_device_get(self, path, device_id=None):
+            if device_id is None:
+                device_id = "default-kindle"
             try:
-                if path == "/api/device/status":
-                    payload = device.get_status()
-                elif path == "/api/device/light":
+                selected = registry.get(device_id)
+                if selected.type != "kindle_pw1":
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "unsupported device type"},
+                    )
+                    return
+                if path.endswith("/status"):
+                    payload = device.get_status(
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
+                elif path.endswith("/light"):
                     payload = {
                         "connected": True,
-                        "brightness": device.get_light(),
+                        "brightness": device.get_light(
+                            connection=selected.connection,
+                            device_id=selected.id,
+                            device_type=selected.type,
+                        ),
                     }
                 else:
                     payload = {
                         "connected": True,
-                        "log": device.get_log(),
+                        "log": device.get_log(
+                            connection=selected.connection,
+                            device_id=selected.id,
+                            device_type=selected.type,
+                        ),
                     }
                 self.send_json(200, payload)
-            except DeviceError:
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except DeviceError as exc:
                 self.send_json(
                     503,
-                    {"ok": False, "error": "Kindle is unavailable"},
+                    {"ok": False, "error": str(exc)},
                 )
-            except Exception:
+            except Exception as exc:
                 self.send_json(
                     500,
-                    {"ok": False, "error": "Device status failed"},
+                    {"ok": False, "error": str(exc)},
                 )
 
-        def handle_device_post(self, path):
+        def handle_device_post(self, path, device_id=None):
             if not self.device_csrf_valid():
                 self.send_json(
                     403,
                     {"ok": False, "error": "invalid request token"},
                 )
                 return
-            action_paths = {
-                "/api/device/start-dashboard": "start",
-                "/api/device/home": "home",
-                "/api/device/refresh": "refresh",
-                "/api/device/autostart/enable": "autostart_enable",
-                "/api/device/autostart/disable": "autostart_disable",
-            }
+            if device_id is None:
+                device_id = "default-kindle"
             try:
-                if path in action_paths:
-                    message = device.run_action(action_paths[path])
+                selected = registry.get(device_id)
+                action_suffix = path.split("/")[-1]
+                if "autostart" in path:
+                    action_suffix = "autostart/" + action_suffix
+
+                if selected.type == "esp32_epaper":
+                    if action_suffix == "push":
+                        self.send_json(
+                            400,
+                            {"ok": False, "error": "Push is not implemented for esp32_epaper devices"},
+                        )
+                        return
+                    else:
+                        self.send_json(
+                            400,
+                            {"ok": False, "error": "unsupported device type"},
+                        )
+                        return
+
+                if selected.type != "kindle_pw1":
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "unsupported device type"},
+                    )
+                    return
+                action_paths = {
+                    "start-dashboard": "start",
+                    "home": "home",
+                    "refresh": "refresh",
+                    "autostart/enable": "autostart_enable",
+                    "autostart/disable": "autostart_disable",
+                }
+                action_suffix = path.split("/")[-1]
+                if "autostart" in path:
+                    action_suffix = "autostart/" + action_suffix
+                if action_suffix in action_paths:
+                    message = device.run_action(
+                        action_paths[action_suffix],
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
                     payload = {"ok": True, "message": message}
-                elif path == "/api/device/push":
-                    payload = {"ok": True, "message": device.push()}
-                elif path == "/api/device/light":
+                elif action_suffix == "push":
+                    message = device.push(
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
+                    payload = {"ok": True, "message": message}
+                elif action_suffix == "light":
                     candidate = self.read_json()
                     level = candidate.get("level")
                     if level is None or isinstance(level, bool) or not isinstance(level, int) or level not in (0, 1, 4, 8, 12, 18):
@@ -1952,38 +2503,56 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                         )
                         return
                     try:
-                        current_config = load_config(config_path)
+                        selected_config_path = (
+                            config_path
+                            if selected.id == "default-kindle"
+                            else selected.config_path
+                        )
+                        current_config = load_config(selected_config_path)
                         current_config["kindle_frontlight"] = level
-                        atomic_write_config(config_path, current_config)
+                        atomic_write_config(selected_config_path, current_config)
                     except Exception as e:
                         print(f"Warning: Failed to save kindle_frontlight to config: {e}")
-                    brightness = device.set_light(level)
+                    brightness = device.set_light(
+                        level,
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
                     payload = {
                         "ok": True,
                         "message": f"Brightness set to {brightness}",
                         "brightness": brightness,
                     }
-                elif path == "/api/device/restart":
+                elif action_suffix == "restart":
                     candidate = self.read_json()
+                    message = device.restart(
+                        candidate.get("confirm"),
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
                     payload = {
                         "ok": True,
-                        "message": device.restart(candidate.get("confirm")),
+                        "message": message,
                     }
                 else:
                     self.send_bytes(404, b"", "text/plain")
                     return
                 self.send_json(200, payload)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
-            except DeviceError:
+            except DeviceError as exc:
                 self.send_json(
                     503,
-                    {"ok": False, "error": "Kindle command failed"},
+                    {"ok": False, "error": str(exc)},
                 )
-            except Exception:
+            except Exception as exc:
                 self.send_json(
                     500,
-                    {"ok": False, "error": "Device action failed"},
+                    {"ok": False, "error": str(exc)},
                 )
 
         def handle_api_post(self):
@@ -1992,9 +2561,40 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 return
             try:
                 candidate = json.loads(self.read_body().decode("utf-8"))
+                selected_device_id = "default-kindle"
+                if "config" in candidate or "selected_device_id" in candidate:
+                    if set(candidate) - {
+                        "config",
+                        "selected_device_id",
+                    }:
+                        raise ValueError(
+                            "unsupported settings request fields"
+                        )
+                    selected_device_id = candidate.get(
+                        "selected_device_id",
+                        "default-kindle",
+                    )
+                    candidate = candidate.get("config")
+                    if not isinstance(candidate, dict):
+                        raise ValueError(
+                            "config must be a JSON object"
+                        )
                 with update_lock:
-                    saved = update_config(config_path, candidate, regenerate)
-                self.send_json(200, {"ok": True, "config": saved})
+                    saved = update_device_config(
+                        registry,
+                        selected_device_id,
+                        config_path,
+                        candidate,
+                        render_selected,
+                    )
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "device_id": selected_device_id,
+                        "config": saved,
+                    },
+                )
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
             except Exception:
@@ -2010,6 +2610,19 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 if not hmac.compare_digest(supplied_csrf, csrf_token):
                     raise ValueError("invalid form token")
 
+                selected_device_id = form.get(
+                    "selected_device_id",
+                    ["default-kindle"],
+                )[0] or "default-kindle"
+                try:
+                    selected_device = registry.get(
+                        selected_device_id,
+                        require_enabled=True,
+                    )
+                except DeviceNotFoundError as exc:
+                    raise ValueError(
+                        "selected device is unavailable"
+                    ) from exc
                 submitted_theme = (
                     form.get("theme", [""])[0]
                     or form.get("selected_theme", [""])[0]
@@ -2017,7 +2630,12 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                 )
                 if not submitted_theme:
                     try:
-                        current_config = load_config(config_path)
+                        current_config_path = (
+                            config_path
+                            if selected_device.id == "default-kindle"
+                            else selected_device.config_path
+                        )
+                        current_config = load_config(current_config_path)
                         submitted_theme = current_config.get("theme", "home_dashboard")
                     except Exception:
                         submitted_theme = "home_dashboard"
@@ -2064,7 +2682,13 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
                         except Exception:
                             pass
                 with update_lock:
-                    update_config(config_path, candidate, regenerate)
+                    update_device_config(
+                        registry,
+                        selected_device_id,
+                        config_path,
+                        candidate,
+                        render_selected,
+                    )
                 self.redirect("/settings?status=saved")
             except ValueError as exc:
                 self.redirect(f"/settings?status={quote(str(exc))}")
@@ -2083,17 +2707,27 @@ def make_handler(config_path, regenerate, device, restart_settings, geocode):
 def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
                 regenerate=regenerate_dashboard, device=None,
                 restart_settings=schedule_settings_restart,
-                geocode=geocode_locations):
+                geocode=geocode_locations, registry=None,
+                render_selected=None):
     if device is None:
         device = KindleDevice()
+    if registry is None:
+        registry = DeviceRegistry(Path(config_path).resolve().parent)
+    if render_selected is None:
+        render_selected = lambda device_id: render_device(
+            device_id,
+            registry=registry,
+        )
     return ThreadingHTTPServer(
         (host, port),
         make_handler(
             config_path,
             regenerate,
+            render_selected,
             device,
             restart_settings,
             geocode,
+            registry,
         ),
     )
 

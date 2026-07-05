@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 import settings_server
 import weather_image
+from device_registry import DeviceRegistry
 
 
 class ConfigTests(unittest.TestCase):
@@ -114,6 +115,7 @@ class SettingsServerTests(unittest.TestCase):
             weather_image.DEFAULT_CONFIG,
         )
         self.regeneration_calls = 0
+        self.rendered_device_ids = []
         self.fail_regeneration = False
         self.device_calls = []
         self.settings_restart_calls = 0
@@ -130,48 +132,82 @@ class SettingsServerTests(unittest.TestCase):
         }]
 
         class FakeDevice:
-            def run_action(inner_self, action):
-                self.device_calls.append(("action", action))
+            def run_action(inner_self, action, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("action", action))
+                else:
+                    self.device_calls.append(("action", action, dev_id))
                 return f"{action} complete"
 
-            def push(inner_self):
-                self.device_calls.append(("push",))
+            def push(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("push",))
+                else:
+                    self.device_calls.append(("push", dev_id))
                 return "Dashboard generated and pushed"
 
-            def get_light(inner_self):
-                self.device_calls.append(("get_light",))
+            def get_light(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("get_light",))
+                else:
+                    self.device_calls.append(("get_light", dev_id))
                 return 8
 
-            def set_light(inner_self, level):
+            def set_light(inner_self, level, *args, **kwargs):
                 if isinstance(level, bool) or not isinstance(level, int):
                     raise ValueError("brightness must be an integer")
                 if level < 0 or level > 24:
                     raise ValueError("brightness must be between 0 and 24")
-                self.device_calls.append(("set_light", level))
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("set_light", level))
+                else:
+                    self.device_calls.append(("set_light", level, dev_id))
                 return level
 
-            def get_status(inner_self):
-                self.device_calls.append(("status",))
+            def get_status(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("status",))
+                else:
+                    self.device_calls.append(("status", dev_id))
                 return {
                     "connected": True,
                     "autostart": "enabled",
                     "brightness": 8,
                 }
 
-            def get_log(inner_self):
-                self.device_calls.append(("log",))
+            def get_log(inner_self, *args, **kwargs):
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("log",))
+                else:
+                    self.device_calls.append(("log", dev_id))
                 return "safe dashboard log"
 
-            def restart(inner_self, confirmation):
+            def restart(inner_self, confirmation, *args, **kwargs):
                 if confirmation != "RESTART":
                     raise ValueError("restart confirmation is required")
-                self.device_calls.append(("restart",))
+                dev_id = kwargs.get("device_id")
+                if dev_id == "default-kindle" or dev_id is None:
+                    self.device_calls.append(("restart",))
+                else:
+                    self.device_calls.append(("restart", dev_id))
                 return "Kindle restart requested"
 
         self.device = FakeDevice()
 
         def regenerate():
             self.regeneration_calls += 1
+            if self.fail_regeneration:
+                raise RuntimeError("controlled regeneration failure")
+
+        def render_selected(device_id):
+            self.regeneration_calls += 1
+            self.rendered_device_ids.append(device_id)
             if self.fail_regeneration:
                 raise RuntimeError("controlled regeneration failure")
 
@@ -184,14 +220,17 @@ class SettingsServerTests(unittest.TestCase):
                 raise RuntimeError("controlled geocoding failure")
             return self.geocode_results
 
+        self.registry = DeviceRegistry(Path(self.tempdir.name))
         self.server = settings_server.make_server(
             host="127.0.0.1",
             port=0,
             config_path=self.config_path,
             regenerate=regenerate,
+            render_selected=render_selected,
             device=self.device,
             restart_settings=restart_settings,
             geocode=geocode,
+            registry=self.registry,
         )
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -445,6 +484,17 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIsNone(saved["latitude"])
         self.assertEqual(saved["theme"], "home_dashboard")
         self.assertEqual(self.regeneration_calls, 1)
+        self.assertEqual(
+            self.rendered_device_ids,
+            ["default-kindle"],
+        )
+        device_config_path = self.registry.get(
+            "default-kindle"
+        ).config_path
+        self.assertEqual(
+            json.loads(device_config_path.read_text(encoding="utf-8")),
+            saved,
+        )
 
     def test_settings_form_saves_registered_themes_and_regenerates(self):
         for theme in (
@@ -456,6 +506,7 @@ class SettingsServerTests(unittest.TestCase):
                 csrf = self.csrf_token()
                 form = {
                     "csrf_token": csrf,
+                    "selected_device_id": "default-kindle",
                     "title": "NOTTINGHAM HOME",
                     "location": "Nottingham",
                     "country": "United Kingdom",
@@ -500,6 +551,10 @@ class SettingsServerTests(unittest.TestCase):
                     self.regeneration_calls,
                     calls_before + 1,
                 )
+                self.assertEqual(
+                    self.rendered_device_ids[-1],
+                    "default-kindle",
+                )
                 self.assertEqual(saved["kindle_frontlight"], 8)
                 self.assertEqual(saved["refresh_interval_minutes"], 30)
                 self.assertEqual(saved["prayer_method"], 13)
@@ -543,6 +598,161 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn("unsupported%20theme", headers["Location"])
         self.assertEqual(self.config_path.read_bytes(), before)
         self.assertEqual(self.regeneration_calls, 0)
+
+    def test_selected_device_form_save_updates_only_selected_device(self):
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+        })
+        legacy_before = self.config_path.read_bytes()
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "selected_device_id": "kitchen-kindle",
+            "title": "KITCHEN DASHBOARD",
+            "location": "London",
+            "country": "United Kingdom",
+            "latitude": "51.5072",
+            "longitude": "-0.1276",
+            "location_display": "London, England, United Kingdom",
+            "location_label": "London, UK",
+            "weather_query": "London",
+            "timezone": "Europe/London",
+            "theme": "compact_dashboard",
+            "show_weather": "on",
+            "show_forecast": "on",
+            "refresh_interval_minutes": "30",
+        }
+
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+
+        self.assertEqual(status, 303)
+        self.assertIn("saved", headers["Location"])
+        saved = json.loads(
+            kitchen.config_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["theme"], "compact_dashboard")
+        self.assertEqual(saved["weather_query"], "London")
+        self.assertEqual(saved["refresh_interval_minutes"], 30)
+        self.assertEqual(
+            self.rendered_device_ids[-1],
+            "kitchen-kindle",
+        )
+        self.assertEqual(self.config_path.read_bytes(), legacy_before)
+
+    def test_invalid_selected_device_is_rejected_without_writes(self):
+        before = self.config_path.read_bytes()
+        csrf = self.csrf_token()
+        base_form = {
+            "csrf_token": csrf,
+            "title": "DO NOT SAVE",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "home_dashboard",
+        }
+        for invalid in ("missing", "../escape", "UPPERCASE"):
+            with self.subTest(device_id=invalid):
+                form = dict(
+                    base_form,
+                    selected_device_id=invalid,
+                )
+                status, headers, body = self.request(
+                    "POST",
+                    "/settings",
+                    body=urlencode(form),
+                    headers={
+                        "Content-Type":
+                            "application/x-www-form-urlencoded",
+                    },
+                )
+                self.assertEqual(status, 303, body)
+                self.assertIn(
+                    "selected%20device%20is%20unavailable",
+                    headers["Location"],
+                )
+                self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertEqual(self.rendered_device_ids, [])
+
+    def test_disabled_selected_device_is_rejected(self):
+        self.registry.get("default-kindle")
+        registry_path = Path(self.tempdir.name) / "devices.json"
+        stored = json.loads(registry_path.read_text(encoding="utf-8"))
+        stored["devices"][0]["enabled"] = False
+        self.registry.write_registry(stored)
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "selected_device_id": "default-kindle",
+            "title": "DO NOT SAVE",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "home_dashboard",
+        }
+
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+
+        self.assertEqual(status, 303)
+        self.assertIn(
+            "selected%20device%20is%20unavailable",
+            headers["Location"],
+        )
+        self.assertEqual(self.rendered_device_ids, [])
+
+    def test_selected_device_api_envelope_updates_and_renders(self):
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "minimal_weather"
+        status, _, body = self.request(
+            "POST",
+            "/api/config",
+            body=json.dumps({
+                "selected_device_id": "default-kindle",
+                "config": config,
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            json.loads(body)["device_id"],
+            "default-kindle",
+        )
+        self.assertEqual(
+            self.rendered_device_ids,
+            ["default-kindle"],
+        )
+
+    def test_selected_device_ui_has_hidden_field_and_indicator(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+
+        self.assertIn('name="selected_device_id"', text)
+        self.assertIn('id="selected-device-id"', text)
+        self.assertIn(
+            'id="editing-device-name">Default Kindle',
+            text,
+        )
+        self.assertIn("Editing device:", text)
 
     def test_daily_notes_fields_do_not_block_main_settings_form(self):
         _, _, body = self.request("GET", "/settings")
@@ -769,7 +979,16 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
 
         # Tab button checks
-        for tab in ("overview", "location", "theme", "display", "device", "maintenance", "status"):
+        for tab in (
+            "overview",
+            "devices",
+            "location",
+            "theme",
+            "display",
+            "device",
+            "maintenance",
+            "status",
+        ):
             self.assertIn(f'data-tab="{tab}"', text)
 
         # Confirm tabs structure has active class/content
@@ -1064,6 +1283,493 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn('data-theme-val="system"', text)
         self.assertIn('[data-theme="dark"]', text)
         self.assertIn('kindle_dashboard_ui_theme', text)
+
+    def test_push_named_device_renders_and_refreshes(self):
+        # Add a named Kindle PW1 device
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.150",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            }
+        })
+        
+        csrf = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/device/kitchen-kindle/push",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("push", [call[0] for call in self.device_calls])
+        # Find the push call for kitchen-kindle
+        push_calls = [call for call in self.device_calls if call[0] == "push"]
+        self.assertEqual(push_calls[-1], ("push", "kitchen-kindle"))
+
+    def test_push_non_kindle_is_rejected(self):
+        # Add a generic PNG display
+        panel = self.registry.add({
+            "id": "living-panel",
+            "name": "Living Panel",
+            "type": "generic_png",
+            "resolution": [800, 600],
+            "enabled": True,
+            "config_path": "devices/living-panel/config.json",
+            "image_path": "devices/living-panel/image.png",
+        })
+        
+        csrf = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/device/living-panel/push",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("unsupported device type", json.loads(body.decode("utf-8"))["error"])
+
+    def test_device_qualified_get_status(self):
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.150",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            }
+        })
+        status, _, body = self.request("GET", "/api/device/kitchen-kindle/status")
+        self.assertEqual(status, 200)
+        status_calls = [call for call in self.device_calls if call[0] == "status"]
+        self.assertEqual(status_calls[-1], ("status", "kitchen-kindle"))
+
+    def test_notes_save_with_devices(self):
+        # Override path to temp dir
+        test_notes_path = Path(self.tempdir.name) / "daily_notes.json"
+        settings_server.DAILY_NOTES_PATH = test_notes_path
+        if test_notes_path.exists():
+            test_notes_path.unlink()
+
+        csrf = self.csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+        }
+
+        # Add kitchen-kindle
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+        })
+
+        # 1. Add note targeting kitchen-kindle
+        payload = {
+            "title": "Kitchen note",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["kitchen-kindle"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        note_id = res["id"]
+
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(notes["items"]), 1)
+        self.assertEqual(notes["items"][0]["devices"], ["kitchen-kindle"])
+
+        # 2. Edit note to target both default-kindle and kitchen-kindle
+        payload_edit = {
+            "id": note_id,
+            "title": "Kitchen note updated",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["default-kindle", "kitchen-kindle"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_edit),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertEqual(notes["items"][0]["devices"], ["default-kindle", "kitchen-kindle"])
+
+        # 3. Edit note to clear devices (make it global)
+        payload_clear = {
+            "id": note_id,
+            "title": "Kitchen note updated",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": []
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_clear),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertNotIn("devices", notes["items"][0])
+
+    def test_notes_save_validation_for_devices(self):
+        csrf = self.csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+        }
+
+        # 1. Unknown device ID rejected
+        payload = {
+            "title": "Unknown device note",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["ghost-kindle"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload),
+            headers=headers
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Unknown device ID: ghost-kindle", json.loads(body.decode("utf-8"))["error"])
+
+        # 2. Invalid device ID format (traversal) rejected
+        payload_bad = {
+            "title": "Bad traversal note",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["../../x"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_bad),
+            headers=headers
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid device ID format: ../../x", json.loads(body.decode("utf-8"))["error"])
+
+    def test_settings_html_includes_show_on_devices_controls(self):
+        status, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("Show on devices", text)
+        self.assertIn('id="note-device-all"', text)
+        self.assertIn('id="note-individual-devices"', text)
+
+    def test_api_devices_still_safe(self):
+        status, _, body = self.request("GET", "/api/devices")
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        self.assertIn("devices", res)
+        # Verify default-kindle is present
+        dev_ids = [d["id"] for d in res["devices"]]
+        self.assertIn("default-kindle", dev_ids)
+
+    def test_esp32_device_config_and_push_rejection(self):
+        self.registry.add({
+            "id": "office-esp32",
+            "name": "Office ESP32",
+            "type": "esp32_epaper",
+            "enabled": True,
+            "resolution": [800, 480],
+            "config_path": "devices/office-esp32/config.json",
+            "image_path": "devices/office-esp32/image.png",
+            "connection": {
+                "method": "http",
+                "host": "192.168.68.200",
+                "port": 80
+            }
+        })
+
+        status, _, body = self.request("GET", "/api/device/office-esp32/config")
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        self.assertEqual(res["device_id"], "office-esp32")
+        self.assertEqual(res["type"], "esp32_epaper")
+        self.assertEqual(res["bmp_url"], "/device/office-esp32/image.bmp")
+        self.assertEqual(res["image_url"], "/device/office-esp32/image.png")
+        self.assertIn("theme", res)
+        self.assertNotIn("connection", res)
+        self.assertNotIn("host", res)
+        self.assertNotIn("method", res)
+
+        csrf = self.csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/device/office-esp32/push",
+            headers=headers
+        )
+        self.assertEqual(status, 400)
+        res_push = json.loads(body.decode("utf-8"))
+        self.assertFalse(res_push["ok"])
+        self.assertEqual(res_push["error"], "Push is not implemented for esp32_epaper devices")
+
+        status_ui, _, body_ui = self.request("GET", "/settings")
+        self.assertEqual(status_ui, 200)
+        text_ui = body_ui.decode("utf-8")
+        self.assertIn("Office ESP32", text_ui)
+        self.assertIn("esp32_epaper", text_ui)
+        self.assertIn("800×480", text_ui)
+        self.assertIn("Open BMP endpoint", text_ui)
+        self.assertIn("Push is unsupported for this device type", text_ui)
+
+
+class DeviceConfigEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.config_path = self.root / "dashboard_config.json"
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "theme": "family_dashboard",
+            "refresh_interval_minutes": 30,
+            "kindle_frontlight": 12,
+        })
+        settings_server.atomic_write_config(self.config_path, config)
+        (self.root / "kindle_weather.png").write_bytes(
+            b"\x89PNG\r\n\x1a\nconfig-endpoint-test"
+        )
+        self.registry = DeviceRegistry(self.root)
+        self.registry.get("default-kindle")
+        self.rendered_device_ids = []
+        self.server = settings_server.make_server(
+            host="127.0.0.1",
+            port=0,
+            config_path=self.config_path,
+            regenerate=lambda: None,
+            render_selected=self.rendered_device_ids.append,
+            device=mock.MagicMock(),
+            restart_settings=lambda: None,
+            geocode=lambda query: [],
+            registry=self.registry,
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.tempdir.cleanup()
+
+    def request(self, path):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        connection.close()
+        return status, body
+
+    def test_default_device_config_returns_safe_allowlisted_json(self):
+        status, body = self.request(
+            "/api/device/default-kindle/config"
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            set(payload),
+            {
+                "device_id",
+                "name",
+                "type",
+                "resolution",
+                "theme",
+                "refresh_interval_minutes",
+                "kindle_frontlight",
+                "image_url",
+                "enabled",
+            },
+        )
+        self.assertEqual(payload["device_id"], "default-kindle")
+        self.assertEqual(payload["type"], "kindle_pw1")
+        self.assertEqual(payload["resolution"], [758, 1024])
+        self.assertEqual(payload["theme"], "family_dashboard")
+        self.assertEqual(payload["refresh_interval_minutes"], 30)
+        self.assertEqual(payload["kindle_frontlight"], 12)
+        self.assertEqual(
+            payload["image_url"],
+            "/device/default-kindle/image.png",
+        )
+
+        serialized = body.decode("utf-8").lower()
+        for forbidden in (
+            "key_path",
+            "known_hosts",
+            "password",
+            "token",
+            "private_key",
+            "/home/user/.ssh",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_invalid_unknown_and_traversal_device_config_is_404(self):
+        for path in (
+            "/api/device/missing/config",
+            "/api/device/../config",
+            "/api/device/%2e%2e/config",
+            "/api/device/default-kindle/../../dashboard_config.json",
+            "/api/device/UPPERCASE/config",
+        ):
+            with self.subTest(path=path):
+                status, body = self.request(path)
+                self.assertEqual(status, 404)
+                self.assertNotIn(
+                    str(self.root).encode("utf-8"),
+                    body,
+                )
+
+    def test_devices_api_returns_safe_allowlisted_registry_data(self):
+        status, body = self.request("/api/devices")
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(set(payload), {"devices"})
+        self.assertEqual(len(payload["devices"]), 1)
+        device = payload["devices"][0]
+        self.assertEqual(
+            set(device),
+            {
+                "id",
+                "name",
+                "type",
+                "enabled",
+                "resolution",
+                "theme",
+                "image_url",
+                "config_url",
+                "connection",
+            },
+        )
+        self.assertEqual(device["id"], "default-kindle")
+        self.assertEqual(device["theme"], "family_dashboard")
+        self.assertEqual(
+            device["image_url"],
+            "/device/default-kindle/image.png",
+        )
+        self.assertEqual(
+            device["config_url"],
+            "/api/device/default-kindle/config",
+        )
+        self.assertEqual(
+            set(device["connection"]),
+            {"host", "user", "ssh_profile", "port"},
+        )
+
+        serialized = body.decode("utf-8").lower()
+        for forbidden in (
+            "key_path",
+            "known_hosts",
+            "password",
+            "token",
+            "private_key",
+            "/home/user/.ssh",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_devices_api_handles_invalid_registry_without_path_leak(self):
+        (self.root / "devices.json").write_text(
+            '{"devices":[{"id":"../escape"}]}',
+            encoding="utf-8",
+        )
+
+        status, body = self.request("/api/devices")
+
+        self.assertEqual(status, 503)
+        payload = json.loads(body)
+        self.assertEqual(
+            payload,
+            {
+                "ok": False,
+                "error": "Device registry is unavailable",
+            },
+        )
+        self.assertNotIn(
+            str(self.root).encode("utf-8"),
+            body,
+        )
+
+    def test_settings_devices_tab_lists_and_selects_default_device(self):
+        status, body = self.request("/settings")
+        text = body.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        self.assertIn('data-tab="devices">Devices</button>', text)
+        self.assertIn('class="card tab-content" id="devices"', text)
+        self.assertIn('id="selected-device"', text)
+        self.assertIn('value="default-kindle"', text)
+        self.assertIn('data-device-id="default-kindle"', text)
+        self.assertIn("Default Kindle", text)
+        self.assertIn("kindle_pw1", text)
+        self.assertIn("758×1024", text)
+        self.assertIn("/device/default-kindle/image.png", text)
+        self.assertIn(
+            "/api/device/default-kindle/config",
+            text,
+        )
+        self.assertIn(
+            "kindle_dashboard_selected_device",
+            text,
+        )
+        self.assertNotIn("/home/user/.ssh", text)
+        self.assertNotIn("known_hosts", text)
+
+    def test_settings_page_survives_invalid_device_registry(self):
+        (self.root / "devices.json").write_text(
+            '{"devices":"invalid"}',
+            encoding="utf-8",
+        )
+
+        status, body = self.request("/settings")
+
+        self.assertEqual(status, 200)
+        self.assertIn(
+            "Device registry is currently unavailable.",
+            body.decode("utf-8"),
+        )
 
 
 if __name__ == "__main__":

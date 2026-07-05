@@ -24,6 +24,16 @@ SSH_BASE = [
     KINDLE_HOST,
 ]
 
+SSH_PROFILES = {
+    "kindle_dashboard": {
+        "key_path": Path("/home/user/.ssh/kindle_dashboard_ed25519"),
+        "known_hosts": Path(
+            "/home/user/.ssh/kindle_dashboard_known_hosts"
+        ),
+        "options": ("-o", "StrictHostKeyChecking=yes"),
+    },
+}
+
 ACTION_COMMANDS = {
     "start": (
         "/mnt/us/dashboard/start-dashboard.sh --manual",
@@ -61,10 +71,17 @@ STATUS_GET = (
 )
 
 
-def get_saved_brightness():
+def get_saved_brightness(device_id="default-kindle"):
     try:
         import json
-        config_file = Path(__file__).resolve().parent / "dashboard_config.json"
+        from device_registry import DeviceRegistry
+        registry = DeviceRegistry(Path(__file__).resolve().parent)
+        device = registry.get(device_id)
+        config_file = (
+            Path(__file__).resolve().parent / "dashboard_config.json"
+            if device_id == "default-kindle"
+            else device.config_path
+        )
         if config_file.exists():
             raw = json.loads(config_file.read_text(encoding="utf-8"))
             val = raw.get("kindle_frontlight", 8)
@@ -80,6 +97,48 @@ class DeviceError(RuntimeError):
 
 
 class KindleDevice:
+    def __init__(self, connection=None):
+        self.connection = connection
+
+    def _get_ssh_base(self, connection, device_id=None):
+        if connection is None:
+            if device_id == "default-kindle" or device_id is None:
+                return SSH_BASE
+            raise DeviceError("Push not configured for this device")
+
+        profile_name = connection.get("ssh_profile")
+        if not profile_name or profile_name not in SSH_PROFILES:
+            raise DeviceError("invalid or missing SSH profile")
+
+        profile = SSH_PROFILES[profile_name]
+        host = connection.get("host")
+        user = connection.get("user")
+        port = connection.get("port")
+
+        if not host or not user:
+            raise DeviceError("missing host or user in connection")
+
+        ssh_args = [
+            "/usr/bin/ssh",
+            "-i", str(profile["key_path"]),
+            "-o", f"UserKnownHostsFile={profile['known_hosts']}",
+        ]
+        for opt in profile.get("options", ()):
+            ssh_args.append(opt)
+
+        ssh_args.extend([
+            "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=5",
+            "-o", "ConnectionAttempts=1",
+            "-o", "LogLevel=ERROR",
+        ])
+        if port is not None:
+            ssh_args.extend(["-p", str(port)])
+
+        ssh_args.append(f"{user}@{host}")
+        return ssh_args
+
     def _run(self, args, timeout, cwd=None):
         try:
             result = subprocess.run(
@@ -98,51 +157,67 @@ class KindleDevice:
             raise DeviceError("Kindle command failed")
         return result.stdout
 
-    def _run_remote(self, command, timeout=10):
-        return self._run(SSH_BASE + [command], timeout)
+    def _run_remote(self, command, ssh_base, timeout=10):
+        return self._run(ssh_base + [command], timeout)
 
-    def run_action(self, action):
+    def run_action(self, action, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
         definition = ACTION_COMMANDS.get(action)
         if definition is None:
             raise ValueError("unsupported device action")
         command, message, timeout = definition
-        self._run_remote(command, timeout)
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+        self._run_remote(command, ssh_base, timeout)
         if action in ("start", "refresh"):
             try:
-                self.set_light(get_saved_brightness())
+                self.set_light(get_saved_brightness(device_id), connection=conn, device_id=device_id, device_type=device_type)
             except Exception as e:
                 print(f"Warning: Failed to reapply brightness on {action}: {e}")
         return message
 
-    def push(self):
-        self._run(
-            [str(RUN_DASHBOARD)],
-            timeout=180,
-            cwd=PROJECT_DIR,
-        )
-        self._run_remote(
-            ACTION_COMMANDS["refresh"][0],
-            ACTION_COMMANDS["refresh"][2],
-        )
+    def push(self, connection=None, device_id="default-kindle", device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+
+        from weather_image import render_device
+        from device_registry import DeviceRegistry
+        registry = DeviceRegistry(PROJECT_DIR)
+        render_device(device_id, force=True, registry=registry)
+
+        refresh_cmd, _, timeout = ACTION_COMMANDS["refresh"]
+        self._run_remote(refresh_cmd, ssh_base, timeout)
         try:
-            self.set_light(get_saved_brightness())
+            self.set_light(get_saved_brightness(device_id), connection=conn, device_id=device_id, device_type=device_type)
         except Exception as e:
             print(f"Warning: Failed to reapply brightness on push: {e}")
         return "Dashboard generated and pushed"
 
-    def set_light(self, level):
+    def set_light(self, level, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
         if isinstance(level, bool) or not isinstance(level, int):
             raise ValueError("brightness must be an integer")
         if level < 0 or level > 24:
             raise ValueError("brightness must be between 0 and 24")
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
         self._run_remote(
             f"lipc-set-prop com.lab126.powerd flIntensity {level}",
+            ssh_base,
             10,
         )
-        return self.get_light()
+        return self.get_light(connection=conn, device_id=device_id, device_type=device_type)
 
-    def get_light(self):
-        output = self._run_remote(LIGHT_GET, 10)
+    def get_light(self, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+        output = self._run_remote(LIGHT_GET, ssh_base, 10)
         values = [
             int(line.strip())
             for line in output.splitlines()
@@ -152,8 +227,12 @@ class KindleDevice:
             raise DeviceError("Kindle returned an invalid brightness value")
         return values[-1]
 
-    def get_status(self):
-        output = self._run_remote(STATUS_GET, 10)
+    def get_status(self, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+        output = self._run_remote(STATUS_GET, ssh_base, 10)
         autostart = "unknown"
         brightness = None
         for line in output.splitlines():
@@ -170,12 +249,20 @@ class KindleDevice:
             "brightness": brightness,
         }
 
-    def get_log(self):
-        output = self._run_remote(LOG_GET, 10)
+    def get_log(self, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+        output = self._run_remote(LOG_GET, ssh_base, 10)
         return output.replace("\x00", "")[-32768:]
 
-    def restart(self, confirmation):
+    def restart(self, confirmation, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
         if confirmation != "RESTART":
             raise ValueError("restart confirmation is required")
-        self._run_remote("reboot", 15)
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+        self._run_remote("reboot", ssh_base, 15)
         return "Kindle restart requested"

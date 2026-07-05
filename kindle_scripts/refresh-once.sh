@@ -1,11 +1,30 @@
 #!/bin/sh
 
-LOCAL_URL="http://192.168.68.167:8765/weather.png"
+# Legacy Fallbacks
+LEGACY_LOCAL_URL="http://192.168.68.167:8765/weather.png"
+LEGACY_CONFIG_URL="http://192.168.68.167:8767/api/config"
+
+SERVER_HOST="192.168.68.167"
+DEVICE_ID="default-kindle"
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+DEVICE_ID_FILE="$DASHBOARD_DIR/device-id"
+
+if [ -s "$DEVICE_ID_FILE" ]; then
+	CANDIDATE=$(sed -n '1p' "$DEVICE_ID_FILE" | tr -d '\r\n')
+	case "$CANDIDATE" in
+		*[!a-zA-Z0-9_-]*|"") ;;
+		*) DEVICE_ID="$CANDIDATE" ;;
+	esac
+fi
+
+LOCAL_URL="http://$SERVER_HOST:8765/device/$DEVICE_ID/image.png"
 PUBLIC_URL="https://user-zbox-ci320nano-series.taildabdfd.ts.net/weather.png"
-CONFIG_URL="http://192.168.68.167:8767/api/config"
-TOKEN_FILE="/mnt/us/dashboard/public-token"
-IMG="/mnt/us/dashboard/weather.png"
-TMP="/mnt/us/dashboard/weather.once.$$"
+CONFIG_URL="http://$SERVER_HOST:8767/api/device/$DEVICE_ID/config"
+# TODO: Support device-qualified public endpoints when implemented on public server
+
+TOKEN_FILE="$DASHBOARD_DIR/public-token"
+IMG="$DASHBOARD_DIR/weather.png"
+TMP="$DASHBOARD_DIR/weather.once.$$"
 LOCK_FILE="/tmp/kindle-refresh.lock"
 
 # Detect if a native timeout command is available
@@ -70,6 +89,9 @@ else
 fi
 
 CONFIG_JSON=$(timeout_cmd 5 wget -q -O- "$CONFIG_URL")
+if [ -z "$CONFIG_JSON" ]; then
+	CONFIG_JSON=$(timeout_cmd 5 wget -q -O- "$LEGACY_CONFIG_URL")
+fi
 
 LIGHT=$(echo "$CONFIG_JSON" | grep -o '"kindle_frontlight":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
 if [ -n "$LIGHT" ] && { [ "$LIGHT" -eq 0 ] || [ "$LIGHT" -eq 1 ] || [ "$LIGHT" -eq 4 ] || [ "$LIGHT" -eq 8 ] || [ "$LIGHT" -eq 12 ] || [ "$LIGHT" -eq 18 ]; }; then
@@ -86,6 +108,8 @@ SOURCE=""
 rm -f "$TMP"
 
 if timeout_cmd 20 wget -q -O "$TMP" "$LOCAL_URL" && [ -s "$TMP" ]; then
+	SOURCE="local"
+elif timeout_cmd 20 wget -q -O "$TMP" "$LEGACY_LOCAL_URL" && [ -s "$TMP" ]; then
 	SOURCE="local"
 else
 	rm -f "$TMP"

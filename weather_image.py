@@ -2277,7 +2277,9 @@ def load_daily_notes():
         return {"items": []}
 
 
-def get_active_reminders(notes_data, local_date_str):
+def get_active_reminders(notes_data, local_date_str, device_id=None):
+    if device_id is None:
+        device_id = "default-kindle"
     try:
         dt = datetime.strptime(local_date_str, "%Y-%m-%d").date()
     except Exception:
@@ -2291,6 +2293,11 @@ def get_active_reminders(notes_data, local_date_str):
     for item in items:
         if not item.get("enabled", True):
             continue
+            
+        devices = item.get("devices")
+        if isinstance(devices, list) and len(devices) > 0:
+            if device_id not in devices:
+                continue
             
         start_date = item.get("start_date")
         if start_date:
@@ -2517,7 +2524,11 @@ def render_family_dashboard(config):
     
     notes_data = load_daily_notes()
     local_date_str = get_local_date(config)
-    active_reminders = get_active_reminders(notes_data, local_date_str)
+    active_reminders = get_active_reminders(
+        notes_data,
+        local_date_str,
+        device_id=config.get("device_id"),
+    )
     
     notes_box_top = y
     notes_box_bottom = 940
@@ -2675,6 +2686,7 @@ def render_device(device_id, force=False, registry=None):
     ):
         config_path = registry.legacy_config_path
     config = load_config(config_path)
+    config["device_id"] = device.id
     lock_path = device.image_path.with_name(".render.lock")
     state_path = device.image_path.with_name("render_state.json")
     lock_path.parent.mkdir(parents=True, exist_ok=True)

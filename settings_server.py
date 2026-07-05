@@ -968,6 +968,18 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
       <span style="display: block; font-size: 0.75rem; color: var(--muted); margin-top: 4px;">Reminder will automatically hide after this date.</span>
     </label>
 
+    <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 18px; background: var(--soft);">
+      <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Show on devices</span>
+      <div style="display: grid; gap: 8px;">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;">
+          <input type="checkbox" id="note-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> All Devices
+        </label>
+        <div id="note-individual-devices" style="display: none; grid-gap: 8px; padding-left: 20px; border-left: 2px solid var(--line); margin-top: 4px;">
+          <!-- Dynamically populated checkboxes -->
+        </div>
+      </div>
+    </div>
+
     <div class="button-grid" style="margin-top: 20px;">
       <button type="button" id="btn-save-note" style="background: var(--ink); color: var(--card); border-color: var(--ink);">Save Reminder</button>
       <button type="button" id="btn-cancel-note">Cancel</button>
@@ -1101,6 +1113,9 @@ function applySelectedDevice(deviceId){{
     else card.removeAttribute("aria-current");
   }});
   localStorage.setItem(selectedDeviceKey,selected);
+  if (typeof renderRemindersPreview === "function") {{
+    renderRemindersPreview();
+  }}
 }}
 if(selectedDeviceControl){{
   selectedDeviceControl.addEventListener("change",()=>{{
@@ -1349,12 +1364,55 @@ const noteStartDateInput = document.getElementById("note-start-date");
 const noteAnchorDateInput = document.getElementById("note-anchor-date");
 const noteDayOfMonthInput = document.getElementById("note-day-of-month");
 const noteExpiresInput = document.getElementById("note-expires");
+const noteDeviceAllCb = document.getElementById("note-device-all");
+const noteIndividualDevicesBox = document.getElementById("note-individual-devices");
 
 const scheduleTypeRadios = document.querySelectorAll('input[name="schedule_type"]');
 const scheduleDateBox = document.getElementById("schedule-date-box");
 const scheduleWeeklyBox = document.getElementById("schedule-weekly-box");
 const scheduleFortnightlyBox = document.getElementById("schedule-fortnightly-box");
 const scheduleMonthlyBox = document.getElementById("schedule-monthly-box");
+
+if (noteDeviceAllCb) {{
+  noteDeviceAllCb.addEventListener("change", () => {{
+    if (noteDeviceAllCb.checked) {{
+      noteIndividualDevicesBox.style.display = "none";
+      document.querySelectorAll('input[name="note_device"]').forEach(cb => cb.checked = false);
+    }} else {{
+      noteIndividualDevicesBox.style.display = "grid";
+    }}
+  }});
+}}
+
+let allDevicesList = [];
+async function initNoteFormDevices() {{
+  try {{
+    const response = await fetch("/api/devices", {{ cache: "no-store" }});
+    const data = await response.json();
+    allDevicesList = data.devices || [];
+    
+    if (noteIndividualDevicesBox) {{
+      noteIndividualDevicesBox.innerHTML = "";
+      allDevicesList.forEach(dev => {{
+        const lbl = document.createElement("label");
+        lbl.style.cssText = "display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 600;";
+        
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.name = "note_device";
+        cb.value = dev.id;
+        cb.style.cssText = "width: 18px; height: 18px; accent-color: var(--ink); margin: 0;";
+        
+        lbl.append(cb);
+        lbl.append(document.createTextNode(" " + dev.name + " (" + dev.id + ")"));
+        noteIndividualDevicesBox.append(lbl);
+      }});
+    }}
+  }} catch (e) {{
+    console.error("Failed to load device list for note form:", e);
+  }}
+}}
+initNoteFormDevices();
 
 function updateScheduleVisibility() {{
   const selectedType = document.querySelector('input[name="schedule_type"]:checked').value;
@@ -1485,8 +1543,15 @@ function renderRemindersPreview() {{
   const currentDate = String(now.getDate()).padStart(2, '0');
   const currentDateStr = `${{currentYear}}-${{currentMonth}}-${{currentDate}}`;
   
+  const selectedDevice = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
   const activeItems = remindersCache.filter(item => {{
     if (item.enabled === false) return false;
+
+    if (item.devices && item.devices.length > 0) {{
+      if (!item.devices.includes(selectedDevice)) {{
+        return false;
+      }}
+    }}
     
     if (item.start_date && currentDateStr < item.start_date) {{
       return false;
@@ -1620,6 +1685,13 @@ function resetNoteForm() {{
   noteAnchorDateInput.value = "";
   noteDayOfMonthInput.value = "";
   noteExpiresInput.value = "";
+  if (noteDeviceAllCb) {{
+    noteDeviceAllCb.checked = true;
+  }}
+  if (noteIndividualDevicesBox) {{
+    noteIndividualDevicesBox.style.display = "none";
+  }}
+  document.querySelectorAll('input[name="note_device"]').forEach(cb => cb.checked = false);
   
   document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
   document.querySelectorAll('input[name="weekly_days"]').forEach(cb => cb.checked = false);
@@ -1678,6 +1750,20 @@ function editReminderForm(item) {{
     }}
   }} else {{
     document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
+  }}
+  
+  if (item.devices && item.devices.length > 0) {{
+    if (noteDeviceAllCb) noteDeviceAllCb.checked = false;
+    if (noteIndividualDevicesBox) noteIndividualDevicesBox.style.display = "grid";
+    document.querySelectorAll('input[name="note_device"]').forEach(cb => {{
+      cb.checked = item.devices.includes(cb.value);
+    }});
+  }} else {{
+    if (noteDeviceAllCb) noteDeviceAllCb.checked = true;
+    if (noteIndividualDevicesBox) noteIndividualDevicesBox.style.display = "none";
+    document.querySelectorAll('input[name="note_device"]').forEach(cb => {{
+      cb.checked = false;
+    }});
   }}
   
   updateScheduleVisibility();
@@ -1745,6 +1831,17 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
     }};
   }}
   
+  let devices = null;
+  if (noteDeviceAllCb && !noteDeviceAllCb.checked) {{
+    const selectedDevices = [];
+    document.querySelectorAll('input[name="note_device"]:checked').forEach(cb => {{
+      selectedDevices.push(cb.value);
+    }});
+    if (selectedDevices.length > 0) {{
+      devices = selectedDevices;
+    }}
+  }}
+
   const body = {{
     id: noteIdInput.value || null,
     enabled: true,
@@ -1755,7 +1852,8 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
     start_date: noteStartDateInput.value || null,
     date: date,
     recurrence: recurrence,
-    expires_after_date: noteExpiresInput.value || null
+    expires_after_date: noteExpiresInput.value || null,
+    devices: devices
   }};
   
   try {{
@@ -2112,6 +2210,28 @@ def make_handler(
                             self.send_json(400, {"ok": False, "error": "Monthly day of month must be between 1 and 31"})
                             return
                     
+                devices = candidate.get("devices")
+                if devices is not None:
+                    if not isinstance(devices, list):
+                        self.send_json(400, {"ok": False, "error": "Devices must be a JSON array of device IDs"})
+                        return
+                    for dev_id in devices:
+                        if not isinstance(dev_id, str):
+                            self.send_json(400, {"ok": False, "error": "Device ID must be a string"})
+                            return
+                        import re
+                        if not re.match(r"^[a-zA-Z0-9_-]+$", dev_id):
+                            self.send_json(400, {"ok": False, "error": f"Invalid device ID format: {dev_id}"})
+                            return
+                        if registry is not None:
+                            try:
+                                registry.get(dev_id)
+                            except DeviceNotFoundError:
+                                self.send_json(400, {"ok": False, "error": f"Unknown device ID: {dev_id}"})
+                                return
+                            except Exception:
+                                pass
+
                 notes = load_daily_notes()
                 items = notes.setdefault("items", [])
                 
@@ -2120,7 +2240,7 @@ def make_handler(
                     found = False
                     for item in items:
                         if item.get("id") == item_id:
-                            item.update({
+                            update_dict = {
                                 "enabled": bool(candidate.get("enabled", True)),
                                 "category": category,
                                 "title": title,
@@ -2130,7 +2250,13 @@ def make_handler(
                                 "date": candidate.get("date") or None,
                                 "recurrence": candidate.get("recurrence") or None,
                                 "expires_after_date": candidate.get("expires_after_date") or None,
-                            })
+                            }
+                            devs = candidate.get("devices")
+                            if devs:
+                                update_dict["devices"] = devs
+                            elif "devices" in item:
+                                del item["devices"]
+                            item.update(update_dict)
                             found = True
                             break
                     if not found:
@@ -2139,7 +2265,7 @@ def make_handler(
                 else:
                     import uuid
                     item_id = str(uuid.uuid4())
-                    items.append({
+                    new_item = {
                         "id": item_id,
                         "enabled": bool(candidate.get("enabled", True)),
                         "category": category,
@@ -2150,7 +2276,11 @@ def make_handler(
                         "date": candidate.get("date") or None,
                         "recurrence": candidate.get("recurrence") or None,
                         "expires_after_date": candidate.get("expires_after_date") or None,
-                    })
+                    }
+                    devs = candidate.get("devices")
+                    if devs:
+                        new_item["devices"] = devs
+                    items.append(new_item)
                     
                 save_daily_notes(notes)
                 try:

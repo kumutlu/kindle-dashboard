@@ -1354,6 +1354,148 @@ class SettingsServerTests(unittest.TestCase):
         status_calls = [call for call in self.device_calls if call[0] == "status"]
         self.assertEqual(status_calls[-1], ("status", "kitchen-kindle"))
 
+    def test_notes_save_with_devices(self):
+        # Override path to temp dir
+        test_notes_path = Path(self.tempdir.name) / "daily_notes.json"
+        settings_server.DAILY_NOTES_PATH = test_notes_path
+        if test_notes_path.exists():
+            test_notes_path.unlink()
+
+        csrf = self.csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+        }
+
+        # Add kitchen-kindle
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+        })
+
+        # 1. Add note targeting kitchen-kindle
+        payload = {
+            "title": "Kitchen note",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["kitchen-kindle"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        note_id = res["id"]
+
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(notes["items"]), 1)
+        self.assertEqual(notes["items"][0]["devices"], ["kitchen-kindle"])
+
+        # 2. Edit note to target both default-kindle and kitchen-kindle
+        payload_edit = {
+            "id": note_id,
+            "title": "Kitchen note updated",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["default-kindle", "kitchen-kindle"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_edit),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertEqual(notes["items"][0]["devices"], ["default-kindle", "kitchen-kindle"])
+
+        # 3. Edit note to clear devices (make it global)
+        payload_clear = {
+            "id": note_id,
+            "title": "Kitchen note updated",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": []
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_clear),
+            headers=headers
+        )
+        self.assertEqual(status, 200)
+        notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
+        self.assertNotIn("devices", notes["items"][0])
+
+    def test_notes_save_validation_for_devices(self):
+        csrf = self.csrf_token()
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+        }
+
+        # 1. Unknown device ID rejected
+        payload = {
+            "title": "Unknown device note",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["ghost-kindle"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload),
+            headers=headers
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Unknown device ID: ghost-kindle", json.loads(body.decode("utf-8"))["error"])
+
+        # 2. Invalid device ID format (traversal) rejected
+        payload_bad = {
+            "title": "Bad traversal note",
+            "category": "NOTE",
+            "priority": "normal",
+            "enabled": True,
+            "devices": ["../../x"]
+        }
+        status, _, body = self.request(
+            "POST",
+            "/api/notes/save",
+            body=json.dumps(payload_bad),
+            headers=headers
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid device ID format: ../../x", json.loads(body.decode("utf-8"))["error"])
+
+    def test_settings_html_includes_show_on_devices_controls(self):
+        status, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("Show on devices", text)
+        self.assertIn('id="note-device-all"', text)
+        self.assertIn('id="note-individual-devices"', text)
+
+    def test_api_devices_still_safe(self):
+        status, _, body = self.request("GET", "/api/devices")
+        self.assertEqual(status, 200)
+        res = json.loads(body.decode("utf-8"))
+        self.assertIn("devices", res)
+        # Verify default-kindle is present
+        dev_ids = [d["id"] for d in res["devices"]]
+        self.assertIn("default-kindle", dev_ids)
+
 
 class DeviceConfigEndpointTests(unittest.TestCase):
     def setUp(self):

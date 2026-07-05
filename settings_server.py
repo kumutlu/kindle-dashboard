@@ -13,7 +13,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
 from dashboard_themes import THEMES
-from device_registry import DeviceNotFoundError, DeviceRegistry
+from device_registry import (
+    DeviceNotFoundError,
+    DeviceRegistry,
+    RegistryValidationError,
+)
 from kindle_device import DeviceError, KindleDevice
 from weather_image import (
     DEFAULT_CONFIG,
@@ -50,6 +54,31 @@ def public_device_config(device, config):
     if device.type == "kindle_pw1":
         payload["kindle_frontlight"] = config["kindle_frontlight"]
     return payload
+
+
+def public_devices(registry, legacy_config_path):
+    devices = []
+    for device in registry.load():
+        selected_config_path = (
+            Path(legacy_config_path)
+            if device.id == "default-kindle"
+            else device.config_path
+        )
+        config = load_config(selected_config_path)
+        value = {
+            "id": device.id,
+            "name": device.name,
+            "type": device.type,
+            "enabled": device.enabled,
+            "resolution": list(device.resolution),
+            "theme": config["theme"],
+            "image_url": f"/device/{device.id}/image.png",
+            "config_url": f"/api/device/{device.id}/config",
+        }
+        if device.connection is not None:
+            value["connection"] = dict(device.connection)
+        devices.append(value)
+    return devices
 
 
 def load_daily_notes():
@@ -220,7 +249,12 @@ def get_prayer_cache_status(config):
     return "Not cached / Pending fetch", "Never"
 
 
-def render_settings(config, csrf_token, status_message=""):
+def render_settings(
+    config,
+    csrf_token,
+    status_message="",
+    devices=None,
+):
     escaped = {key: html.escape(str(value), quote=True)
                for key, value in config.items()}
     latitude_value = (
@@ -269,6 +303,73 @@ def render_settings(config, csrf_token, status_message=""):
         )
     )
     saved_brightness = str(config.get("kindle_frontlight", 8))
+    if devices is None:
+        devices = [{
+            "id": "default-kindle",
+            "name": "Default Kindle",
+            "type": "kindle_pw1",
+            "enabled": True,
+            "resolution": [758, 1024],
+            "theme": config["theme"],
+            "image_url": "/device/default-kindle/image.png",
+            "config_url": "/api/device/default-kindle/config",
+        }]
+    device_options = "".join(
+        f'<option value="{html.escape(device["id"], quote=True)}">'
+        f'{html.escape(device["name"])}'
+        f' ({html.escape(device["id"])})</option>'
+        for device in devices
+    )
+    device_cards = []
+    for listed_device in devices:
+        connection = listed_device.get("connection") or {}
+        connection_items = []
+        for key in ("host", "user", "ssh_profile", "port"):
+            if key in connection:
+                connection_items.append(
+                    f"<span><strong>{html.escape(key)}:</strong> "
+                    f"{html.escape(str(connection[key]))}</span>"
+                )
+        connection_html = (
+            '<div class="device-connection">'
+            + "".join(connection_items)
+            + "</div>"
+            if connection_items
+            else '<p class="device-unconfigured">Connection not configured</p>'
+        )
+        width, height = listed_device["resolution"]
+        enabled_label = (
+            "Enabled" if listed_device["enabled"] else "Disabled"
+        )
+        device_cards.append(
+            '<article class="registered-device" '
+            f'data-device-id="{html.escape(listed_device["id"], quote=True)}">'
+            '<div class="registered-device-heading">'
+            f'<h3>{html.escape(listed_device["name"])}</h3>'
+            f'<span class="device-enabled">{enabled_label}</span>'
+            "</div>"
+            '<dl class="device-details">'
+            f'<div><dt>ID</dt><dd>{html.escape(listed_device["id"])}</dd></div>'
+            f'<div><dt>Type</dt><dd>{html.escape(listed_device["type"])}</dd></div>'
+            f"<div><dt>Resolution</dt><dd>{width}×{height}</dd></div>"
+            f'<div><dt>Theme</dt><dd>{html.escape(listed_device["theme"])}</dd></div>'
+            "</dl>"
+            + connection_html
+            + '<div class="device-links">'
+            f'<a href="{html.escape(listed_device["image_url"], quote=True)}" '
+            'target="_blank" rel="noopener">Open image preview</a>'
+            f'<a href="{html.escape(listed_device["config_url"], quote=True)}" '
+            'target="_blank" rel="noopener">Open config endpoint</a>'
+            "</div></article>"
+        )
+    devices_html = (
+        "".join(device_cards)
+        if device_cards
+        else (
+            '<p class="device-registry-unavailable">'
+            "Device registry is currently unavailable.</p>"
+        )
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -411,6 +512,23 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 .stat-item strong{{display:block;font-size:1.05rem;font-weight:700}}
 .match{{margin:-4px 0 14px;padding:11px 12px;border-radius:12px;background:var(--soft);color:var(--muted);font-size:0.9rem;border:1px solid var(--line)}}
 
+/* Registered Devices */
+.registered-devices{{display:grid;grid-template-columns:1fr;gap:14px;margin-top:18px}}
+.registered-device{{padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);transition:border-color .2s ease,background .2s ease}}
+.registered-device.selected{{border:2px solid var(--accent);padding:15px;background:var(--soft)}}
+.registered-device-heading{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}}
+.registered-device-heading h3{{margin:0;font-size:1.05rem}}
+.device-enabled{{padding:4px 8px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted);font-size:.75rem;font-weight:700}}
+.device-details{{display:grid;gap:7px;margin:0}}
+.device-details div{{display:flex;justify-content:space-between;gap:14px}}
+.device-details dt{{color:var(--muted);font-size:.86rem}}
+.device-details dd{{margin:0;text-align:right;font-size:.86rem;font-weight:700;overflow-wrap:anywhere}}
+.device-connection{{display:flex;flex-wrap:wrap;gap:7px 12px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line);color:var(--muted);font-size:.8rem}}
+.device-unconfigured,.device-registry-unavailable{{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--soft);color:var(--muted)}}
+.device-links{{display:grid;grid-template-columns:1fr;gap:8px;margin-top:14px}}
+.device-links a{{display:flex;align-items:center;justify-content:center;min-height:44px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;color:var(--ink);text-decoration:none;font-size:.86rem;font-weight:650}}
+.device-links a:hover{{border-color:var(--button-hover-border);background:var(--button-hover)}}
+
 /* City Results */
 .city-results{{display:grid;gap:8px;margin:0 0 14px}}
 .city-result{{display:grid;gap:3px;width:100%;min-height:58px;text-align:left;padding:10px 12px;border-color:var(--line)}}
@@ -472,6 +590,8 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   .overview-stats{{grid-template-columns:repeat(3,1fr)}}
   .toggle-list{{grid-template-columns:1fr 1fr}}
   .city-results{{grid-template-columns:1fr 1fr}}
+  .registered-devices{{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  .device-links{{grid-template-columns:1fr 1fr}}
   .action-bar{{left:50%;right:auto;bottom:24px;width:min(600px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:10px;box-shadow:0 8px 30px rgba(0,0,0,0.12)}}
 }}
 </style>
@@ -493,6 +613,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 
 <nav class="tabs-nav" aria-label="Dashboard sections">
   <button type="button" class="tab-btn active" data-tab="overview">Overview</button>
+  <button type="button" class="tab-btn" data-tab="devices">Devices</button>
   <button type="button" class="tab-btn" data-tab="location">Location</button>
   <button type="button" class="tab-btn" data-tab="theme">Theme</button>
   <button type="button" class="tab-btn" data-tab="display">Display</button>
@@ -539,7 +660,20 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   </div>
 </section>
 
-<!-- 2. Location Tab -->
+<!-- 2. Devices Tab -->
+<section class="card tab-content" id="devices">
+  <h2>Devices</h2>
+  <p class="section-note">View registered displays and choose the active device for this browser. Settings still save to Default Kindle during this checkpoint.</p>
+  <label class="field">
+    <span>Selected device</span>
+    <select id="selected-device">{device_options}</select>
+  </label>
+  <div class="registered-devices" id="registered-devices">
+    {devices_html}
+  </div>
+</section>
+
+<!-- 3. Location Tab -->
 <section class="card tab-content" id="location">
   <h2>Location</h2>
   <p class="section-note">Search for a city, then select the correct result.</p>
@@ -869,6 +1003,34 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e =
 }});
 
 applyTheme(localStorage.getItem("kindle_dashboard_ui_theme") || "system");
+
+const selectedDeviceKey="kindle_dashboard_selected_device";
+const selectedDeviceControl=document.getElementById("selected-device");
+const registeredDeviceCards=document.querySelectorAll("[data-device-id]");
+function applySelectedDevice(deviceId){{
+  if(!selectedDeviceControl) return;
+  const available=Array.from(selectedDeviceControl.options).map(option=>option.value);
+  const selected=available.includes(deviceId)
+    ?deviceId
+    :(available.includes("default-kindle")?"default-kindle":available[0]);
+  if(!selected) return;
+  selectedDeviceControl.value=selected;
+  registeredDeviceCards.forEach(card=>{{
+    const active=card.dataset.deviceId===selected;
+    card.classList.toggle("selected",active);
+    if(active) card.setAttribute("aria-current","true");
+    else card.removeAttribute("aria-current");
+  }});
+  localStorage.setItem(selectedDeviceKey,selected);
+}}
+if(selectedDeviceControl){{
+  selectedDeviceControl.addEventListener("change",()=>{{
+    applySelectedDevice(selectedDeviceControl.value);
+  }});
+  applySelectedDevice(
+    localStorage.getItem(selectedDeviceKey)||"default-kindle"
+  );
+}}
 
 const tabBtns=document.querySelectorAll(".tab-btn");
 const tabContents=document.querySelectorAll(".tab-content");
@@ -1602,6 +1764,20 @@ def make_handler(
             if parsed.path == "/api/config":
                 self.send_json(200, load_config(config_path))
                 return
+            if parsed.path == "/api/devices":
+                try:
+                    devices = public_devices(registry, config_path)
+                except (RegistryValidationError, OSError, ValueError):
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "error": "Device registry is unavailable",
+                        },
+                    )
+                    return
+                self.send_json(200, {"devices": devices})
+                return
             device_config_match = DEVICE_CONFIG_RE.fullmatch(parsed.path)
             if device_config_match is not None:
                 try:
@@ -1669,10 +1845,15 @@ def make_handler(
             if parsed.path == "/settings":
                 query = parse_qs(parsed.query)
                 message = query.get("status", [""])[0]
+                try:
+                    devices = public_devices(registry, config_path)
+                except (RegistryValidationError, OSError, ValueError):
+                    devices = []
                 body = render_settings(
                     load_config(config_path),
                     csrf_token,
                     message,
+                    devices=devices,
                 ).encode("utf-8")
                 self.send_bytes(200, body, "text/html; charset=utf-8")
                 return

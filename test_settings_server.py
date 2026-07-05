@@ -770,7 +770,16 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
 
         # Tab button checks
-        for tab in ("overview", "location", "theme", "display", "device", "maintenance", "status"):
+        for tab in (
+            "overview",
+            "devices",
+            "location",
+            "theme",
+            "display",
+            "device",
+            "maintenance",
+            "status",
+        ):
             self.assertIn(f'data-tab="{tab}"', text)
 
         # Confirm tabs structure has active class/content
@@ -1177,6 +1186,115 @@ class DeviceConfigEndpointTests(unittest.TestCase):
                     str(self.root).encode("utf-8"),
                     body,
                 )
+
+    def test_devices_api_returns_safe_allowlisted_registry_data(self):
+        status, body = self.request("/api/devices")
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(set(payload), {"devices"})
+        self.assertEqual(len(payload["devices"]), 1)
+        device = payload["devices"][0]
+        self.assertEqual(
+            set(device),
+            {
+                "id",
+                "name",
+                "type",
+                "enabled",
+                "resolution",
+                "theme",
+                "image_url",
+                "config_url",
+                "connection",
+            },
+        )
+        self.assertEqual(device["id"], "default-kindle")
+        self.assertEqual(device["theme"], "family_dashboard")
+        self.assertEqual(
+            device["image_url"],
+            "/device/default-kindle/image.png",
+        )
+        self.assertEqual(
+            device["config_url"],
+            "/api/device/default-kindle/config",
+        )
+        self.assertEqual(
+            set(device["connection"]),
+            {"host", "user", "ssh_profile", "port"},
+        )
+
+        serialized = body.decode("utf-8").lower()
+        for forbidden in (
+            "key_path",
+            "known_hosts",
+            "password",
+            "token",
+            "private_key",
+            "/home/user/.ssh",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_devices_api_handles_invalid_registry_without_path_leak(self):
+        (self.root / "devices.json").write_text(
+            '{"devices":[{"id":"../escape"}]}',
+            encoding="utf-8",
+        )
+
+        status, body = self.request("/api/devices")
+
+        self.assertEqual(status, 503)
+        payload = json.loads(body)
+        self.assertEqual(
+            payload,
+            {
+                "ok": False,
+                "error": "Device registry is unavailable",
+            },
+        )
+        self.assertNotIn(
+            str(self.root).encode("utf-8"),
+            body,
+        )
+
+    def test_settings_devices_tab_lists_and_selects_default_device(self):
+        status, body = self.request("/settings")
+        text = body.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        self.assertIn('data-tab="devices">Devices</button>', text)
+        self.assertIn('class="card tab-content" id="devices"', text)
+        self.assertIn('id="selected-device"', text)
+        self.assertIn('value="default-kindle"', text)
+        self.assertIn('data-device-id="default-kindle"', text)
+        self.assertIn("Default Kindle", text)
+        self.assertIn("kindle_pw1", text)
+        self.assertIn("758×1024", text)
+        self.assertIn("/device/default-kindle/image.png", text)
+        self.assertIn(
+            "/api/device/default-kindle/config",
+            text,
+        )
+        self.assertIn(
+            "kindle_dashboard_selected_device",
+            text,
+        )
+        self.assertNotIn("/home/user/.ssh", text)
+        self.assertNotIn("known_hosts", text)
+
+    def test_settings_page_survives_invalid_device_registry(self):
+        (self.root / "devices.json").write_text(
+            '{"devices":"invalid"}',
+            encoding="utf-8",
+        )
+
+        status, body = self.request("/settings")
+
+        self.assertEqual(status, 200)
+        self.assertIn(
+            "Device registry is currently unavailable.",
+            body.decode("utf-8"),
+        )
 
 
 if __name__ == "__main__":

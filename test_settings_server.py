@@ -115,6 +115,7 @@ class SettingsServerTests(unittest.TestCase):
             weather_image.DEFAULT_CONFIG,
         )
         self.regeneration_calls = 0
+        self.rendered_device_ids = []
         self.fail_regeneration = False
         self.device_calls = []
         self.settings_restart_calls = 0
@@ -176,6 +177,12 @@ class SettingsServerTests(unittest.TestCase):
             if self.fail_regeneration:
                 raise RuntimeError("controlled regeneration failure")
 
+        def render_selected(device_id):
+            self.regeneration_calls += 1
+            self.rendered_device_ids.append(device_id)
+            if self.fail_regeneration:
+                raise RuntimeError("controlled regeneration failure")
+
         def restart_settings():
             self.settings_restart_calls += 1
 
@@ -185,14 +192,17 @@ class SettingsServerTests(unittest.TestCase):
                 raise RuntimeError("controlled geocoding failure")
             return self.geocode_results
 
+        self.registry = DeviceRegistry(Path(self.tempdir.name))
         self.server = settings_server.make_server(
             host="127.0.0.1",
             port=0,
             config_path=self.config_path,
             regenerate=regenerate,
+            render_selected=render_selected,
             device=self.device,
             restart_settings=restart_settings,
             geocode=geocode,
+            registry=self.registry,
         )
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -446,6 +456,17 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIsNone(saved["latitude"])
         self.assertEqual(saved["theme"], "home_dashboard")
         self.assertEqual(self.regeneration_calls, 1)
+        self.assertEqual(
+            self.rendered_device_ids,
+            ["default-kindle"],
+        )
+        device_config_path = self.registry.get(
+            "default-kindle"
+        ).config_path
+        self.assertEqual(
+            json.loads(device_config_path.read_text(encoding="utf-8")),
+            saved,
+        )
 
     def test_settings_form_saves_registered_themes_and_regenerates(self):
         for theme in (
@@ -457,6 +478,7 @@ class SettingsServerTests(unittest.TestCase):
                 csrf = self.csrf_token()
                 form = {
                     "csrf_token": csrf,
+                    "selected_device_id": "default-kindle",
                     "title": "NOTTINGHAM HOME",
                     "location": "Nottingham",
                     "country": "United Kingdom",
@@ -501,6 +523,10 @@ class SettingsServerTests(unittest.TestCase):
                     self.regeneration_calls,
                     calls_before + 1,
                 )
+                self.assertEqual(
+                    self.rendered_device_ids[-1],
+                    "default-kindle",
+                )
                 self.assertEqual(saved["kindle_frontlight"], 8)
                 self.assertEqual(saved["refresh_interval_minutes"], 30)
                 self.assertEqual(saved["prayer_method"], 13)
@@ -544,6 +570,161 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn("unsupported%20theme", headers["Location"])
         self.assertEqual(self.config_path.read_bytes(), before)
         self.assertEqual(self.regeneration_calls, 0)
+
+    def test_selected_device_form_save_updates_only_selected_device(self):
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+        })
+        legacy_before = self.config_path.read_bytes()
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "selected_device_id": "kitchen-kindle",
+            "title": "KITCHEN DASHBOARD",
+            "location": "London",
+            "country": "United Kingdom",
+            "latitude": "51.5072",
+            "longitude": "-0.1276",
+            "location_display": "London, England, United Kingdom",
+            "location_label": "London, UK",
+            "weather_query": "London",
+            "timezone": "Europe/London",
+            "theme": "compact_dashboard",
+            "show_weather": "on",
+            "show_forecast": "on",
+            "refresh_interval_minutes": "30",
+        }
+
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+
+        self.assertEqual(status, 303)
+        self.assertIn("saved", headers["Location"])
+        saved = json.loads(
+            kitchen.config_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["theme"], "compact_dashboard")
+        self.assertEqual(saved["weather_query"], "London")
+        self.assertEqual(saved["refresh_interval_minutes"], 30)
+        self.assertEqual(
+            self.rendered_device_ids[-1],
+            "kitchen-kindle",
+        )
+        self.assertEqual(self.config_path.read_bytes(), legacy_before)
+
+    def test_invalid_selected_device_is_rejected_without_writes(self):
+        before = self.config_path.read_bytes()
+        csrf = self.csrf_token()
+        base_form = {
+            "csrf_token": csrf,
+            "title": "DO NOT SAVE",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "home_dashboard",
+        }
+        for invalid in ("missing", "../escape", "UPPERCASE"):
+            with self.subTest(device_id=invalid):
+                form = dict(
+                    base_form,
+                    selected_device_id=invalid,
+                )
+                status, headers, body = self.request(
+                    "POST",
+                    "/settings",
+                    body=urlencode(form),
+                    headers={
+                        "Content-Type":
+                            "application/x-www-form-urlencoded",
+                    },
+                )
+                self.assertEqual(status, 303, body)
+                self.assertIn(
+                    "selected%20device%20is%20unavailable",
+                    headers["Location"],
+                )
+                self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertEqual(self.rendered_device_ids, [])
+
+    def test_disabled_selected_device_is_rejected(self):
+        self.registry.get("default-kindle")
+        registry_path = Path(self.tempdir.name) / "devices.json"
+        stored = json.loads(registry_path.read_text(encoding="utf-8"))
+        stored["devices"][0]["enabled"] = False
+        self.registry.write_registry(stored)
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "selected_device_id": "default-kindle",
+            "title": "DO NOT SAVE",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "theme": "home_dashboard",
+        }
+
+        status, headers, _ = self.request(
+            "POST",
+            "/settings",
+            body=urlencode(form),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+
+        self.assertEqual(status, 303)
+        self.assertIn(
+            "selected%20device%20is%20unavailable",
+            headers["Location"],
+        )
+        self.assertEqual(self.rendered_device_ids, [])
+
+    def test_selected_device_api_envelope_updates_and_renders(self):
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "minimal_weather"
+        status, _, body = self.request(
+            "POST",
+            "/api/config",
+            body=json.dumps({
+                "selected_device_id": "default-kindle",
+                "config": config,
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            json.loads(body)["device_id"],
+            "default-kindle",
+        )
+        self.assertEqual(
+            self.rendered_device_ids,
+            ["default-kindle"],
+        )
+
+    def test_selected_device_ui_has_hidden_field_and_indicator(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+
+        self.assertIn('name="selected_device_id"', text)
+        self.assertIn('id="selected-device-id"', text)
+        self.assertIn(
+            'id="editing-device-name">Default Kindle',
+            text,
+        )
+        self.assertIn("Editing device:", text)
 
     def test_daily_notes_fields_do_not_block_main_settings_form(self):
         _, _, body = self.request("GET", "/settings")
@@ -1093,11 +1274,13 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         )
         self.registry = DeviceRegistry(self.root)
         self.registry.get("default-kindle")
+        self.rendered_device_ids = []
         self.server = settings_server.make_server(
             host="127.0.0.1",
             port=0,
             config_path=self.config_path,
             regenerate=lambda: None,
+            render_selected=self.rendered_device_ids.append,
             device=mock.MagicMock(),
             restart_settings=lambda: None,
             geocode=lambda query: [],

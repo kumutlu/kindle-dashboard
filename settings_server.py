@@ -23,6 +23,7 @@ from weather_image import (
     DEFAULT_CONFIG,
     geocode_locations,
     load_config,
+    render_device,
     validate_config,
 )
 
@@ -214,6 +215,70 @@ def update_config(config_path, candidate, regenerate):
             atomic_write_bytes(config_path, previous_data)
         else:
             config_path.unlink(missing_ok=True)
+        raise
+    return validated
+
+
+def update_device_config(
+    registry,
+    device_id,
+    legacy_config_path,
+    candidate,
+    render_selected,
+):
+    try:
+        device = registry.get(device_id, require_enabled=True)
+    except DeviceNotFoundError as exc:
+        raise ValueError("selected device is unavailable") from exc
+
+    target_path = device.config_path
+    legacy_config_path = Path(legacy_config_path)
+    target_existed = target_path.exists()
+    target_before = (
+        target_path.read_bytes() if target_existed else None
+    )
+    legacy_existed = legacy_config_path.exists()
+    legacy_before = (
+        legacy_config_path.read_bytes() if legacy_existed else None
+    )
+    current_path = target_path
+    if (
+        device.id == "default-kindle"
+        and not current_path.exists()
+    ):
+        current_path = legacy_config_path
+    current = load_config(current_path)
+    candidate = dict(candidate)
+    for field in (
+        "kindle_frontlight",
+        "prayer_method",
+        "prayer_school",
+        "prayer_high_latitude",
+        "hijri_adjustment",
+        "refresh_interval_minutes",
+    ):
+        if field not in candidate and field in current:
+            candidate[field] = current[field]
+
+    validated = validate_config(candidate)
+    atomic_write_config(target_path, validated)
+    if device.id == "default-kindle":
+        atomic_write_config(legacy_config_path, validated)
+    try:
+        render_selected(device.id)
+    except Exception:
+        if target_existed:
+            atomic_write_bytes(target_path, target_before)
+        else:
+            target_path.unlink(missing_ok=True)
+        if device.id == "default-kindle":
+            if legacy_existed:
+                atomic_write_bytes(
+                    legacy_config_path,
+                    legacy_before,
+                )
+            else:
+                legacy_config_path.unlink(missing_ok=True)
         raise
     return validated
 
@@ -573,6 +638,8 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 
 /* Action Bar */
 .action-bar{{position:fixed;z-index:100;left:0;right:0;bottom:0;display:grid;grid-template-columns:1.35fr 1fr;gap:12px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:var(--action-bar-bg);border-top:1px solid var(--line);box-shadow:0 -8px 30px rgba(0, 0, 0, 0.08);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}
+.editing-device{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;text-align:center}}
+.editing-device strong{{color:var(--ink)}}
 .action-bar button{{margin:0;width:100%}}
 .action-bar button[type=submit],.overview-actions button[type=submit]{{background:var(--ink);color:var(--card);border-color:var(--ink)}}
 .action-bar button[type=submit]:hover:not(:disabled),.overview-actions button[type=submit]:hover:not(:disabled){{background:var(--primary-hover);border-color:var(--primary-hover)}}
@@ -625,6 +692,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
 
 <form method="post" action="/settings">
 <input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">
+<input type="hidden" name="selected_device_id" id="selected-device-id" value="default-kindle">
 
 <!-- TAB CONTENTS -->
 
@@ -959,6 +1027,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   <a href="#status">Status</a>
 </nav>
 <div class="action-bar">
+  <p class="editing-device">Editing device: <strong id="editing-device-name">Default Kindle</strong></p>
   <button type="submit">Save &amp; Regenerate</button>
   <button type="button" id="push-kindle">Push to Kindle</button>
 </div>
@@ -1006,6 +1075,8 @@ applyTheme(localStorage.getItem("kindle_dashboard_ui_theme") || "system");
 
 const selectedDeviceKey="kindle_dashboard_selected_device";
 const selectedDeviceControl=document.getElementById("selected-device");
+const selectedDeviceField=document.getElementById("selected-device-id");
+const editingDeviceName=document.getElementById("editing-device-name");
 const registeredDeviceCards=document.querySelectorAll("[data-device-id]");
 function applySelectedDevice(deviceId){{
   if(!selectedDeviceControl) return;
@@ -1015,6 +1086,14 @@ function applySelectedDevice(deviceId){{
     :(available.includes("default-kindle")?"default-kindle":available[0]);
   if(!selected) return;
   selectedDeviceControl.value=selected;
+  if(selectedDeviceField) selectedDeviceField.value=selected;
+  const selectedOption=selectedDeviceControl.options[
+    selectedDeviceControl.selectedIndex
+  ];
+  if(editingDeviceName && selectedOption){{
+    editingDeviceName.textContent=selectedOption.textContent
+      .replace(` (${{selected}})`,"");
+  }}
   registeredDeviceCards.forEach(card=>{{
     const active=card.dataset.deviceId===selected;
     card.classList.toggle("selected",active);
@@ -1703,6 +1782,7 @@ loadDeviceState();
 def make_handler(
     config_path,
     regenerate,
+    render_selected,
     device,
     restart_settings,
     geocode,
@@ -2226,9 +2306,40 @@ def make_handler(
                 return
             try:
                 candidate = json.loads(self.read_body().decode("utf-8"))
+                selected_device_id = "default-kindle"
+                if "config" in candidate or "selected_device_id" in candidate:
+                    if set(candidate) - {
+                        "config",
+                        "selected_device_id",
+                    }:
+                        raise ValueError(
+                            "unsupported settings request fields"
+                        )
+                    selected_device_id = candidate.get(
+                        "selected_device_id",
+                        "default-kindle",
+                    )
+                    candidate = candidate.get("config")
+                    if not isinstance(candidate, dict):
+                        raise ValueError(
+                            "config must be a JSON object"
+                        )
                 with update_lock:
-                    saved = update_config(config_path, candidate, regenerate)
-                self.send_json(200, {"ok": True, "config": saved})
+                    saved = update_device_config(
+                        registry,
+                        selected_device_id,
+                        config_path,
+                        candidate,
+                        render_selected,
+                    )
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "device_id": selected_device_id,
+                        "config": saved,
+                    },
+                )
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
             except Exception:
@@ -2244,6 +2355,19 @@ def make_handler(
                 if not hmac.compare_digest(supplied_csrf, csrf_token):
                     raise ValueError("invalid form token")
 
+                selected_device_id = form.get(
+                    "selected_device_id",
+                    ["default-kindle"],
+                )[0] or "default-kindle"
+                try:
+                    selected_device = registry.get(
+                        selected_device_id,
+                        require_enabled=True,
+                    )
+                except DeviceNotFoundError as exc:
+                    raise ValueError(
+                        "selected device is unavailable"
+                    ) from exc
                 submitted_theme = (
                     form.get("theme", [""])[0]
                     or form.get("selected_theme", [""])[0]
@@ -2251,7 +2375,12 @@ def make_handler(
                 )
                 if not submitted_theme:
                     try:
-                        current_config = load_config(config_path)
+                        current_config_path = (
+                            config_path
+                            if selected_device.id == "default-kindle"
+                            else selected_device.config_path
+                        )
+                        current_config = load_config(current_config_path)
                         submitted_theme = current_config.get("theme", "home_dashboard")
                     except Exception:
                         submitted_theme = "home_dashboard"
@@ -2298,7 +2427,13 @@ def make_handler(
                         except Exception:
                             pass
                 with update_lock:
-                    update_config(config_path, candidate, regenerate)
+                    update_device_config(
+                        registry,
+                        selected_device_id,
+                        config_path,
+                        candidate,
+                        render_selected,
+                    )
                 self.redirect("/settings?status=saved")
             except ValueError as exc:
                 self.redirect(f"/settings?status={quote(str(exc))}")
@@ -2317,16 +2452,23 @@ def make_handler(
 def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
                 regenerate=regenerate_dashboard, device=None,
                 restart_settings=schedule_settings_restart,
-                geocode=geocode_locations, registry=None):
+                geocode=geocode_locations, registry=None,
+                render_selected=None):
     if device is None:
         device = KindleDevice()
     if registry is None:
         registry = DeviceRegistry(Path(config_path).resolve().parent)
+    if render_selected is None:
+        render_selected = lambda device_id: render_device(
+            device_id,
+            registry=registry,
+        )
     return ThreadingHTTPServer(
         (host, port),
         make_handler(
             config_path,
             regenerate,
+            render_selected,
             device,
             restart_settings,
             geocode,

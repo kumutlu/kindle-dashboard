@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
+import device_status
 from dashboard_themes import THEMES
 from device_registry import (
     DeviceNotFoundError,
@@ -37,6 +38,9 @@ RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
 DEVICE_CONFIG_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/config$"
+)
+DEVICE_STATUS_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/status$"
 )
 
 
@@ -68,6 +72,7 @@ def public_devices(registry, legacy_config_path):
     devices = []
     for device in registry.load():
         config = load_effective_device_config(device, registry)
+        status = device_status.status_summary(device)
         value = {
             "id": device.id,
             "name": device.name,
@@ -77,6 +82,7 @@ def public_devices(registry, legacy_config_path):
             "theme": config.get("theme") or "",
             "image_url": f"/device/{device.id}/image.png",
             "config_url": f"/api/device/{device.id}/config",
+            "status": status,
         }
         if device.connection is not None:
             value["connection"] = dict(device.connection)
@@ -385,6 +391,19 @@ def render_settings(
     device_cards = []
     for listed_device in devices:
         connection = listed_device.get("connection") or {}
+        status = listed_device.get("status") or {}
+        online_label = "Online" if status.get("online") else "Offline"
+        battery = status.get("battery_percent")
+        battery_label = "—" if battery is None else f"{battery}%"
+        charging = status.get("charging")
+        charging_label = (
+            "—" if charging is None else ("Charging" if charging else "Not charging")
+        )
+        last_seen_label = status.get("last_seen") or "—"
+        last_refresh_label = status.get("last_refresh_at") or "—"
+        ip_label = status.get("ip_address") or connection.get("host") or "—"
+        firmware_label = status.get("firmware_version") or "—"
+        last_error = status.get("last_error")
         connection_items = []
         for key in ("host", "user", "ssh_profile", "port", "method"):
             if key in connection:
@@ -442,8 +461,20 @@ def render_settings(
             f'<div><dt>Type</dt><dd>{html.escape(listed_device["type"])}</dd></div>'
             f"<div><dt>Resolution</dt><dd>{width}×{height}</dd></div>"
             f'<div><dt>Theme</dt><dd>{html.escape(listed_device["theme"])}</dd></div>'
+            f'<div><dt>Status</dt><dd>{online_label}</dd></div>'
+            f'<div><dt>Battery</dt><dd>{html.escape(battery_label)}</dd></div>'
+            f'<div><dt>Charging</dt><dd>{html.escape(charging_label)}</dd></div>'
+            f'<div><dt>Last Seen</dt><dd>{html.escape(last_seen_label)}</dd></div>'
+            f'<div><dt>Last Refresh</dt><dd>{html.escape(last_refresh_label)}</dd></div>'
+            f'<div><dt>IP Address</dt><dd>{html.escape(str(ip_label))}</dd></div>'
+            f'<div><dt>Firmware</dt><dd>{html.escape(firmware_label)}</dd></div>'
             "</dl>"
             + connection_html
+            + (
+                '<p class="device-status-error">'
+                f'{html.escape(last_error)}</p>'
+                if last_error else ""
+            )
             + esp_warning
             + links_html
             + "</article>"
@@ -3652,6 +3683,10 @@ def make_handler(
                     ),
                 )
                 return
+            device_status_match = DEVICE_STATUS_RE.fullmatch(parsed.path)
+            if device_status_match is not None:
+                self.handle_status_get(device_status_match.group(1))
+                return
             if parsed.path == "/api/notes":
                 self.send_json(200, load_daily_notes())
                 return
@@ -3761,6 +3796,10 @@ def make_handler(
                 self.handle_maintenance_restart()
                 return
             if parsed.path.startswith("/api/device/"):
+                device_status_match = DEVICE_STATUS_RE.fullmatch(parsed.path)
+                if device_status_match is not None:
+                    self.handle_status_post(device_status_match.group(1))
+                    return
                 known_paths = {
                     "/api/device/start-dashboard",
                     "/api/device/home",
@@ -3784,6 +3823,49 @@ def make_handler(
                 self.send_bytes(404, b"", "text/plain")
                 return
             self.send_bytes(404, b"", "text/plain")
+
+        def handle_status_get(self, device_id):
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+                payload = device_status.status_summary(selected)
+                if selected.type == "kindle_pw1":
+                    try:
+                        live = device.get_status(
+                            connection=selected.connection,
+                            device_id=selected.id,
+                            device_type=selected.type,
+                        )
+                        if isinstance(live, dict):
+                            payload.update(live)
+                    except Exception as exc:
+                        payload.setdefault("connected", False)
+                        payload.setdefault("last_error", str(exc))
+                self.send_json(200, payload)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+
+        def handle_status_post(self, device_id):
+            if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                self.send_json(415, {"ok": False, "error": "application/json required"})
+                return
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            supplied_token = (
+                self.headers.get("X-Device-Token")
+                or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            )
+            if not device_status.token_is_valid(selected, supplied_token):
+                self.send_json(403, {"ok": False, "error": "invalid device token"})
+                return
+            try:
+                candidate = self.read_json()
+                saved = device_status.save_status(selected, candidate)
+                self.send_json(200, {"ok": True, "status": saved})
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
 
         def handle_maintenance_restart(self):
             if not self.device_csrf_valid():

@@ -83,6 +83,10 @@ THEME_ALIAS_FIELDS = (
     "mode",
     "style",
 )
+NON_RENDER_CONFIG_FIELDS = {
+    "status_token",
+    "device_token",
+}
 OPTIONAL_LOCATION_FIELDS = {
     "location",
     "country",
@@ -205,6 +209,8 @@ def normalize_theme_field(value):
                 break
     for alias in THEME_ALIAS_FIELDS:
         value.pop(alias, None)
+    for field in NON_RENDER_CONFIG_FIELDS:
+        value.pop(field, None)
     return value
 
 

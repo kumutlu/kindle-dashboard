@@ -64,6 +64,28 @@ class KindleDeviceTests(unittest.TestCase):
             with self.assertRaises(kindle_device.DeviceError):
                 self.device.get_light()
 
+    def test_battery_status_reads_capacity_and_charging_when_available(self):
+        output = "capacity=87\nstatus=Charging\nvoltage_now=3975000\n"
+        with mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=self.completed(output),
+        ):
+            status = self.device.get_battery_status()
+
+        self.assertEqual(status["battery_percent"], 87)
+        self.assertTrue(status["charging"])
+        self.assertEqual(status["battery_voltage"], 3.975)
+
+    def test_battery_status_reports_unknown_when_capacity_unavailable(self):
+        with mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=self.completed("capacity=unknown\nstatus=unknown\n"),
+        ):
+            status = self.device.get_battery_status()
+
+        self.assertIsNone(status["battery_percent"])
+        self.assertIsNone(status["charging"])
+
     @mock.patch("weather_image.render_device")
     def test_push_generates_then_runs_one_shot_refresh(self, mock_render):
         with mock.patch(

@@ -1661,6 +1661,21 @@ class SettingsServerTests(unittest.TestCase):
         for theme_value in ("light", "dark", "system"):
             self.assertIn(f'data-theme-val="{theme_value}"', text)
 
+    def test_devices_tab_shows_status_fields(self):
+        status, _, body = self.request("GET", "/settings")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        for label in (
+            "Status",
+            "Battery",
+            "Charging",
+            "Last Seen",
+            "Last Refresh",
+            "IP Address",
+            "Firmware",
+        ):
+            self.assertIn(label, text)
+
 
 class DeviceConfigEndpointTests(unittest.TestCase):
     def setUp(self):
@@ -1715,6 +1730,28 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         status = response.status
         connection.close()
         return status, body
+
+    def post_json(self, path, payload, headers=None):
+        request_headers = {"Content-Type": "application/json"}
+        if headers:
+            request_headers.update(headers)
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request(
+            "POST",
+            path,
+            body=json.dumps(payload),
+            headers=request_headers,
+        )
+        response = connection.getresponse()
+        body = response.read()
+        response_headers = dict(response.getheaders())
+        status = response.status
+        connection.close()
+        return status, response_headers, body
 
     def test_default_device_config_returns_safe_allowlisted_json(self):
         status, body = self.request(
@@ -1814,6 +1851,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
                 "image_url",
                 "config_url",
                 "connection",
+                "status",
             },
         )
         self.assertEqual(device["id"], "default-kindle")
@@ -1841,6 +1879,126 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "/home/user/.ssh",
         ):
             self.assertNotIn(forbidden, serialized)
+
+    def test_device_status_post_and_get_round_trip(self):
+        payload = {
+            "battery_percent": 77,
+            "charging": False,
+            "battery_voltage": 3.92,
+            "wifi_rssi": -61,
+            "ip_address": "192.168.68.88",
+            "firmware_version": "5.6.1.1",
+            "last_refresh_at": "2026-07-06T10:30:00+00:00",
+        }
+        status, _, body = self.post_json(
+            "/api/device/default-kindle/status",
+            payload,
+        )
+        self.assertEqual(status, 200)
+        saved = json.loads(
+            (
+                self.root / "devices/default-kindle/status.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["battery_percent"], 77)
+        self.assertEqual(saved["firmware_version"], "5.6.1.1")
+
+        status, body = self.request(
+            "/api/device/default-kindle/status"
+        )
+        result = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["battery_percent"], 77)
+        self.assertFalse(result["charging"])
+        self.assertIn("online", result)
+
+    def test_device_status_allows_missing_battery_fields(self):
+        status, _, _ = self.post_json(
+            "/api/device/default-kindle/status",
+            {"ip_address": "192.168.68.88"},
+        )
+
+        self.assertEqual(status, 200)
+        status, body = self.request(
+            "/api/device/default-kindle/status"
+        )
+        result = json.loads(body)
+        self.assertIsNone(result["battery_percent"])
+        self.assertEqual(result["ip_address"], "192.168.68.88")
+
+    def test_device_status_rejects_invalid_and_traversal_device_ids(self):
+        for path in (
+            "/api/device/missing/status",
+            "/api/device/../status",
+            "/api/device/%2e%2e/status",
+            "/api/device/UPPERCASE/status",
+        ):
+            with self.subTest(path=path):
+                status, _, _ = self.post_json(
+                    path,
+                    {"battery_percent": 50},
+                )
+                self.assertEqual(status, 404)
+
+    def test_status_token_protected_device_rejects_wrong_token(self):
+        device = self.registry.get("default-kindle")
+        raw = json.loads(device.config_path.read_text(encoding="utf-8"))
+        raw["status_token"] = "correct-token"
+        device.config_path.write_text(
+            json.dumps(raw),
+            encoding="utf-8",
+        )
+
+        status, _, _ = self.post_json(
+            "/api/device/default-kindle/status",
+            {"battery_percent": 50},
+            headers={"X-Device-Token": "wrong-token"},
+        )
+        self.assertEqual(status, 403)
+
+        status, _, _ = self.post_json(
+            "/api/device/default-kindle/status",
+            {"battery_percent": 50},
+            headers={"X-Device-Token": "correct-token"},
+        )
+        self.assertEqual(status, 200)
+
+    def test_status_token_in_device_config_does_not_break_public_device_config(self):
+        device = self.registry.get("default-kindle")
+        raw = json.loads(device.config_path.read_text(encoding="utf-8"))
+        raw["status_token"] = "correct-token"
+        device.config_path.write_text(
+            json.dumps(raw),
+            encoding="utf-8",
+        )
+
+        status, body = self.request("/api/devices")
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertNotIn("correct-token", json.dumps(payload))
+        self.assertNotIn("status_token", json.dumps(payload))
+
+    def test_devices_api_includes_status_summary_without_token(self):
+        self.post_json(
+            "/api/device/default-kindle/status",
+            {
+                "battery_percent": 82,
+                "charging": True,
+                "ip_address": "192.168.68.88",
+                "firmware_version": "5.6.1.1",
+            },
+        )
+
+        status, body = self.request("/api/devices")
+        payload = json.loads(body)
+        device = payload["devices"][0]
+        self.assertEqual(status, 200)
+        self.assertEqual(device["status"]["battery_percent"], 82)
+        self.assertTrue(device["status"]["charging"])
+        self.assertEqual(device["status"]["ip_address"], "192.168.68.88")
+        self.assertNotIn("status_token", json.dumps(device))
+        self.assertNotIn("correct-token", json.dumps(device))
 
     def test_devices_api_handles_invalid_registry_without_path_leak(self):
         (self.root / "devices.json").write_text(

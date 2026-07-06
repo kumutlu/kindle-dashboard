@@ -69,6 +69,19 @@ STATUS_GET = (
     "then echo autostart=disabled; else echo autostart=enabled; fi; "
     "lipc-get-prop com.lab126.powerd flIntensity"
 )
+BATTERY_STATUS_GET = (
+    "cap=unknown; stat=unknown; volt=unknown; "
+    "for f in /sys/class/power_supply/*/capacity; do "
+    "[ -r \"$f\" ] && cap=$(cat \"$f\" 2>/dev/null) && break; "
+    "done; "
+    "for f in /sys/class/power_supply/*/status; do "
+    "[ -r \"$f\" ] && stat=$(cat \"$f\" 2>/dev/null) && break; "
+    "done; "
+    "for f in /sys/class/power_supply/*/voltage_now; do "
+    "[ -r \"$f\" ] && volt=$(cat \"$f\" 2>/dev/null) && break; "
+    "done; "
+    "echo capacity=$cap; echo status=$stat; echo voltage_now=$volt"
+)
 
 
 def get_saved_brightness(device_id="default-kindle"):
@@ -226,6 +239,45 @@ class KindleDevice:
         if not values or values[-1] < 0 or values[-1] > 24:
             raise DeviceError("Kindle returned an invalid brightness value")
         return values[-1]
+
+    def get_battery_status(self, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type != "kindle_pw1":
+            raise ValueError("unsupported device type")
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+        output = self._run_remote(BATTERY_STATUS_GET, ssh_base, 10)
+        values = {}
+        for line in output.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+
+        battery_percent = None
+        capacity = values.get("capacity")
+        if capacity and capacity.isdigit():
+            parsed = int(capacity)
+            if 0 <= parsed <= 100:
+                battery_percent = parsed
+
+        charging = None
+        status = values.get("status", "").lower()
+        if status in ("charging", "full"):
+            charging = True
+        elif status in ("discharging", "not charging"):
+            charging = False
+
+        battery_voltage = None
+        voltage = values.get("voltage_now")
+        if voltage and voltage.isdigit():
+            parsed_voltage = int(voltage)
+            if parsed_voltage > 0:
+                battery_voltage = round(parsed_voltage / 1000000, 3)
+
+        return {
+            "battery_percent": battery_percent,
+            "charging": charging,
+            "battery_voltage": battery_voltage,
+        }
 
     def get_status(self, connection=None, device_id=None, device_type="kindle_pw1"):
         if device_type != "kindle_pw1":

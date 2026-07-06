@@ -4,12 +4,12 @@
 LEGACY_LOCAL_URL="http://192.168.68.167:8765/weather.png"
 LEGACY_CONFIG_URL="http://192.168.68.167:8767/api/config"
 
-SERVER_HOST="192.168.68.167"
-DEVICE_ID="default-kindle"
+SERVER_HOST="${SERVER_HOST:-192.168.68.167}"
+DEVICE_ID="${DEVICE_ID:-default-kindle}"
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
 DEVICE_ID_FILE="$DASHBOARD_DIR/device-id"
 
-if [ -s "$DEVICE_ID_FILE" ]; then
+if [ -s "$DEVICE_ID_FILE" ] && [ "$DEVICE_ID" = "default-kindle" ]; then
 	CANDIDATE=$(sed -n '1p' "$DEVICE_ID_FILE" | tr -d '\r\n')
 	case "$CANDIDATE" in
 		*[!a-zA-Z0-9_-]*|"") ;;
@@ -26,6 +26,8 @@ TOKEN_FILE="$DASHBOARD_DIR/public-token"
 IMG="$DASHBOARD_DIR/weather.png"
 TMP="$DASHBOARD_DIR/weather.once.$$"
 LOCK_FILE="/tmp/kindle-refresh.lock"
+STATUS_SENDER="${STATUS_SENDER:-$(dirname "$0")/send-status.sh}"
+EIPS_BIN="${EIPS_BIN:-/usr/sbin/eips}"
 
 # Detect if a native timeout command is available
 TIMEOUT_CMD=""
@@ -139,17 +141,24 @@ else
 	echo "$(date '+%Y-%m-%d %H:%M:%S') download failed; using previous image"
 fi
 
+DISPLAY_OK=0
 if [ -s "$IMG" ]; then
-	if ! timeout_cmd 15 /usr/sbin/eips -c; then
+	if ! timeout_cmd 15 "$EIPS_BIN" -c; then
 		echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed/timed out (eips -c)"
 		exit 1
-	elif ! timeout_cmd 15 /usr/sbin/eips -f; then
+	elif ! timeout_cmd 15 "$EIPS_BIN" -f; then
 		echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed/timed out (eips -f)"
 		exit 1
-	elif ! timeout_cmd 20 /usr/sbin/eips -g "$IMG"; then
+	elif ! timeout_cmd 20 "$EIPS_BIN" -g "$IMG"; then
 		echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed/timed out (eips -g)"
 		exit 1
+	else
+		DISPLAY_OK=1
 	fi
+fi
+
+if [ "$DISPLAY_OK" -eq 1 ] && [ -f "$STATUS_SENDER" ]; then
+	SERVER_HOST="$SERVER_HOST" DEVICE_ID="$DEVICE_ID" DASHBOARD_DIR="$DASHBOARD_DIR" sh "$STATUS_SENDER" >/dev/null 2>&1 || true
 fi
 
 exit 0

@@ -785,6 +785,14 @@ class SettingsServerTests(unittest.TestCase):
         )
         self.assertIn("Editing device:", text)
 
+    def test_selected_device_config_is_applied_to_theme_form(self):
+        _, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+
+        self.assertIn("function applyDeviceConfigToForm", text)
+        self.assertIn('querySelector(`input[name="theme"][value="${config.theme}"]`)', text)
+        self.assertIn("applyDeviceConfigToForm(configData)", text)
+
     def test_daily_notes_fields_do_not_block_main_settings_form(self):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")
@@ -1345,9 +1353,8 @@ class SettingsServerTests(unittest.TestCase):
             headers={"X-CSRF-Token": csrf},
         )
         self.assertEqual(status, 200)
-        self.mock_run.assert_called_once()
-        called_args = self.mock_run.call_args[0][0]
-        self.assertEqual(called_args, ["ssh", "-o", "BatchMode=yes", "root@192.168.68.150", "/mnt/us/dashboard/refresh.sh"])
+        self.assertIn(("push", "kitchen-kindle"), self.device_calls)
+        self.mock_run.assert_not_called()
 
     def test_push_non_kindle_is_rejected(self):
         # Add a generic PNG display
@@ -1742,6 +1749,16 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         connection.close()
         return status, body
 
+    def csrf_token(self):
+        status, body = self.request("/settings")
+        self.assertEqual(status, 200)
+        match = re.search(
+            rb'name="csrf_token" value="([^"]+)"',
+            body,
+        )
+        self.assertIsNotNone(match)
+        return match.group(1).decode("ascii")
+
     def post_json(self, path, payload, headers=None):
         request_headers = {"Content-Type": "application/json"}
         if headers:
@@ -2129,6 +2146,61 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("firmware_version", script)
         self.assertNotIn("] && command -v", script)
 
+    def test_installer_refresh_uses_absolute_eips_without_path_lookup(self):
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        created = json.loads(body)
+
+        status, body = self.request(
+            "/install/kindle/kitchen-kindle?token="
+            + created["pairing_token"]
+        )
+        script = body.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        self.assertIn('EIPS_BIN="/usr/sbin/eips"', script)
+        self.assertIn('"$EIPS_BIN" -g "$DASHBOARD_DIR/image.png"', script)
+        self.assertNotIn("command -v eips", script)
+        self.assertNotIn("\neips ", script)
+
+    def test_installer_contains_idempotent_multi_device_layout(self):
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        created = json.loads(body)
+
+        status, body = self.request(
+            "/install/kindle/kitchen-kindle?token="
+            + created["pairing_token"]
+        )
+        script = body.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        for path in (
+            "device.env",
+            "device-id",
+            "status-token",
+            "status.sh",
+            "refresh.sh",
+            "start.sh",
+            "stop.sh",
+            "dashboard_loop.sh",
+        ):
+            self.assertIn(path, script)
+        self.assertIn('mkdir -p "$DASHBOARD_DIR"', script)
+        self.assertIn('cat <<', script)
+
     def test_pair_endpoint_requires_token_and_marks_status_seen(self):
         status, _, body = self.post_json(
             "/api/devices",
@@ -2225,6 +2297,25 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn('class="regenerated-installer-command"', text)
         self.assertNotIn("/home/user/.ssh", text)
         self.assertNotIn("known_hosts", text)
+
+    def test_settings_html_does_not_embed_device_status_tokens(self):
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        created = json.loads(body)
+
+        status, body = self.request("/settings")
+        text = body.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        self.assertNotIn(created["status_token"], text)
+        self.assertNotIn("deviceStatusTokens", text)
+        self.assertNotIn("X-Device-Token", text)
 
     def test_settings_page_survives_invalid_device_registry(self):
         (self.root / "devices.json").write_text(
@@ -2520,7 +2611,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         content_b = path_b.read_bytes()
         self.assertNotEqual(content_k, content_b)
 
-    def test_push_with_valid_token_succeeds(self):
+    def test_push_requires_csrf_and_rejects_status_token(self):
         status_k, _, body_k = self.post_json(
             "/api/devices",
             {
@@ -2540,9 +2631,22 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         status = response.status
         response.read()
         conn.close()
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 403)
 
-    def test_push_with_invalid_token_fails(self):
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            f"/api/device/{id_k}/push",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body.decode("utf-8")),
+            {"ok": True, "message": "generated and pushed"},
+        )
+        self.mock_device.push.assert_called()
+
+    def test_push_with_invalid_csrf_fails(self):
         status_k, _, body_k = self.post_json(
             "/api/devices",
             {
@@ -2556,7 +2660,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         id_k = res_k["device"]["id"]
 
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": "invalid-token-12345"})
+        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-CSRF-Token": "invalid-token-12345"})
         response = conn.getresponse()
         status = response.status
         body = response.read()
@@ -2564,7 +2668,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(body.decode("utf-8"))["error"], "invalid request token")
 
-    def test_push_kitchen_uses_kitchen_specific_token(self):
+    def test_status_token_only_authenticates_status_endpoint(self):
         status_k, _, body_k = self.post_json(
             "/api/devices",
             {
@@ -2577,42 +2681,16 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         id_k = res_k["device"]["id"]
         token_k = res_k["status_token"]
 
-        status_b, _, body_b = self.post_json(
-            "/api/devices",
-            {
-                "type": "kindle_pw1",
-                "name": "Bedroom Kindle",
-                "theme": "minimal_weather",
-            },
+        status, _, body = self.post_json(
+            f"/api/device/{id_k}/status",
+            {"battery_percent": 83},
+            headers={"X-Device-Token": token_k},
         )
-        res_b = json.loads(body_b)
-        id_b = res_b["device"]["id"]
-        token_b = res_b["status_token"]
-
-        # Push to kitchen with bedroom's token fails
-        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": token_b})
-        response = conn.getresponse()
-        status = response.status
-        response.read()
-        conn.close()
-        self.assertEqual(status, 403)
-
-        # Push to kitchen with kitchen's own token succeeds
-        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": token_k})
-        response = conn.getresponse()
-        status = response.status
-        response.read()
-        conn.close()
         self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body.decode("utf-8"))["ok"])
 
     @mock.patch("subprocess.run")
-    def test_push_endpoint_builds_ssh_command(self, mock_run):
-        mock_result = mock.MagicMock()
-        mock_result.returncode = 0
-        mock_run.return_value = mock_result
-
+    def test_push_endpoint_uses_kindle_device_runner_not_raw_ssh(self, mock_run):
         status_k, _, body_k = self.post_json(
             "/api/devices",
             {
@@ -2624,97 +2702,17 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(status_k, 201)
         res_k = json.loads(body_k)
         id_k = res_k["device"]["id"]
-        token_k = res_k["status_token"]
 
-        device = self.registry.get(id_k)
-        status_path = self.root / f"devices/{id_k}/status.json"
-        status_path.parent.mkdir(parents=True, exist_ok=True)
-        status_path.write_text(json.dumps({"ip_address": "192.168.68.200"}), encoding="utf-8")
-
-        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": token_k})
-        response = conn.getresponse()
-        status = response.status
-        body = response.read()
-        conn.close()
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            f"/api/device/{id_k}/push",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
 
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body.decode("utf-8")), {"ok": True, "message": "Dashboard generated and pushed"})
-
-        mock_run.assert_called_once()
-        called_args = mock_run.call_args[0][0]
-        self.assertEqual(called_args, ["ssh", "-o", "BatchMode=yes", "root@192.168.68.200", "/mnt/us/dashboard/refresh.sh"])
-
-    @mock.patch("subprocess.run")
-    def test_push_missing_ip_returns_clear_error(self, mock_run):
-        status_b, _, body_b = self.post_json(
-            "/api/devices",
-            {
-                "type": "kindle_pw1",
-                "name": "Bedroom Custom Kindle",
-                "theme": "home_dashboard",
-            },
-        )
-        res_b = json.loads(body_b)
-        id_b = res_b["device"]["id"]
-        token_b = res_b["status_token"]
-
-        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        conn.request("POST", f"/api/device/{id_b}/push", headers={"X-Device-Token": token_b})
-        response = conn.getresponse()
-        status = response.status
-        body = response.read()
-        conn.close()
-
-        self.assertEqual(status, 400)
-        self.assertEqual(json.loads(body.decode("utf-8"))["error"], "missing IP address for device")
         mock_run.assert_not_called()
-
-    @mock.patch("subprocess.run")
-    @mock.patch("builtins.print")
-    def test_push_failed_ssh_returns_error_and_logs(self, mock_print, mock_run):
-        mock_result = mock.MagicMock()
-        mock_result.returncode = 255
-        mock_result.stderr = "Permission denied (publickey)."
-        mock_run.return_value = mock_result
-
-        status_k, _, body_k = self.post_json(
-            "/api/devices",
-            {
-                "type": "kindle_pw1",
-                "name": "Kitchen Kindle",
-                "theme": "home_dashboard",
-            },
-        )
-        res_k = json.loads(body_k)
-        id_k = res_k["device"]["id"]
-        token_k = res_k["status_token"]
-
-        device = self.registry.get(id_k)
-        status_path = self.root / f"devices/{id_k}/status.json"
-        status_path.parent.mkdir(parents=True, exist_ok=True)
-        status_path.write_text(json.dumps({"ip_address": "192.168.68.200"}), encoding="utf-8")
-
-        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
-        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": token_k})
-        response = conn.getresponse()
-        status = response.status
-        body = response.read()
-        conn.close()
-
-        self.assertEqual(status, 500)
-        self.assertEqual(json.loads(body.decode("utf-8")), {"ok": False, "error": "Kindle command failed"})
-
-        any_logged_exit_code = False
-        any_logged_stderr = False
-        for call in mock_print.call_args_list:
-            arg = call[0][0]
-            if "255" in arg:
-                any_logged_exit_code = True
-            if "Permission denied" in arg:
-                any_logged_stderr = True
-        self.assertTrue(any_logged_exit_code)
-        self.assertTrue(any_logged_stderr)
+        self.mock_device.push.assert_called_once()
 
 
 if __name__ == "__main__":

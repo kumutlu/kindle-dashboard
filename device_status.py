@@ -21,11 +21,13 @@ STATUS_FIELDS = {
     "firmware_version",
     "last_refresh_at",
     "last_error",
+    "loop_status",
 }
 TEXT_LIMITS = {
     "ip_address": 80,
     "firmware_version": 80,
     "last_error": 500,
+    "loop_status": 40,
 }
 
 
@@ -74,6 +76,7 @@ def validate_status_update(value, now=None):
         "firmware_version": None,
         "last_refresh_at": None,
         "last_error": None,
+        "loop_status": None,
     }
 
     if "battery_percent" in value and value["battery_percent"] is not None:

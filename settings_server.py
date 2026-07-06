@@ -660,10 +660,13 @@ if [ -n "${IMAGE_URL:-}" ]; then
     fi
 fi
 
-if command -v eips >/dev/null 2>&1; then
-    eips -c || true
-    eips -f || true
-    eips -g "$DASHBOARD_DIR/image.png" || true
+EIPS_BIN="/usr/sbin/eips"
+if [ -x "$EIPS_BIN" ]; then
+    "$EIPS_BIN" -c || true
+    "$EIPS_BIN" -f || true
+    "$EIPS_BIN" -g "$DASHBOARD_DIR/image.png" || true
+else
+    echo "missing eips: $EIPS_BIN" >&2
 fi
 
 if [ -x "$DASHBOARD_DIR/status.sh" ]; then
@@ -907,6 +910,7 @@ def render_settings(
         f'<button type="button" data-device-action="{action}">{label}</button>'
         for action, label in (
             ("start-dashboard", "Start Dashboard"),
+            ("stop-dashboard", "Stop Dashboard"),
             ("home", "Return Home"),
             ("refresh", "Refresh Now"),
             ("autostart/enable", "Enable Autostart"),
@@ -921,10 +925,6 @@ def render_settings(
         )
     )
     saved_brightness = str(config.get("kindle_frontlight", 8))
-    device_status_tokens_json = json.dumps({
-        device["id"]: device.get("status_token") or ""
-        for device in (devices or [])
-    })
     if devices is None:
         devices = [{
             "id": "default-kindle",
@@ -2997,7 +2997,6 @@ button:disabled {{
 <script>
 const imageServerUrl = "{image_server_url}";
 const csrfToken = document.querySelector('[name="csrf_token"]').value;
-const deviceStatusTokens = {device_status_tokens_json};
 const deviceMessage = document.getElementById("device-message");
 const connectionValue = document.getElementById("kindle-connection");
 const brightnessValue = document.getElementById("kindle-brightness");
@@ -3007,17 +3006,6 @@ const deviceLog = document.getElementById("device-log");
 async function deviceApi(path, options = {{}}) {{
   const headers = {{ ... (options.headers || {{}}) }};
   if ((options.method || "GET") !== "GET") {{
-    // Check if it is a device-specific API POST request
-    const match = path.match(/^\/api\/device\/([a-z0-9][a-z0-9-]{{0,63}})\/(light|push|restart|start-dashboard|home|refresh|autostart\/(enable|disable))$/);
-    if (match) {{
-      const deviceId = match[1];
-      const token = deviceStatusTokens[deviceId] || "";
-      if (token) {{
-        headers["X-Device-Token"] = token;
-        headers["Authorization"] = "Bearer " + token;
-      }}
-    }}
-    // Always include global CSRF token for session authentication
     headers["X-CSRF-Token"] = csrfToken;
   }}
   const response = await fetch(path, {{ ...options, headers }});
@@ -3088,13 +3076,15 @@ async function loadDeviceState() {{
   
   // Fetch config dynamically to get the relative image_url
   let imageUrl = `/device/${{selected}}/image.png`;
+  let configData = null;
   try {{
     const configResp = await fetch(`/api/device/${{selected}}/config`);
     if (configResp.ok) {{
-      const configData = await configResp.json();
+      configData = await configResp.json();
       if (configData.image_url) {{
         imageUrl = configData.image_url;
       }}
+      applyDeviceConfigToForm(configData);
     }}
   }} catch (e) {{
     console.error("Failed to load device config:", e);
@@ -3172,6 +3162,26 @@ async function loadDeviceState() {{
     brightnessValue.textContent = "—";
     autostartValue.textContent = "—";
     if (deviceLog) deviceLog.textContent = "Failed to fetch log: " + error.message;
+  }}
+}}
+
+function applyDeviceConfigToForm(config) {{
+  if (!config || typeof config !== "object") return;
+  if (config.theme) {{
+    const themeInput = document.querySelector(`input[name="theme"][value="${{config.theme}}"]`);
+    if (themeInput && !themeInput.disabled) themeInput.checked = true;
+  }}
+  if (config.refresh_interval_minutes !== undefined) {{
+    const refreshInput = document.querySelector('[name="refresh_interval_minutes"]');
+    if (refreshInput) refreshInput.value = String(config.refresh_interval_minutes);
+  }}
+  if (config.kindle_frontlight !== undefined) {{
+    const frontlightInput = document.querySelector('[name="kindle_frontlight"]');
+    if (frontlightInput) frontlightInput.value = String(config.kindle_frontlight);
+    const persistentLightDisplay = document.getElementById("persistent-light-display");
+    if (persistentLightDisplay) {{
+      persistentLightDisplay.innerHTML = `Current saved default: <strong>${{config.kindle_frontlight}}</strong>`;
+    }}
   }}
 }}
 
@@ -4560,6 +4570,7 @@ def make_handler(
                     return
                 known_paths = {
                     "/api/device/start-dashboard",
+                    "/api/device/stop-dashboard",
                     "/api/device/home",
                     "/api/device/refresh",
                     "/api/device/autostart/enable",
@@ -4572,7 +4583,7 @@ def make_handler(
                     self.handle_device_post(parsed.path)
                     return
                 device_control_post_match = re.match(
-                    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(light|push|restart|start-dashboard|home|refresh|autostart/enable|autostart/disable)$",
+                    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(light|push|restart|start-dashboard|stop-dashboard|home|refresh|autostart/enable|autostart/disable)$",
                     parsed.path,
                 )
                 if device_control_post_match is not None:
@@ -5128,24 +5139,7 @@ def make_handler(
                 device_id = "default-kindle"
             try:
                 selected = registry.get(device_id)
-                config = read_raw_device_config(selected)
-                expected_token = config.get("status_token")
-                is_authenticated = self.device_csrf_valid()
-                
-                device_token_supplied = (
-                    self.headers.get("X-Device-Token", "").strip()
-                    or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-                )
-                is_device_authenticated = False
-                if expected_token and device_token_supplied:
-                    is_device_authenticated = hmac.compare_digest(device_token_supplied, expected_token)
-
-                if not (is_authenticated or is_device_authenticated):
-                    print(
-                        f"[Error] Push/Device token validation failed for device {device_id}. "
-                        f"Global CSRF valid: {is_authenticated}, "
-                        f"Device token valid: {is_device_authenticated} (supplied: '{device_token_supplied}', expected: '{expected_token}')"
-                    )
+                if not self.device_csrf_valid():
                     self.send_json(
                         403,
                         {"ok": False, "error": "invalid request token"},
@@ -5178,6 +5172,7 @@ def make_handler(
                     return
                 action_paths = {
                     "start-dashboard": "start",
+                    "stop-dashboard": "stop",
                     "home": "home",
                     "refresh": "refresh",
                     "autostart/enable": "autostart_enable",
@@ -5195,86 +5190,12 @@ def make_handler(
                     )
                     payload = {"ok": True, "message": message}
                 elif action_suffix == "push":
-                    # 1. Resolve device IP address
-                    ip_address = None
-                    
-                    # 1.a. Check status.json
-                    status_file = device_status.status_path(selected)
-                    if status_file.exists():
-                        try:
-                            status_data = json.loads(status_file.read_text(encoding="utf-8"))
-                            ip_address = status_data.get("ip_address")
-                        except Exception:
-                            pass
-                            
-                    # 1.b. Check registry connection host
-                    if not ip_address:
-                        if selected.connection and isinstance(selected.connection, dict):
-                            ip_address = selected.connection.get("host")
-                            
-                    # 1.c. Check raw device config connection host
-                    if not ip_address:
-                        try:
-                            raw_config = read_raw_device_config(selected)
-                            conn_conf = raw_config.get("connection")
-                            if conn_conf and isinstance(conn_conf, dict):
-                                ip_address = conn_conf.get("host")
-                        except Exception:
-                            pass
-                            
-                    # 1.d. Fallback to static IPs for known devices
-                    if not ip_address:
-                        fallback_ips = {
-                            "kitchen": "192.168.68.122",
-                            "kitchen-kindle": "192.168.68.122",
-                            "default-kindle": "192.168.68.119",
-                        }
-                        ip_address = fallback_ips.get(selected.id)
-
-                    if not ip_address:
-                        self.send_json(
-                            400,
-                            {"ok": False, "error": "missing IP address for device"},
-                        )
-                        return
-
-                    # 2. Render selected device dashboard image
-                    render_selected(selected.id)
-
-                    # 3. Trigger remote refresh on Kindle via SSH
-                    cmd = ["ssh", "-o", "BatchMode=yes", f"root@{ip_address}", "/mnt/us/dashboard/refresh.sh"]
-                    try:
-                        result = subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                            check=False,
-                        )
-                    except OSError as exc:
-                        print(f"[Error] Failed to start SSH process: {exc}")
-                        self.send_json(
-                            500,
-                            {"ok": False, "error": f"Kindle command failed: {str(exc)}"},
-                        )
-                        return
-                    except subprocess.TimeoutExpired as exc:
-                        print(f"[Error] SSH process timed out: {exc}")
-                        self.send_json(
-                            503,
-                            {"ok": False, "error": "Kindle command timed out"},
-                        )
-                        return
-
-                    if result.returncode != 0:
-                        print(f"[Error] Kindle command failed with exit code {result.returncode}. Stderr: {result.stderr}")
-                        self.send_json(
-                            500,
-                            {"ok": False, "error": "Kindle command failed"},
-                        )
-                        return
-
-                    payload = {"ok": True, "message": "Dashboard generated and pushed"}
+                    message = device.push(
+                        connection=selected.connection,
+                        device_id=selected.id,
+                        device_type=selected.type,
+                    )
+                    payload = {"ok": True, "message": message}
                 elif action_suffix == "light":
                     candidate = self.read_json()
                     level = candidate.get("level")

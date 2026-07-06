@@ -34,19 +34,37 @@ SSH_PROFILES = {
     },
 }
 
+def require_script_command(path):
+    return (
+        f'if [ ! -x {path} ]; then '
+        f'echo "missing script: {path}" >&2; exit 127; '
+        f"fi; exec {path}"
+    )
+
+
 ACTION_COMMANDS = {
     "start": (
-        "/mnt/us/dashboard/start.sh",
+        require_script_command("/mnt/us/dashboard/start.sh"),
         "Dashboard started",
         20,
     ),
+    "stop": (
+        require_script_command("/mnt/us/dashboard/stop.sh"),
+        "Dashboard stopped",
+        20,
+    ),
     "home": (
-        "/mnt/us/dashboard/home.sh",
+        (
+            "if [ -x /mnt/us/dashboard/home.sh ]; then "
+            "exec /mnt/us/dashboard/home.sh; "
+            "fi; "
+            "lipc-set-prop com.lab126.appmgrd start app://com.lab126.booklet.home"
+        ),
         "Kindle Home opened",
         20,
     ),
     "refresh": (
-        "/mnt/us/dashboard/refresh-once.sh",
+        require_script_command("/mnt/us/dashboard/refresh.sh"),
         "Dashboard refreshed",
         60,
     ),
@@ -167,6 +185,9 @@ class KindleDevice:
         except OSError as exc:
             raise DeviceError("Kindle command could not start") from exc
         if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            if detail:
+                raise DeviceError(f"Kindle command failed: {detail[-500:]}")
             raise DeviceError("Kindle command failed")
         return result.stdout
 

@@ -22,12 +22,22 @@ class KindleDeviceTests(unittest.TestCase):
 
         args, kwargs = run.call_args
         self.assertIsInstance(args[0], list)
-        self.assertEqual(
-            args[0][-1],
-            "/mnt/us/dashboard/refresh-once.sh",
-        )
+        self.assertIn("/mnt/us/dashboard/refresh.sh", args[0][-1])
+        self.assertIn("missing script", args[0][-1])
         self.assertNotIn("shell", kwargs)
         self.assertEqual(message, "Dashboard refreshed")
+
+    def test_actions_map_to_installed_multi_device_scripts(self):
+        expected = {
+            "start": "/mnt/us/dashboard/start.sh",
+            "refresh": "/mnt/us/dashboard/refresh.sh",
+            "stop": "/mnt/us/dashboard/stop.sh",
+        }
+        for action, script in expected.items():
+            with self.subTest(action=action):
+                command, _, _ = kindle_device.ACTION_COMMANDS[action]
+                self.assertIn(script, command)
+                self.assertIn("missing script", command)
 
     def test_unsupported_action_is_rejected_before_subprocess(self):
         with mock.patch("kindle_device.subprocess.run") as run:
@@ -95,10 +105,7 @@ class KindleDeviceTests(unittest.TestCase):
             message = self.device.push()
 
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(
-            run.call_args_list[0].args[0][-1],
-            "/mnt/us/dashboard/refresh-once.sh",
-        )
+        self.assertIn("/mnt/us/dashboard/refresh.sh", run.call_args_list[0].args[0][-1])
         self.assertEqual(message, "Dashboard generated and pushed")
 
     def test_timeout_returns_safe_device_error(self):
@@ -225,7 +232,7 @@ class KindleDeviceTests(unittest.TestCase):
         
         # Verify SSH refresh was called on the remote device
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args[0][0][-1], "/mnt/us/dashboard/refresh-once.sh")
+        self.assertIn("/mnt/us/dashboard/refresh.sh", run.call_args[0][0][-1])
 
 
 if __name__ == "__main__":

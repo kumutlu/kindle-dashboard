@@ -514,14 +514,17 @@ done
 
 # Fallback to lipc properties if sysfs power supply was empty (e.g. on PW1)
 if [ -z "$BATTERY_PERCENT" ] && command -v lipc-get-prop >/dev/null 2>&1; then
-    LIPC_BAT=$(lipc-get-prop com.lab126.powerd batteryLevel 2>/dev/null | tr -d '\\r\\n')
+    LIPC_BAT=$(lipc-get-prop com.lab126.powerd battLevel 2>/dev/null | tr -d '[]\\r\\n')
+    if [ -z "$LIPC_BAT" ]; then
+        LIPC_BAT=$(lipc-get-prop com.lab126.powerd batteryLevel 2>/dev/null | tr -d '[]\\r\\n')
+    fi
     case "$LIPC_BAT" in
         ""|*[!0-9]*) ;;
         *) BATTERY_PERCENT="$LIPC_BAT" ;;
     esac
 fi
 if [ -z "$CHARGING" ] && command -v lipc-get-prop >/dev/null 2>&1; then
-    LIPC_CHG=$(lipc-get-prop com.lab126.powerd isCharging 2>/dev/null | tr -d '\\r\\n')
+    LIPC_CHG=$(lipc-get-prop com.lab126.powerd isCharging 2>/dev/null | tr -d '[]\\r\\n')
     case "$LIPC_CHG" in
         1|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]) CHARGING="true" ;;
         0|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]) CHARGING="false" ;;
@@ -530,7 +533,10 @@ fi
 
 IP_ADDRESS=""
 if command -v ifconfig >/dev/null 2>&1; then
-    IP_ADDRESS=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\\([0-9.][0-9.]*\\).*/\\1/p' | sed -n '1p')
+    IP_ADDRESS=$(ifconfig wlan0 2>/dev/null | grep 'inet addr:' | cut -d: -f2 | awk '{print $1}' | tr -d ' \\t\\r\\n')
+    if [ -z "$IP_ADDRESS" ]; then
+        IP_ADDRESS=$(ifconfig wlan0 2>/dev/null | grep 'inet addr:' | cut -d: -f2 | sed -e 's/^[ \\t]*//' | cut -d' ' -f1 | tr -d ' \\t\\r\\n')
+    fi
 fi
 if [ -z "$IP_ADDRESS" ] && command -v ip >/dev/null 2>&1; then
     IP_ADDRESS=$(ip route get "${SERVER_HOST:-127.0.0.1}" 2>/dev/null | sed -n 's/.* src \\([0-9.][0-9.]*\\).*/\\1/p' | sed -n '1p')
@@ -539,7 +545,7 @@ if [ -z "$IP_ADDRESS" ] && command -v ip >/dev/null 2>&1; then
     fi
 fi
 if [ -z "$IP_ADDRESS" ] && command -v ifconfig >/dev/null 2>&1; then
-    IP_ADDRESS=$(ifconfig 2>/dev/null | sed -n 's/.*inet addr:\\([0-9.][0-9.]*\\).*/\\1/p' | grep -v '^127\\.' | sed -n '1p')
+    IP_ADDRESS=$(ifconfig 2>/dev/null | grep 'inet addr:' | grep -v '127.0.0.1' | cut -d: -f2 | awk '{print $1}' | tr -d ' \\t\\r\\n')
 fi
 
 FIRMWARE_VERSION=""

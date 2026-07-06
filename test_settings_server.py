@@ -2103,6 +2103,8 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         # Verify wlan0 IP preference, lipc battery level fallback, and prettyversion.txt firmware version extraction
         self.assertIn("ifconfig wlan0", script)
         self.assertIn("lipc-get-prop", script)
+        self.assertIn("battLevel", script)
+        self.assertIn("awk '{print $1}'", script)
         self.assertIn("/etc/prettyversion.txt", script)
         self.assertIn("firmware_version", script)
 

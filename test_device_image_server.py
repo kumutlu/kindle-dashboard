@@ -24,7 +24,11 @@ class DeviceImageServerTests(unittest.TestCase):
         self.legacy_image = self.root / "kindle_weather.png"
         self.legacy_image.write_bytes(self.PNG_BYTES)
         self.registry = DeviceRegistry(self.root)
-        self.registry.get("default-kindle")
+        self.default_device = self.registry.get("default-kindle")
+        self.device_image = self.default_device.image_path
+        self.device_image.write_bytes(
+            b"\x89PNG\r\n\x1a\ndefault-device-image"
+        )
         self.server = serve_image.make_server(
             host="127.0.0.1",
             port=0,
@@ -65,7 +69,7 @@ class DeviceImageServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "image/png")
-        self.assertEqual(body, self.PNG_BYTES)
+        self.assertEqual(body, self.device_image.read_bytes())
 
         status, headers, body = self.request(
             "/device/default-kindle/image.png",
@@ -75,13 +79,15 @@ class DeviceImageServerTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "image/png")
         self.assertEqual(
             int(headers["Content-Length"]),
-            len(self.PNG_BYTES),
+            len(self.device_image.read_bytes()),
         )
         self.assertEqual(body, b"")
 
-    def test_weather_png_remains_the_live_default_alias(self):
+    def test_weather_png_remains_legacy_alias_but_device_endpoint_is_isolated(self):
         newer = b"\x89PNG\r\n\x1a\nnewer-legacy-image"
+        device_bytes = b"\x89PNG\r\n\x1a\nmaarif-device-image"
         self.legacy_image.write_bytes(newer)
+        self.device_image.write_bytes(device_bytes)
 
         status, headers, body = self.request("/weather.png")
         self.assertEqual(status, 200)
@@ -92,7 +98,21 @@ class DeviceImageServerTests(unittest.TestCase):
             "/device/default-kindle/image.png"
         )
         self.assertEqual(status, 200)
-        self.assertEqual(device_body, newer)
+        self.assertEqual(device_body, device_bytes)
+
+    def test_maarif_device_endpoint_does_not_serve_stale_home_legacy_png(self):
+        stale_home_png = b"\x89PNG\r\n\x1a\nNOTTINGHAM HOME layout"
+        current_maarif_png = b"\x89PNG\r\n\x1a\nMAARIF CALENDAR layout"
+        self.legacy_image.write_bytes(stale_home_png)
+        self.device_image.write_bytes(current_maarif_png)
+
+        status, _, body = self.request(
+            "/device/default-kindle/image.png"
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, current_maarif_png)
+        self.assertNotIn(b"NOTTINGHAM HOME", body)
 
     def test_invalid_unknown_and_traversal_device_paths_are_404(self):
         for path in (

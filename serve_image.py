@@ -86,10 +86,10 @@ def make_handler(
                 match.group(1),
                 require_enabled=True,
             )
-            # Until the renderer refactor, default-kindle follows the
-            # continuously generated legacy image. Other registered devices
-            # use their isolated cached image.
-            if device.id == "default-kindle":
+            if (
+                device.id == "default-kindle"
+                and not device.image_path.exists()
+            ):
                 return legacy_image_path
             return device.image_path
 

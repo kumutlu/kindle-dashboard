@@ -2892,12 +2892,13 @@ async function deviceApi(path, options = {{}}) {{
     if (match) {{
       const deviceId = match[1];
       const token = deviceStatusTokens[deviceId] || "";
-      headers["X-Device-Token"] = token;
-      headers["X-CSRF-Token"] = token;
-      headers["Authorization"] = "Bearer " + token;
-    }} else {{
-      headers["X-CSRF-Token"] = csrfToken;
+      if (token) {{
+        headers["X-Device-Token"] = token;
+        headers["Authorization"] = "Bearer " + token;
+      }}
     }}
+    // Always include global CSRF token for session authentication
+    headers["X-CSRF-Token"] = csrfToken;
   }}
   const response = await fetch(path, {{ ...options, headers }});
   const data = await response.json();
@@ -5009,28 +5010,27 @@ def make_handler(
                 selected = registry.get(device_id)
                 config = read_raw_device_config(selected)
                 expected_token = config.get("status_token")
-                supplied = (
-                    self.headers.get("X-Device-Token")
-                    or self.headers.get("X-CSRF-Token")
+                is_authenticated = self.device_csrf_valid()
+                
+                device_token_supplied = (
+                    self.headers.get("X-Device-Token", "").strip()
                     or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
                 )
+                is_device_authenticated = False
+                if expected_token and device_token_supplied:
+                    is_device_authenticated = hmac.compare_digest(device_token_supplied, expected_token)
 
-                if expected_token:
-                    if not hmac.compare_digest(supplied or "", expected_token):
-                        print(f"[Error] Push/Device action failed: expected status_token for device {device_id}")
-                        self.send_json(
-                            403,
-                            {"ok": False, "error": "invalid request token"},
-                        )
-                        return
-                else:
-                    if not self.device_csrf_valid():
-                        print(f"[Error] Push/Device action failed: expected global CSRF token for device {device_id}")
-                        self.send_json(
-                            403,
-                            {"ok": False, "error": "invalid request token"},
-                        )
-                        return
+                if not (is_authenticated or is_device_authenticated):
+                    print(
+                        f"[Error] Push/Device token validation failed for device {device_id}. "
+                        f"Global CSRF valid: {is_authenticated}, "
+                        f"Device token valid: {is_device_authenticated} (supplied: '{device_token_supplied}', expected: '{expected_token}')"
+                    )
+                    self.send_json(
+                        403,
+                        {"ok": False, "error": "invalid request token"},
+                    )
+                    return
 
                 action_suffix = path.split("/")[-1]
                 if "autostart" in path:

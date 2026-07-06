@@ -57,6 +57,15 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(upgraded["latitude"])
         self.assertIsNone(upgraded["longitude"])
 
+    def test_legacy_theme_alias_is_normalized(self):
+        legacy = dict(weather_image.DEFAULT_CONFIG)
+        legacy.pop("theme")
+        legacy["dashboard_mode"] = "maarif_calendar"
+
+        upgraded = weather_image.validate_config(legacy)
+
+        self.assertEqual(upgraded["theme"], "maarif_calendar")
+
 
 class PiholeSessionTests(unittest.TestCase):
     def test_close_session_uses_delete_with_sid_header(self):
@@ -116,6 +125,7 @@ class SettingsServerTests(unittest.TestCase):
         )
         self.regeneration_calls = 0
         self.rendered_device_ids = []
+        self.rendered_device_themes = []
         self.fail_regeneration = False
         self.device_calls = []
         self.settings_restart_calls = 0
@@ -208,6 +218,14 @@ class SettingsServerTests(unittest.TestCase):
         def render_selected(device_id):
             self.regeneration_calls += 1
             self.rendered_device_ids.append(device_id)
+            device = self.registry.get(device_id, require_enabled=True)
+            rendered_config = weather_image.load_effective_device_config(
+                device,
+                self.registry,
+            )
+            self.rendered_device_themes.append(
+                rendered_config["theme"],
+            )
             if self.fail_regeneration:
                 raise RuntimeError("controlled regeneration failure")
 
@@ -555,6 +573,7 @@ class SettingsServerTests(unittest.TestCase):
                     self.rendered_device_ids[-1],
                     "default-kindle",
                 )
+                self.assertEqual(self.rendered_device_themes[-1], theme)
                 self.assertEqual(saved["kindle_frontlight"], 8)
                 self.assertEqual(saved["refresh_interval_minutes"], 30)
                 self.assertEqual(saved["prayer_method"], 13)
@@ -649,6 +668,10 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(
             self.rendered_device_ids[-1],
             "kitchen-kindle",
+        )
+        self.assertEqual(
+            self.rendered_device_themes[-1],
+            "compact_dashboard",
         )
         self.assertEqual(self.config_path.read_bytes(), legacy_before)
 
@@ -1735,6 +1758,25 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "/home/user/.ssh",
         ):
             self.assertNotIn(forbidden, serialized)
+
+    def test_default_device_config_inherits_global_theme_when_device_theme_missing(self):
+        device = self.registry.get("default-kindle")
+        device_config = json.loads(
+            device.config_path.read_text(encoding="utf-8")
+        )
+        device_config.pop("theme")
+        device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        status, body = self.request(
+            "/api/device/default-kindle/config"
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["theme"], "family_dashboard")
 
     def test_invalid_unknown_and_traversal_device_config_is_404(self):
         for path in (

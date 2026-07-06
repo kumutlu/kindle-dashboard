@@ -22,6 +22,7 @@ from kindle_device import DeviceError, KindleDevice
 from weather_image import (
     DEFAULT_CONFIG,
     geocode_locations,
+    load_effective_device_config,
     load_config,
     render_device,
     validate_config,
@@ -66,12 +67,7 @@ def public_device_config(device, config):
 def public_devices(registry, legacy_config_path):
     devices = []
     for device in registry.load():
-        selected_config_path = (
-            Path(legacy_config_path)
-            if device.id == "default-kindle"
-            else device.config_path
-        )
-        config = load_config(selected_config_path)
+        config = load_effective_device_config(device, registry)
         value = {
             "id": device.id,
             "name": device.name,
@@ -247,13 +243,7 @@ def update_device_config(
     legacy_before = (
         legacy_config_path.read_bytes() if legacy_existed else None
     )
-    current_path = target_path
-    if (
-        device.id == "default-kindle"
-        and not current_path.exists()
-    ):
-        current_path = legacy_config_path
-    current = load_config(current_path)
+    current = load_effective_device_config(device, registry)
     candidate = dict(candidate)
     for field in (
         "kindle_frontlight",
@@ -3654,16 +3644,11 @@ def make_handler(
                 except DeviceNotFoundError:
                     self.send_bytes(404, b"", "text/plain")
                     return
-                selected_config_path = (
-                    config_path
-                    if selected.id == "default-kindle"
-                    else selected.config_path
-                )
                 self.send_json(
                     200,
                     public_device_config(
                         selected,
-                        load_config(selected_config_path),
+                        load_effective_device_config(selected, registry),
                     ),
                 )
                 return
@@ -4351,12 +4336,10 @@ def make_handler(
                 )
                 if not submitted_theme:
                     try:
-                        current_config_path = (
-                            config_path
-                            if selected_device.id == "default-kindle"
-                            else selected_device.config_path
+                        current_config = load_effective_device_config(
+                            selected_device,
+                            registry,
                         )
-                        current_config = load_config(current_config_path)
                         submitted_theme = current_config.get("theme", "home_dashboard")
                     except Exception:
                         submitted_theme = "home_dashboard"

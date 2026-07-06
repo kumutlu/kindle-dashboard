@@ -102,6 +102,100 @@ class DeviceRendererTests(unittest.TestCase):
         with Image.open(self.default_device.image_path) as generated:
             self.assertEqual(generated.size, (758, 1024))
 
+    def test_default_device_inherits_global_theme_when_device_theme_missing(self):
+        self.legacy_config["theme"] = "maarif_calendar"
+        (self.root / "dashboard_config.json").write_text(
+            json.dumps(self.legacy_config),
+            encoding="utf-8",
+        )
+        device_config = dict(self.legacy_config)
+        device_config.pop("theme")
+        device_config["title"] = "DEVICE DEFAULT"
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        rendered_themes = []
+
+        def fake_maarif_renderer(config):
+            rendered_themes.append(config["theme"])
+            self.fake_renderer(config)
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"maarif_calendar": fake_maarif_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(rendered_themes, ["maarif_calendar"])
+        self.assertEqual(result["theme"], "maarif_calendar")
+
+    def test_default_device_explicit_theme_overrides_global_theme(self):
+        self.legacy_config["theme"] = "maarif_calendar"
+        (self.root / "dashboard_config.json").write_text(
+            json.dumps(self.legacy_config),
+            encoding="utf-8",
+        )
+        device_config = dict(self.legacy_config)
+        device_config["theme"] = "compact_dashboard"
+        device_config["title"] = "DEVICE DEFAULT"
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        rendered_themes = []
+
+        def fake_compact_renderer(config):
+            rendered_themes.append(config["theme"])
+            self.fake_renderer(config)
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"compact_dashboard": fake_compact_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(rendered_themes, ["compact_dashboard"])
+        self.assertEqual(result["theme"], "compact_dashboard")
+
+    def test_legacy_theme_alias_is_normalized_for_device_rendering(self):
+        device_config = dict(self.legacy_config)
+        device_config.pop("theme")
+        device_config["dashboard_mode"] = "maarif_calendar"
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        rendered_themes = []
+
+        def fake_maarif_renderer(config):
+            rendered_themes.append(config["theme"])
+            self.fake_renderer(config)
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"maarif_calendar": fake_maarif_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(rendered_themes, ["maarif_calendar"])
+        self.assertEqual(result["theme"], "maarif_calendar")
+
     def test_render_named_device_uses_isolated_config_and_output(self):
         kitchen = self.registry.add({
             "id": "kitchen-kindle",

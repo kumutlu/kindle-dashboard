@@ -75,6 +75,14 @@ STRING_LIMITS = {
     "timezone": 64,
     "theme": 40,
 }
+THEME_ALIAS_FIELDS = (
+    "dashboard_type",
+    "dashboard_mode",
+    "display_mode",
+    "layout",
+    "mode",
+    "style",
+)
 OPTIONAL_LOCATION_FIELDS = {
     "location",
     "country",
@@ -186,9 +194,24 @@ def should_regenerate_maarif(config):
 
 
 
+def normalize_theme_field(value):
+    value = dict(value)
+    theme = value.get("theme")
+    if not (isinstance(theme, str) and theme.strip()):
+        for alias in THEME_ALIAS_FIELDS:
+            alias_value = value.get(alias)
+            if isinstance(alias_value, str) and alias_value.strip():
+                value["theme"] = alias_value
+                break
+    for alias in THEME_ALIAS_FIELDS:
+        value.pop(alias, None)
+    return value
+
+
 def validate_config(value):
     if not isinstance(value, dict):
         raise ValueError("configuration must be a JSON object")
+    value = normalize_theme_field(value)
     unknown = set(value) - set(DEFAULT_CONFIG)
     required = set(DEFAULT_CONFIG) - OPTIONAL_LOCATION_FIELDS
     if unknown or not required.issubset(value):
@@ -281,6 +304,36 @@ def load_config(path=CONFIG_PATH):
     except Exception:
         print("Dashboard config missing or invalid; using Nottingham defaults")
         return dict(DEFAULT_CONFIG)
+
+
+def load_config_strict(path):
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return validate_config(raw)
+
+
+def merge_config(base, override):
+    merged = dict(base)
+    override = normalize_theme_field(override)
+    for key, value in override.items():
+        if key == "theme" and not (
+            isinstance(value, str) and value.strip()
+        ):
+            continue
+        merged[key] = value
+    return validate_config(merged)
+
+
+def load_effective_device_config(device, registry):
+    try:
+        base = load_config_strict(registry.legacy_config_path)
+    except Exception:
+        base = dict(DEFAULT_CONFIG)
+
+    if not device.config_path.exists():
+        return base
+
+    raw_device = json.loads(device.config_path.read_text(encoding="utf-8"))
+    return merge_config(base, raw_device)
 
 
 def weather_url(query):
@@ -2679,13 +2732,7 @@ def render_device(device_id, force=False, registry=None):
         registry = DeviceRegistry(PROJECT_DIR)
     device = registry.get(device_id, require_enabled=True)
     resolution = tuple(device.resolution or (W, H))
-    config_path = device.config_path
-    if (
-        device.id == "default-kindle"
-        and not config_path.exists()
-    ):
-        config_path = registry.legacy_config_path
-    config = load_config(config_path)
+    config = load_effective_device_config(device, registry)
     config["device_id"] = device.id
     lock_path = device.image_path.with_name(".render.lock")
     state_path = device.image_path.with_name("render_state.json")

@@ -2107,6 +2107,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("awk '{print $1}'", script)
         self.assertIn("/etc/prettyversion.txt", script)
         self.assertIn("firmware_version", script)
+        self.assertNotIn("] && command -v", script)
 
     def test_pair_endpoint_requires_token_and_marks_status_seen(self):
         status, _, body = self.post_json(

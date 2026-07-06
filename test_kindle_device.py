@@ -22,7 +22,9 @@ class KindleDeviceTests(unittest.TestCase):
 
         args, kwargs = run.call_args
         self.assertIsInstance(args[0], list)
+        self.assertIn("/mnt/us/dashboard/device.env", args[0][-1])
         self.assertIn("/mnt/us/dashboard/refresh.sh", args[0][-1])
+        self.assertIn("/mnt/us/dashboard/refresh-once.sh", args[0][-1])
         self.assertIn("missing script", args[0][-1])
         self.assertNotIn("shell", kwargs)
         self.assertEqual(message, "Dashboard refreshed")
@@ -37,7 +39,33 @@ class KindleDeviceTests(unittest.TestCase):
             with self.subTest(action=action):
                 command, _, _ = kindle_device.ACTION_COMMANDS[action]
                 self.assertIn(script, command)
-                self.assertIn("missing script", command)
+        self.assertIn("missing script", kindle_device.ACTION_COMMANDS["start"][0])
+        self.assertIn("/mnt/us/dashboard/start-dashboard.sh --manual", kindle_device.ACTION_COMMANDS["start"][0])
+        self.assertIn("refresh-once.sh", kindle_device.ACTION_COMMANDS["refresh"][0])
+        self.assertIn("pkill", kindle_device.ACTION_COMMANDS["stop"][0])
+
+    def test_default_refresh_uses_legacy_one_shot_when_not_migrated(self):
+        command, _, _ = kindle_device.ACTION_COMMANDS["refresh"]
+        self.assertIn("[ -f /mnt/us/dashboard/device.env ]", command)
+        self.assertIn("exec /mnt/us/dashboard/refresh-once.sh", command)
+        self.assertIn("refusing to run possible loop", command)
+
+    def test_remote_stderr_is_returned_in_device_error(self):
+        failed = subprocess.CompletedProcess(
+            [],
+            127,
+            stdout="",
+            stderr="missing script: /mnt/us/dashboard/refresh.sh\n",
+        )
+        with mock.patch(
+            "kindle_device.subprocess.run",
+            return_value=failed,
+        ):
+            with self.assertRaisesRegex(
+                kindle_device.DeviceError,
+                "missing script: /mnt/us/dashboard/refresh.sh",
+            ):
+                self.device.run_action("refresh")
 
     def test_unsupported_action_is_rejected_before_subprocess(self):
         with mock.patch("kindle_device.subprocess.run") as run:
@@ -105,7 +133,7 @@ class KindleDeviceTests(unittest.TestCase):
             message = self.device.push()
 
         self.assertEqual(run.call_count, 1)
-        self.assertIn("/mnt/us/dashboard/refresh.sh", run.call_args_list[0].args[0][-1])
+        self.assertIn("/mnt/us/dashboard/refresh-once.sh", run.call_args_list[0].args[0][-1])
         self.assertEqual(message, "Dashboard generated and pushed")
 
     def test_timeout_returns_safe_device_error(self):
@@ -233,6 +261,7 @@ class KindleDeviceTests(unittest.TestCase):
         # Verify SSH refresh was called on the remote device
         self.assertEqual(run.call_count, 1)
         self.assertIn("/mnt/us/dashboard/refresh.sh", run.call_args[0][0][-1])
+        self.assertIn("/mnt/us/dashboard/refresh-once.sh", run.call_args[0][0][-1])
 
 
 if __name__ == "__main__":

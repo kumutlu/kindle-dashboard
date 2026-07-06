@@ -78,10 +78,30 @@ def public_device_config(device, config):
         "resolution": list(device.resolution),
         "enabled": device.enabled,
     }
-    if "theme" in config:
-        payload["theme"] = config["theme"]
-    if "refresh_interval_minutes" in config:
-        payload["refresh_interval_minutes"] = config["refresh_interval_minutes"]
+    for key in (
+        "title",
+        "location",
+        "country",
+        "latitude",
+        "longitude",
+        "location_display",
+        "location_label",
+        "weather_query",
+        "timezone",
+        "theme",
+        "show_weather",
+        "show_forecast",
+        "show_server",
+        "show_pihole",
+        "show_tailscale",
+        "refresh_interval_minutes",
+        "prayer_method",
+        "prayer_school",
+        "prayer_high_latitude",
+        "hijri_adjustment",
+    ):
+        if key in config:
+            payload[key] = config[key]
     if "deep_sleep_minutes" in config:
         payload["deep_sleep_minutes"] = config["deep_sleep_minutes"]
     
@@ -3167,6 +3187,26 @@ async function loadDeviceState() {{
 
 function applyDeviceConfigToForm(config) {{
   if (!config || typeof config !== "object") return;
+  [
+    "title",
+    "location",
+    "country",
+    "latitude",
+    "longitude",
+    "location_display",
+    "weather_query",
+    "location_label",
+    "timezone",
+    "prayer_method",
+    "prayer_school",
+    "prayer_high_latitude",
+    "hijri_adjustment",
+  ].forEach(name => {{
+    const input = document.querySelector(`[name="${{name}}"]`);
+    if (input && config[name] !== undefined && config[name] !== null) {{
+      input.value = String(config[name]);
+    }}
+  }});
   if (config.theme) {{
     const themeInput = document.querySelector(`input[name="theme"][value="${{config.theme}}"]`);
     if (themeInput && !themeInput.disabled) themeInput.checked = true;
@@ -3183,6 +3223,16 @@ function applyDeviceConfigToForm(config) {{
       persistentLightDisplay.innerHTML = `Current saved default: <strong>${{config.kindle_frontlight}}</strong>`;
     }}
   }}
+  [
+    "show_weather",
+    "show_forecast",
+    "show_server",
+    "show_pihole",
+    "show_tailscale",
+  ].forEach(name => {{
+    const input = document.querySelector(`[name="${{name}}"]`);
+    if (input && typeof config[name] === "boolean") input.checked = config[name];
+  }});
 }}
 
 function applySelectedDevice(deviceId) {{

@@ -792,6 +792,19 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn("function applyDeviceConfigToForm", text)
         self.assertIn('querySelector(`input[name="theme"][value="${config.theme}"]`)', text)
         self.assertIn("applyDeviceConfigToForm(configData)", text)
+        for name in (
+            "title",
+            "location",
+            "country",
+            "latitude",
+            "longitude",
+            "location_display",
+            "weather_query",
+            "location_label",
+            "timezone",
+        ):
+            self.assertIn(f'"{name}"', text)
+        self.assertIn('querySelector(`[name="${name}"]`)', text)
 
     def test_daily_notes_fields_do_not_block_main_settings_form(self):
         _, _, body = self.request("GET", "/settings")
@@ -1749,6 +1762,25 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         connection.close()
         return status, body
 
+    def post_form(self, path, form):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request(
+            "POST",
+            path,
+            body=urlencode(form),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        response_headers = dict(response.getheaders())
+        status = response.status
+        connection.close()
+        return status, response_headers, body
+
     def csrf_token(self):
         status, body = self.request("/settings")
         self.assertEqual(status, 200)
@@ -1795,11 +1827,29 @@ class DeviceConfigEndpointTests(unittest.TestCase):
                 "name",
                 "type",
                 "resolution",
+                "enabled",
+                "title",
+                "location",
+                "country",
+                "latitude",
+                "longitude",
+                "location_display",
+                "location_label",
+                "weather_query",
+                "timezone",
                 "theme",
+                "show_weather",
+                "show_forecast",
+                "show_server",
+                "show_pihole",
+                "show_tailscale",
                 "refresh_interval_minutes",
                 "kindle_frontlight",
+                "prayer_method",
+                "prayer_school",
+                "prayer_high_latitude",
+                "hijri_adjustment",
                 "image_url",
-                "enabled",
             },
         )
         self.assertEqual(payload["device_id"], "default-kindle")
@@ -2006,6 +2056,121 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn("correct-token", json.dumps(payload))
         self.assertNotIn("status_token", json.dumps(payload))
+
+    def test_device_config_endpoint_returns_safe_persistent_settings(self):
+        kitchen = self.registry.add({
+            "id": "kitchen",
+            "name": "Kitchen",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen/config.json",
+            "image_path": "devices/kitchen/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            },
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "title": "KITCHEN",
+            "location": "Istanbul",
+            "country": "Türkiye",
+            "latitude": 41.0082,
+            "longitude": 28.9784,
+            "location_display": "Istanbul, Türkiye",
+            "location_label": "Istanbul, Türkiye",
+            "weather_query": "Istanbul",
+            "timezone": "Europe/Istanbul",
+            "theme": "travel_weather",
+            "refresh_interval_minutes": 30,
+            "kindle_frontlight": 4,
+            "status_token": "secret-status-token",
+            "pairing_token": "secret-pairing-token",
+        })
+        kitchen.config_path.write_text(
+            json.dumps(config),
+            encoding="utf-8",
+        )
+
+        status, body = self.request("/api/device/kitchen/config")
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        for key in (
+            "title",
+            "location",
+            "country",
+            "latitude",
+            "longitude",
+            "location_display",
+            "location_label",
+            "weather_query",
+            "timezone",
+            "theme",
+            "refresh_interval_minutes",
+            "kindle_frontlight",
+        ):
+            self.assertEqual(payload[key], config[key])
+        self.assertNotIn("status_token", payload)
+        self.assertNotIn("pairing_token", payload)
+
+    def test_kitchen_save_persists_only_kitchen_config(self):
+        kitchen = self.registry.add({
+            "id": "kitchen",
+            "name": "Kitchen",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen/config.json",
+            "image_path": "devices/kitchen/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            },
+        })
+        default_before = json.loads(
+            self.registry.get("default-kindle").config_path.read_text(
+                encoding="utf-8",
+            )
+        )
+        csrf = self.csrf_token()
+        form = {
+            "csrf_token": csrf,
+            "selected_device_id": "kitchen",
+            "title": "KITCHEN",
+            "location": "Istanbul",
+            "country": "Türkiye",
+            "latitude": "41.0082",
+            "longitude": "28.9784",
+            "location_display": "Istanbul, Türkiye",
+            "location_label": "Istanbul, Türkiye",
+            "weather_query": "Istanbul",
+            "timezone": "Europe/Istanbul",
+            "theme": "travel_weather",
+            "show_weather": "on",
+            "show_forecast": "on",
+            "refresh_interval_minutes": "30",
+        }
+
+        status, headers, _ = self.post_form(
+            "/settings",
+            form,
+        )
+
+        self.assertEqual(status, 303)
+        saved = json.loads(kitchen.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "travel_weather")
+        self.assertEqual(saved["weather_query"], "Istanbul")
+        self.assertEqual(saved["timezone"], "Europe/Istanbul")
+        default_after = json.loads(
+            self.registry.get("default-kindle").config_path.read_text(
+                encoding="utf-8",
+            )
+        )
+        self.assertEqual(default_after, default_before)
 
     def test_devices_api_includes_status_summary_without_token(self):
         self.post_json(

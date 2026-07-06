@@ -42,14 +42,56 @@ def require_script_command(path):
     )
 
 
+REFRESH_COMMAND = (
+    "if [ -f /mnt/us/dashboard/device.env ] && "
+    "[ -x /mnt/us/dashboard/refresh.sh ]; then "
+    "exec /mnt/us/dashboard/refresh.sh; "
+    "fi; "
+    "if [ -x /mnt/us/dashboard/refresh-once.sh ]; then "
+    "exec /mnt/us/dashboard/refresh-once.sh; "
+    "fi; "
+    "if [ -x /mnt/us/dashboard/refresh.sh ]; then "
+    "echo \"legacy refresh.sh exists but no device.env; "
+    "refusing to run possible loop\" >&2; exit 124; "
+    "fi; "
+    "echo \"missing script: /mnt/us/dashboard/refresh.sh "
+    "or /mnt/us/dashboard/refresh-once.sh\" >&2; exit 127"
+)
+
+
+START_COMMAND = (
+    "if [ -x /mnt/us/dashboard/start.sh ]; then "
+    "exec /mnt/us/dashboard/start.sh; "
+    "fi; "
+    "if [ -x /mnt/us/dashboard/start-dashboard.sh ]; then "
+    "exec /mnt/us/dashboard/start-dashboard.sh --manual; "
+    "fi; "
+    "echo \"missing script: /mnt/us/dashboard/start.sh "
+    "or /mnt/us/dashboard/start-dashboard.sh\" >&2; exit 127"
+)
+
+
+STOP_COMMAND = (
+    "if [ -x /mnt/us/dashboard/stop.sh ]; then "
+    "exec /mnt/us/dashboard/stop.sh; "
+    "fi; "
+    "pkill -f /mnt/us/dashboard/dashboard_loop.sh 2>/dev/null || true; "
+    "pkill -f /mnt/us/dashboard/watchdog.sh 2>/dev/null || true; "
+    "pkill -f /mnt/us/dashboard/refresh.sh 2>/dev/null || true; "
+    "rm -f /mnt/us/dashboard/dashboard_loop.pid "
+    "/mnt/us/dashboard/watchdog.pid 2>/dev/null || true; "
+    "echo \"Dashboard stopped\""
+)
+
+
 ACTION_COMMANDS = {
     "start": (
-        require_script_command("/mnt/us/dashboard/start.sh"),
+        START_COMMAND,
         "Dashboard started",
         20,
     ),
     "stop": (
-        require_script_command("/mnt/us/dashboard/stop.sh"),
+        STOP_COMMAND,
         "Dashboard stopped",
         20,
     ),
@@ -64,7 +106,7 @@ ACTION_COMMANDS = {
         20,
     ),
     "refresh": (
-        require_script_command("/mnt/us/dashboard/refresh.sh"),
+        REFRESH_COMMAND,
         "Dashboard refreshed",
         60,
     ),

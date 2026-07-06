@@ -2090,8 +2090,16 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn('SERVER_HOST="', script)
         self.assertIn('DEVICE_ID="kitchen-kindle"', script)
         self.assertIn('STATUS_TOKEN="' + created["status_token"] + '"', script)
-        self.assertIn("/device/kitchen-kindle/image.png", script)
         self.assertIn("/api/device/kitchen-kindle/status", script)
+        self.assertIn("status.sh", script)
+        self.assertIn("refresh.sh", script)
+        self.assertIn("start.sh", script)
+        self.assertIn("STATUS_URL=", script)
+        self.assertIn("IMAGE_URL=", script)
+        self.assertIn("Authorization: Bearer", script)
+        # Verify BusyBox-compatible syntax and chmod executions
+        self.assertIn('chmod +x "$DASHBOARD_DIR/status.sh"', script)
+        self.assertIn('"$DASHBOARD_DIR/status.sh" >/dev/null 2>&1', script)
 
     def test_pair_endpoint_requires_token_and_marks_status_seen(self):
         status, _, body = self.post_json(

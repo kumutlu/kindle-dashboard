@@ -42,6 +42,29 @@ DEVICE_CONFIG_RE = re.compile(
 DEVICE_STATUS_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/status$"
 )
+DEVICE_PAIR_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/pair$"
+)
+KINDLE_INSTALL_RE = re.compile(
+    r"^/install/kindle/([a-z0-9][a-z0-9-]{0,63})$"
+)
+DEVICE_PROFILES = {
+    "kindle_pw1": {
+        "label": "Kindle Paperwhite 1",
+        "type": "kindle_pw1",
+        "resolution": [758, 1024],
+    },
+    "esp32_800x480": {
+        "label": "ESP32 e-paper 800×480",
+        "type": "esp32_epaper",
+        "resolution": [800, 480],
+    },
+    "esp32_960x540": {
+        "label": "ESP32 e-paper 960×540",
+        "type": "esp32_epaper",
+        "resolution": [960, 540],
+    },
+}
 
 
 def public_device_config(device, config):
@@ -88,6 +111,50 @@ def public_devices(registry, legacy_config_path):
             value["connection"] = dict(device.connection)
         devices.append(value)
     return devices
+
+
+def slugify_device_name(value):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower())
+    slug = slug.strip("-")
+    return slug or "device"
+
+
+def unique_device_id(registry, base):
+    existing = {device.id for device in registry.load()}
+    if base not in existing:
+        return base
+    suffix = 2
+    while True:
+        candidate = f"{base}-{suffix}"
+        if candidate not in existing:
+            return candidate
+        suffix += 1
+
+
+def generate_device_token():
+    return secrets.token_urlsafe(32)
+
+
+def public_host_from_headers(headers):
+    host_header = headers.get("Host", f"localhost:{PORT}")
+    host = host_header.split(":", 1)[0].strip()
+    return host or "localhost"
+
+
+def shell_quote(value):
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def shell_double_quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+
+
+def read_raw_device_config(device):
+    try:
+        value = json.loads(Path(device.config_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def load_daily_notes():
@@ -285,6 +352,138 @@ def update_device_config(
     return validated
 
 
+def create_device(registry, legacy_config_path, payload, headers, settings_port):
+    if not isinstance(payload, dict):
+        raise ValueError("device request must be a JSON object")
+    device_type = str(payload.get("type", "")).strip()
+    if device_type not in ("kindle_pw1", "esp32_epaper"):
+        raise ValueError("device type must be kindle_pw1 or esp32_epaper")
+    name = str(payload.get("name", "")).strip()
+    if not name or len(name) > 100:
+        raise ValueError("device name is required")
+
+    profile_key = str(payload.get("profile", "")).strip()
+    if not profile_key:
+        profile_key = "kindle_pw1" if device_type == "kindle_pw1" else "esp32_800x480"
+    profile = DEVICE_PROFILES.get(profile_key)
+    if profile is None or profile["type"] != device_type:
+        raise ValueError("device profile is invalid")
+
+    theme = str(payload.get("theme", "home_dashboard")).strip()
+    if theme not in THEMES:
+        raise ValueError("theme is invalid")
+
+    records = registry.load()
+    device_id = unique_device_id(registry, slugify_device_name(name))
+    new_record = {
+        "id": device_id,
+        "name": name,
+        "type": device_type,
+        "resolution": list(profile["resolution"]),
+        "enabled": True,
+        "config_path": f"devices/{device_id}/config.json",
+        "image_path": f"devices/{device_id}/image.png",
+    }
+
+    host = str(payload.get("host", "")).strip()
+    if host:
+        if device_type == "kindle_pw1":
+            new_record["connection"] = {
+                "host": host,
+                "user": str(payload.get("user", "root")).strip() or "root",
+                "ssh_profile": str(
+                    payload.get("ssh_profile", "kindle_dashboard")
+                ).strip() or "kindle_dashboard",
+                "port": int(payload.get("port", 22) or 22),
+            }
+        else:
+            new_record["connection"] = {
+                "method": "http",
+                "host": host,
+            }
+
+    registry.write_registry({
+        "devices": [
+            registry._storage_record(record) for record in records
+        ] + [new_record],
+    })
+    device = registry.get(device_id)
+
+    base_config = load_config(legacy_config_path)
+    config = validate_config(dict(base_config))
+    config.update({
+        "title": name.upper()[:28],
+        "theme": theme,
+        "status_token": generate_device_token(),
+        "pairing_token": generate_device_token(),
+    })
+    if device_type == "esp32_epaper":
+        config.setdefault("deep_sleep_minutes", 30)
+    atomic_write_bytes(
+        device.config_path,
+        (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        ),
+    )
+    device_status.atomic_write_json(device_status.status_path(device), {})
+
+    public_host = public_host_from_headers(headers)
+    install_command = ""
+    if device_type == "kindle_pw1":
+        install_command = (
+            "curl -fsS "
+            f"http://{public_host}:{settings_port}/install/kindle/{device_id}"
+            f"?token={quote(config['pairing_token'])} | sh"
+        )
+
+    public_device = public_device_config(device, config)
+    public_device["id"] = device.id
+    return {
+        "ok": True,
+        "device": public_device,
+        "pairing_token": config["pairing_token"],
+        "status_token": config["status_token"],
+        "install_command": install_command,
+    }
+
+
+def kindle_installer_script(device, config, server_host, image_port, settings_port):
+    if device.type != "kindle_pw1":
+        raise ValueError("Kindle installer is available only for Kindle devices")
+    device_id = device.id
+    status_token = config.get("status_token", "")
+    image_url = (
+        f"http://{server_host}:{image_port}/device/{device_id}/image.png"
+    )
+    status_url = (
+        f"http://{server_host}:{settings_port}/api/device/{device_id}/status"
+    )
+    lines = [
+        "#!/bin/sh",
+        "set -eu",
+        'DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"',
+        "mkdir -p \"$DASHBOARD_DIR\"",
+        f"SERVER_HOST={shell_double_quote(server_host)}",
+        f"DEVICE_ID={shell_double_quote(device_id)}",
+        f"STATUS_TOKEN={shell_double_quote(status_token)}",
+        f"IMAGE_URL={shell_double_quote(image_url)}",
+        f"STATUS_URL={shell_double_quote(status_url)}",
+        'printf "%s\\n" "$DEVICE_ID" > "$DASHBOARD_DIR/device-id"',
+        'printf "%s\\n" "$STATUS_TOKEN" > "$DASHBOARD_DIR/status-token"',
+        'chmod 600 "$DASHBOARD_DIR/status-token" 2>/dev/null || true',
+        'cat > "$DASHBOARD_DIR/device.env" <<EOF',
+        'SERVER_HOST="$SERVER_HOST"',
+        'DEVICE_ID="$DEVICE_ID"',
+        'STATUS_TOKEN="$STATUS_TOKEN"',
+        'IMAGE_URL="$IMAGE_URL"',
+        'STATUS_URL="$STATUS_URL"',
+        "EOF",
+        'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',
+        'echo "Configured Kindle dashboard device: $DEVICE_ID"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def get_prayer_cache_status(config):
     try:
         import hashlib
@@ -348,6 +547,19 @@ def render_settings(
         f'<span><strong>{html.escape(definition["label"])}</strong>'
         f'<small>{html.escape(definition["description"])}</small></span></label>'
         for theme, definition in THEMES.items()
+    )
+    wizard_theme_options = "".join(
+        f'<option value="{html.escape(theme, quote=True)}">'
+        f'{html.escape(definition["label"])}</option>'
+        for theme, definition in THEMES.items()
+    )
+    wizard_profile_options = "".join(
+        f'<option value="{html.escape(profile_id, quote=True)}" '
+        f'data-device-type="{html.escape(profile["type"], quote=True)}">'
+        f'{html.escape(profile["label"])} '
+        f'({profile["resolution"][0]}×{profile["resolution"][1]})'
+        f'</option>'
+        for profile_id, profile in DEVICE_PROFILES.items()
     )
     message = (
         f'<p class="message" role="status">{html.escape(status_message)}</p>'
@@ -2031,11 +2243,35 @@ button:disabled {{
 <!-- 2. Devices Tab (Device Setup) -->
 <section class="card tab-content" id="devices">
   <h2>Device Setup</h2>
-  <p class="section-note">View registered displays and choose the active device for this browser. Settings still save to Default Kindle during this checkpoint.</p>
+  <p class="section-note">View registered displays, choose the active device for this browser, or add a new Kindle / ESP32 e-paper display.</p>
   <label class="field">
     <span>Selected device</span>
     <select id="selected-device">{device_options}</select>
   </label>
+  <button type="button" id="btn-add-device" style="width:100%;margin-bottom:14px">Add Device</button>
+  <div class="future-box" id="add-device-wizard" style="display:none;margin-bottom:18px">
+    <h3 style="font-size:1.05rem;font-weight:800;margin:0 0 8px">Add Device Wizard</h3>
+    <p class="section-note">Create a repeatable device record, generate pairing tokens, then copy the installer command when you are ready.</p>
+    <label class="field"><span>Device type</span>
+      <select id="add-device-type">
+        <option value="kindle_pw1">Kindle</option>
+        <option value="esp32_epaper">ESP32 e-paper</option>
+      </select>
+    </label>
+    <label class="field"><span>Device name</span><input type="text" id="add-device-name" maxlength="100" placeholder="Kitchen Kindle"></label>
+    <label class="field"><span>Resolution / profile</span>
+      <select id="add-device-profile">{wizard_profile_options}</select>
+    </label>
+    <label class="field"><span>Theme</span>
+      <select id="add-device-theme">{wizard_theme_options}</select>
+    </label>
+    <label class="field"><span>Optional device host</span><input type="text" id="add-device-host" maxlength="253" placeholder="192.168.68.120"></label>
+    <button type="button" id="btn-create-device" style="width:100%">Create Device</button>
+    <p class="device-message" id="add-device-message" role="status"></p>
+    <label class="field" id="install-command-wrap" style="display:none"><span>Copyable Kindle install command</span>
+      <textarea id="add-device-install-command" readonly rows="3" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace"></textarea>
+    </label>
+  </div>
   <div class="registered-devices" id="registered-devices">
     {devices_html}
   </div>
@@ -2595,6 +2831,79 @@ const topSelect = document.getElementById("top-selected-device");
 if (topSelect) {{
   topSelect.addEventListener("change", () => {{
     applySelectedDevice(topSelect.value);
+  }});
+}}
+
+const addDeviceButton=document.getElementById("btn-add-device");
+const addDeviceWizard=document.getElementById("add-device-wizard");
+const addDeviceType=document.getElementById("add-device-type");
+const addDeviceProfile=document.getElementById("add-device-profile");
+const createDeviceButton=document.getElementById("btn-create-device");
+const addDeviceMessage=document.getElementById("add-device-message");
+const installCommandWrap=document.getElementById("install-command-wrap");
+const installCommand=document.getElementById("add-device-install-command");
+
+function syncAddDeviceProfiles(){{
+  if(!addDeviceType || !addDeviceProfile) return;
+  const selectedType=addDeviceType.value;
+  let firstVisible=null;
+  Array.from(addDeviceProfile.options).forEach(option=>{{
+    const visible=option.dataset.deviceType===selectedType;
+    option.hidden=!visible;
+    option.disabled=!visible;
+    if(visible && firstVisible===null) firstVisible=option.value;
+  }});
+  const current=addDeviceProfile.options[addDeviceProfile.selectedIndex];
+  if(!current || current.disabled) addDeviceProfile.value=firstVisible || "";
+}}
+
+if(addDeviceButton && addDeviceWizard){{
+  addDeviceButton.addEventListener("click",()=>{{
+    const open=addDeviceWizard.style.display==="none";
+    addDeviceWizard.style.display=open?"block":"none";
+    if(open) syncAddDeviceProfiles();
+  }});
+}}
+if(addDeviceType){{
+  addDeviceType.addEventListener("change",syncAddDeviceProfiles);
+  syncAddDeviceProfiles();
+}}
+if(createDeviceButton){{
+  createDeviceButton.addEventListener("click",async()=>{{
+    const name=document.getElementById("add-device-name").value.trim();
+    const host=document.getElementById("add-device-host").value.trim();
+    if(!name){{
+      addDeviceMessage.textContent="Device name is required.";
+      return;
+    }}
+    createDeviceButton.disabled=true;
+    addDeviceMessage.textContent="Creating device...";
+    if(installCommandWrap) installCommandWrap.style.display="none";
+    try{{
+      const payload={{
+        type:addDeviceType.value,
+        name,
+        profile:addDeviceProfile.value,
+        theme:document.getElementById("add-device-theme").value,
+      }};
+      if(host) payload.host=host;
+      const result=await deviceApi("/api/devices",{{
+        method:"POST",
+        headers:{{"Content-Type":"application/json"}},
+        body:JSON.stringify(payload),
+      }});
+      addDeviceMessage.textContent=`Created ${{result.device.name}} (${{result.device.device_id}}).`;
+      if(result.install_command && installCommand && installCommandWrap){{
+        installCommand.value=result.install_command;
+        installCommandWrap.style.display="block";
+        installCommand.focus();
+        installCommand.select();
+      }}
+    }}catch(error){{
+      addDeviceMessage.textContent="Create failed: "+error.message;
+    }}finally{{
+      createDeviceButton.disabled=false;
+    }}
   }});
 }}
 
@@ -3687,6 +3996,13 @@ def make_handler(
             if device_status_match is not None:
                 self.handle_status_get(device_status_match.group(1))
                 return
+            kindle_install_match = KINDLE_INSTALL_RE.fullmatch(parsed.path)
+            if kindle_install_match is not None:
+                self.handle_kindle_installer(
+                    kindle_install_match.group(1),
+                    parse_qs(parsed.query, keep_blank_values=True),
+                )
+                return
             if parsed.path == "/api/notes":
                 self.send_json(200, load_daily_notes())
                 return
@@ -3774,6 +4090,9 @@ def make_handler(
             if parsed.path == "/api/config":
                 self.handle_api_post()
                 return
+            if parsed.path == "/api/devices":
+                self.handle_create_device()
+                return
             if parsed.path == "/api/devices/push-all":
                 self.handle_push_all()
                 return
@@ -3799,6 +4118,10 @@ def make_handler(
                 device_status_match = DEVICE_STATUS_RE.fullmatch(parsed.path)
                 if device_status_match is not None:
                     self.handle_status_post(device_status_match.group(1))
+                    return
+                device_pair_match = DEVICE_PAIR_RE.fullmatch(parsed.path)
+                if device_pair_match is not None:
+                    self.handle_device_pair(device_pair_match.group(1))
                     return
                 known_paths = {
                     "/api/device/start-dashboard",
@@ -3866,6 +4189,96 @@ def make_handler(
                 self.send_json(200, {"ok": True, "status": saved})
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_create_device(self):
+            if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                self.send_json(415, {"ok": False, "error": "application/json required"})
+                return
+            try:
+                candidate = self.read_json()
+                with update_lock:
+                    payload = create_device(
+                        registry,
+                        config_path,
+                        candidate,
+                        self.headers,
+                        self.server.server_port,
+                    )
+                self.send_json(201, payload)
+            except (
+                ValueError,
+                RegistryValidationError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception:
+                self.send_json(500, {"ok": False, "error": "device creation failed"})
+
+        def handle_device_pair(self, device_id):
+            if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                self.send_json(415, {"ok": False, "error": "application/json required"})
+                return
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            try:
+                candidate = self.read_json()
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+                return
+            config = read_raw_device_config(selected)
+            expected = config.get("pairing_token")
+            supplied = candidate.get("token")
+            if not expected or not hmac.compare_digest(str(supplied or ""), expected):
+                self.send_json(403, {"ok": False, "error": "invalid pairing token"})
+                return
+            saved = device_status.save_status(
+                selected,
+                {
+                    "firmware_version": "paired",
+                    "last_error": None,
+                },
+            )
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "device_id": selected.id,
+                    "status": saved,
+                },
+            )
+
+        def handle_kindle_installer(self, device_id, query):
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            config = read_raw_device_config(selected)
+            expected = config.get("pairing_token")
+            supplied = (query.get("token") or [""])[0]
+            if not expected or not hmac.compare_digest(str(supplied or ""), expected):
+                self.send_json(403, {"ok": False, "error": "invalid pairing token"})
+                return
+            if selected.type != "kindle_pw1":
+                self.send_json(400, {"ok": False, "error": "not a Kindle device"})
+                return
+            server_host = public_host_from_headers(self.headers)
+            script = kindle_installer_script(
+                selected,
+                config,
+                server_host,
+                image_server_port,
+                self.server.server_port,
+            )
+            self.send_bytes(
+                200,
+                script.encode("utf-8"),
+                "text/x-shellscript; charset=utf-8",
+            )
 
         def handle_maintenance_restart(self):
             if not self.device_csrf_valid():

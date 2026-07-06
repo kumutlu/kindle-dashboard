@@ -2000,6 +2000,142 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertNotIn("status_token", json.dumps(device))
         self.assertNotIn("correct-token", json.dumps(device))
 
+    def test_create_new_kindle_device_generates_id_tokens_and_files(self):
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "profile": "kindle_pw1",
+                "theme": "family_dashboard",
+                "host": "192.168.68.120",
+            },
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["device"]["id"], "kitchen-kindle")
+        self.assertEqual(payload["device"]["type"], "kindle_pw1")
+        self.assertIn("install_command", payload)
+        self.assertIn("/install/kindle/kitchen-kindle?token=", payload["install_command"])
+        self.assertGreaterEqual(len(payload["pairing_token"]), 32)
+        self.assertGreaterEqual(len(payload["status_token"]), 32)
+
+        device = self.registry.get("kitchen-kindle")
+        config = json.loads(device.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config["theme"], "family_dashboard")
+        self.assertEqual(config["status_token"], payload["status_token"])
+        self.assertEqual(config["pairing_token"], payload["pairing_token"])
+        self.assertTrue(device.image_path.parent.exists())
+        self.assertTrue(device.config_path.exists())
+        self.assertTrue((device.image_path.parent / "status.json").exists())
+
+    def test_create_duplicate_name_generates_unique_device_id_without_overwrite(self):
+        for _ in range(2):
+            status, _, _ = self.post_json(
+                "/api/devices",
+                {
+                    "type": "kindle_pw1",
+                    "name": "Kitchen Kindle",
+                    "theme": "home_dashboard",
+                },
+            )
+            self.assertEqual(status, 201)
+
+        ids = [record.id for record in self.registry.load()]
+        self.assertIn("kitchen-kindle", ids)
+        self.assertIn("kitchen-kindle-2", ids)
+        self.assertIn("default-kindle", ids)
+
+    def test_create_esp32_device_uses_esp32_profile(self):
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "esp32_epaper",
+                "name": "Office Panel",
+                "profile": "esp32_800x480",
+                "theme": "minimal_weather",
+                "host": "192.168.68.150",
+            },
+        )
+        payload = json.loads(body)
+
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["device"]["id"], "office-panel")
+        self.assertEqual(payload["device"]["resolution"], [800, 480])
+        device = self.registry.get("office-panel")
+        self.assertEqual(device.connection["method"], "http")
+        self.assertEqual(device.connection["host"], "192.168.68.150")
+
+    def test_installer_script_requires_pairing_token_and_contains_endpoints(self):
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        created = json.loads(body)
+
+        status, body = self.request("/install/kindle/kitchen-kindle?token=wrong")
+        self.assertEqual(status, 403)
+
+        status, body = self.request(
+            "/install/kindle/kitchen-kindle?token="
+            + created["pairing_token"]
+        )
+        script = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn('SERVER_HOST="', script)
+        self.assertIn('DEVICE_ID="kitchen-kindle"', script)
+        self.assertIn('STATUS_TOKEN="' + created["status_token"] + '"', script)
+        self.assertIn("/device/kitchen-kindle/image.png", script)
+        self.assertIn("/api/device/kitchen-kindle/status", script)
+
+    def test_pair_endpoint_requires_token_and_marks_status_seen(self):
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        created = json.loads(body)
+
+        status, _, _ = self.post_json(
+            "/api/device/kitchen-kindle/pair",
+            {"token": "wrong"},
+        )
+        self.assertEqual(status, 403)
+
+        status, _, body = self.post_json(
+            "/api/device/kitchen-kindle/pair",
+            {"token": created["pairing_token"]},
+        )
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["device_id"], "kitchen-kindle")
+        status_file = self.root / "devices/kitchen-kindle/status.json"
+        self.assertTrue(status_file.exists())
+
+    def test_create_device_rejects_invalid_theme_and_does_not_overwrite_existing(self):
+        before = json.loads((self.root / "devices.json").read_text(encoding="utf-8"))
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Bad Device",
+                "theme": "not-a-theme",
+            },
+        )
+
+        self.assertEqual(status, 400)
+        after = json.loads((self.root / "devices.json").read_text(encoding="utf-8"))
+        self.assertEqual(before, after)
+
     def test_devices_api_handles_invalid_registry_without_path_leak(self):
         (self.root / "devices.json").write_text(
             '{"devices":[{"id":"../escape"}]}',
@@ -2036,6 +2172,10 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("kindle_pw1", text)
         self.assertIn("758×1024", text)
         self.assertIn("/device/default-kindle/image.png", text)
+        self.assertIn("Add Device", text)
+        self.assertIn("add-device-wizard", text)
+        self.assertIn("Kindle", text)
+        self.assertIn("ESP32 e-paper", text)
         self.assertIn(
             "/api/device/default-kindle/config",
             text,

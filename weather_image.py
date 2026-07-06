@@ -86,6 +86,7 @@ THEME_ALIAS_FIELDS = (
 NON_RENDER_CONFIG_FIELDS = {
     "status_token",
     "device_token",
+    "pairing_token",
 }
 OPTIONAL_LOCATION_FIELDS = {
     "location",

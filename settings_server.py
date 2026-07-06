@@ -99,6 +99,7 @@ def public_devices(registry, legacy_config_path):
     for device in registry.load():
         config = load_effective_device_config(device, registry)
         status = device_status.status_summary(device)
+        raw_config = read_raw_device_config(device)
         value = {
             "id": device.id,
             "name": device.name,
@@ -110,6 +111,8 @@ def public_devices(registry, legacy_config_path):
             "config_url": f"/api/device/{device.id}/config",
             "status": status,
         }
+        if "pairing_token" in raw_config:
+            value["pairing_token"] = raw_config["pairing_token"]
         if device.connection is not None:
             value["connection"] = dict(device.connection)
         devices.append(value)
@@ -737,6 +740,7 @@ def render_settings(
     status_message="",
     devices=None,
     image_server_url="http://localhost:8765",
+    settings_host="localhost:8767",
 ):
     escaped = {key: html.escape(str(value), quote=True)
                for key, value in config.items()}
@@ -799,6 +803,10 @@ def render_settings(
         )
     )
     saved_brightness = str(config.get("kindle_frontlight", 8))
+    device_status_tokens_json = json.dumps({
+        device["id"]: device.get("status_token") or ""
+        for device in (devices or [])
+    })
     if devices is None:
         devices = [{
             "id": "default-kindle",
@@ -893,6 +901,21 @@ def render_settings(
                 f'</div>'
             )
 
+        installer_command_html = ""
+        if listed_device["type"] == "kindle_pw1" and listed_device.get("pairing_token"):
+            p_token = listed_device["pairing_token"]
+            install_cmd = (
+                "curl -fsS "
+                f"http://{settings_host}/install/kindle/{listed_device['id']}"
+                f"?token={quote(p_token)} | sh"
+            )
+            installer_command_html = (
+                f'<div class="device-installer-cmd" style="margin-top: 10px; padding: 8px 12px; background: var(--background-soft, #f7f7f7); border: 1px solid var(--line); border-radius: 6px; font-size: 0.8rem;">'
+                f'<strong>Installer command:</strong>'
+                f'<code style="display:block; margin-top:4px; word-break:break-all">{html.escape(install_cmd)}</code>'
+                f'</div>'
+            )
+
         device_cards.append(
             '<article class="registered-device" '
             f'data-device-id="{html.escape(listed_device["id"], quote=True)}">'
@@ -914,6 +937,7 @@ def render_settings(
             f'<div><dt>Firmware</dt><dd>{html.escape(firmware_label)}</dd></div>'
             "</dl>"
             + connection_html
+            + installer_command_html
             + (
                 '<p class="device-status-error">'
                 f'{html.escape(last_error)}</p>'
@@ -2853,6 +2877,7 @@ button:disabled {{
 <script>
 const imageServerUrl = "{image_server_url}";
 const csrfToken = document.querySelector('[name="csrf_token"]').value;
+const deviceStatusTokens = {device_status_tokens_json};
 const deviceMessage = document.getElementById("device-message");
 const connectionValue = document.getElementById("kindle-connection");
 const brightnessValue = document.getElementById("kindle-brightness");
@@ -2861,7 +2886,19 @@ const deviceLog = document.getElementById("device-log");
 
 async function deviceApi(path, options = {{}}) {{
   const headers = {{ ... (options.headers || {{}}) }};
-  if ((options.method || "GET") !== "GET") headers["X-CSRF-Token"] = csrfToken;
+  if ((options.method || "GET") !== "GET") {{
+    // Check if it is a device-specific API POST request
+    const match = path.match(/^\/api\/device\/([a-z0-9][a-z0-9-]{{0,63}})\/(light|push|restart|start-dashboard|home|refresh|autostart\/(enable|disable))$/);
+    if (match) {{
+      const deviceId = match[1];
+      const token = deviceStatusTokens[deviceId] || "";
+      headers["X-Device-Token"] = token;
+      headers["X-CSRF-Token"] = token;
+      headers["Authorization"] = "Bearer " + token;
+    }} else {{
+      headers["X-CSRF-Token"] = csrfToken;
+    }}
+  }}
   const response = await fetch(path, {{ ...options, headers }});
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "Device request failed");
@@ -4231,6 +4268,10 @@ def make_handler(
             if parsed.path == "/api/devices":
                 try:
                     devices = public_devices(registry, config_path)
+                    public_api_devices = []
+                    for dev in devices:
+                        public_dev = {k: v for k, v in dev.items() if k not in ("status_token", "pairing_token")}
+                        public_api_devices.append(public_dev)
                 except (RegistryValidationError, OSError, ValueError):
                     self.send_json(
                         503,
@@ -4240,7 +4281,7 @@ def make_handler(
                         },
                     )
                     return
-                self.send_json(200, {"devices": devices})
+                self.send_json(200, {"devices": public_api_devices})
                 return
             device_config_match = DEVICE_CONFIG_RE.fullmatch(parsed.path)
             if device_config_match is not None:
@@ -4348,6 +4389,7 @@ def make_handler(
                     message,
                     devices=devices,
                     image_server_url=image_server_url,
+                    settings_host=host_header,
                 ).encode("utf-8")
                 self.send_bytes(200, body, "text/html; charset=utf-8")
                 return
@@ -4961,16 +5003,35 @@ def make_handler(
                 )
 
         def handle_device_post(self, path, device_id=None):
-            if not self.device_csrf_valid():
-                self.send_json(
-                    403,
-                    {"ok": False, "error": "invalid request token"},
-                )
-                return
             if device_id is None:
                 device_id = "default-kindle"
             try:
                 selected = registry.get(device_id)
+                config = read_raw_device_config(selected)
+                expected_token = config.get("status_token")
+                supplied = (
+                    self.headers.get("X-Device-Token")
+                    or self.headers.get("X-CSRF-Token")
+                    or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+                )
+
+                if expected_token:
+                    if not hmac.compare_digest(supplied or "", expected_token):
+                        print(f"[Error] Push/Device action failed: expected status_token for device {device_id}")
+                        self.send_json(
+                            403,
+                            {"ok": False, "error": "invalid request token"},
+                        )
+                        return
+                else:
+                    if not self.device_csrf_valid():
+                        print(f"[Error] Push/Device action failed: expected global CSRF token for device {device_id}")
+                        self.send_json(
+                            403,
+                            {"ok": False, "error": "invalid request token"},
+                        )
+                        return
+
                 action_suffix = path.split("/")[-1]
                 if "autostart" in path:
                     action_suffix = "autostart/" + action_suffix

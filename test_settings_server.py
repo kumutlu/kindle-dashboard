@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import html
 import http.client
 import json
 import re
@@ -1695,13 +1696,17 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.registry = DeviceRegistry(self.root)
         self.registry.get("default-kindle")
         self.rendered_device_ids = []
+        self.mock_device = mock.MagicMock()
+        self.mock_device.push.return_value = "generated and pushed"
+        self.mock_device.run_action.return_value = "action completed"
+        self.mock_device.set_light.return_value = 12
         self.server = settings_server.make_server(
             host="127.0.0.1",
             port=0,
             config_path=self.config_path,
             regenerate=lambda: None,
             render_selected=self.rendered_device_ids.append,
-            device=mock.MagicMock(),
+            device=self.mock_device,
             restart_settings=lambda: None,
             geocode=lambda query: [],
             registry=self.registry,
@@ -2386,9 +2391,206 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         # Verify device config contains both pairing_token and status_token
         config_final = read_raw_device_config(device)
         self.assertIn("pairing_token", config_final)
-        self.assertEqual(config_final["pairing_token"], new_pairing_token)
+        self.assertEqual(config_final.get("pairing_token"), new_pairing_token)
         self.assertIn("status_token", config_final)
         self.assertTrue(config_final["status_token"])
+
+    def test_multiple_devices_flows(self):
+        # 1. Create kitchen device
+        status_k, _, body_k = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        self.assertEqual(status_k, 201)
+        res_k = json.loads(body_k)
+        dev_k = res_k["device"]
+        id_k = dev_k["id"]
+        
+        # 2. Create bedroom device
+        status_b, _, body_b = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Bedroom Kindle",
+                "theme": "minimal_weather",
+            },
+        )
+        self.assertEqual(status_b, 201)
+        res_b = json.loads(body_b)
+        dev_b = res_b["device"]
+        id_b = dev_b["id"]
+
+        # 3. Verify two devices exist and have distinct IDs
+        self.assertEqual(id_k, "kitchen-kindle")
+        self.assertEqual(id_b, "bedroom-kindle")
+        self.assertNotEqual(id_k, id_b)
+        
+        # 4. Verify tokens are unique
+        self.assertNotEqual(res_k["pairing_token"], res_b["pairing_token"])
+        self.assertNotEqual(res_k["status_token"], res_b["status_token"])
+
+        # 5. Verify image URLs are different
+        self.assertEqual(dev_k["image_url"], f"/device/{id_k}/image.png")
+        self.assertEqual(dev_b["image_url"], f"/device/{id_b}/image.png")
+        self.assertNotEqual(dev_k["image_url"], dev_b["image_url"])
+
+        # 6. Verify status files are separate
+        status_file_k = self.root / f"devices/{id_k}/status.json"
+        status_file_b = self.root / f"devices/{id_b}/status.json"
+        self.assertTrue(status_file_k.exists())
+        self.assertTrue(status_file_b.exists())
+
+        # 7. Verify installer command is device-specific
+        self.assertIn(id_k, res_k["install_command"])
+        self.assertIn(res_k["pairing_token"], res_k["install_command"])
+        self.assertIn(id_b, res_b["install_command"])
+        self.assertIn(res_b["pairing_token"], res_b["install_command"])
+
+        # 8. Check that the config files exist and have the correct unique titles
+        from settings_server import read_raw_device_config
+        record_k = self.registry.get(id_k)
+        record_b = self.registry.get(id_b)
+        config_k = read_raw_device_config(record_k)
+        config_b = read_raw_device_config(record_b)
+        self.assertEqual(config_k["title"], "KITCHEN KINDLE")
+        self.assertEqual(config_b["title"], "BEDROOM KINDLE")
+        self.assertEqual(config_k["theme"], "home_dashboard")
+        self.assertEqual(config_b["theme"], "minimal_weather")
+
+        # 9. Verify web UI lists both devices and their unique installer commands
+        status, body = self.request("/settings")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        
+        # Verify both device names are listed
+        self.assertIn("Kitchen Kindle", text)
+        self.assertIn("Bedroom Kindle", text)
+        
+        # Verify both installer commands are printed on their respective cards
+        self.assertIn(html.escape(res_k["install_command"]), text)
+        self.assertIn(html.escape(res_b["install_command"]), text)
+
+        # 10. Render both devices and verify different PNGs are generated containing screen labels
+        from PIL import Image, ImageDraw
+        rendered_titles = []
+        def fake_renderer(config):
+            rendered_titles.append(config["title"])
+            img = Image.new("L", (758, 1024), 255)
+            draw = ImageDraw.Draw(img)
+            draw.text((10, 10), config["title"])
+            img.save(weather_image.ACTIVE_OUTPUT.get())
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {
+                "home_dashboard": fake_renderer,
+                "minimal_weather": fake_renderer,
+            },
+            clear=True,
+        ):
+            res_render_k = weather_image.render_device(id_k, registry=self.registry)
+            res_render_b = weather_image.render_device(id_b, registry=self.registry)
+
+        self.assertEqual(rendered_titles, ["KITCHEN KINDLE", "BEDROOM KINDLE"])
+        path_k = Path(res_render_k["output_path"])
+        path_b = Path(res_render_b["output_path"])
+        self.assertTrue(path_k.exists())
+        self.assertTrue(path_b.exists())
+        
+        content_k = path_k.read_bytes()
+        content_b = path_b.read_bytes()
+        self.assertNotEqual(content_k, content_b)
+
+    def test_push_with_valid_token_succeeds(self):
+        status_k, _, body_k = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        self.assertEqual(status_k, 201)
+        res_k = json.loads(body_k)
+        id_k = res_k["device"]["id"]
+        token_k = res_k["status_token"]
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": token_k})
+        response = conn.getresponse()
+        status = response.status
+        response.read()
+        conn.close()
+        self.assertEqual(status, 200)
+
+    def test_push_with_invalid_token_fails(self):
+        status_k, _, body_k = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        self.assertEqual(status_k, 201)
+        res_k = json.loads(body_k)
+        id_k = res_k["device"]["id"]
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": "invalid-token-12345"})
+        response = conn.getresponse()
+        status = response.status
+        body = response.read()
+        conn.close()
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body.decode("utf-8"))["error"], "invalid request token")
+
+    def test_push_kitchen_uses_kitchen_specific_token(self):
+        status_k, _, body_k = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Kitchen Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        res_k = json.loads(body_k)
+        id_k = res_k["device"]["id"]
+        token_k = res_k["status_token"]
+
+        status_b, _, body_b = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Bedroom Kindle",
+                "theme": "minimal_weather",
+            },
+        )
+        res_b = json.loads(body_b)
+        id_b = res_b["device"]["id"]
+        token_b = res_b["status_token"]
+
+        # Push to kitchen with bedroom's token fails
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": token_b})
+        response = conn.getresponse()
+        status = response.status
+        response.read()
+        conn.close()
+        self.assertEqual(status, 403)
+
+        # Push to kitchen with kitchen's own token succeeds
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        conn.request("POST", f"/api/device/{id_k}/push", headers={"X-Device-Token": token_k})
+        response = conn.getresponse()
+        status = response.status
+        response.read()
+        conn.close()
+        self.assertEqual(status, 200)
 
 
 if __name__ == "__main__":

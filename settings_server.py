@@ -45,6 +45,9 @@ DEVICE_STATUS_RE = re.compile(
 DEVICE_PAIR_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/pair$"
 )
+DEVICE_RESET_INSTALLER_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/installer-token/reset$"
+)
 KINDLE_INSTALL_RE = re.compile(
     r"^/install/kindle/([a-z0-9][a-z0-9-]{0,63})$"
 )
@@ -236,7 +239,20 @@ def atomic_write_bytes(path, data):
 
 
 def atomic_write_config(path, config):
+    existing_tokens = {}
+    try:
+        raw_existing = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(raw_existing, dict):
+            for key in ("status_token", "pairing_token", "device_token"):
+                if key in raw_existing:
+                    existing_tokens[key] = raw_existing[key]
+    except Exception:
+        pass
+
     validated = validate_config(config)
+    if existing_tokens:
+        validated.update(existing_tokens)
+
     data = (
         json.dumps(validated, indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")
@@ -817,6 +833,22 @@ def render_settings(
         
         links_html = '<div class="device-links">' + "".join(links) + '</div>'
         
+        regenerate_installer_html = ""
+        if listed_device["type"] == "kindle_pw1":
+            regenerate_installer_html = (
+                f'<div style="margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 12px;">'
+                f'<button type="button" class="btn-regenerate-installer" data-device-id="{html.escape(listed_device["id"])}" '
+                f'style="width:100%; font-size: 0.85rem; padding: 6px 10px; margin-bottom: 8px;">'
+                f'Regenerate installer command</button>'
+                f'<div class="installer-command-wrap" style="display:none">'
+                f'<label class="field" style="font-size:0.8rem"><span>Copyable Kindle install command</span>'
+                f'<textarea class="regenerated-installer-command" readonly rows="3" '
+                f'style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.8rem; width:100%"></textarea>'
+                f'</label>'
+                f'</div>'
+                f'</div>'
+            )
+
         device_cards.append(
             '<article class="registered-device" '
             f'data-device-id="{html.escape(listed_device["id"], quote=True)}">'
@@ -845,6 +877,7 @@ def render_settings(
             )
             + esp_warning
             + links_html
+            + regenerate_installer_html
             + "</article>"
         )
     devices_html = (
@@ -3063,6 +3096,41 @@ if(createDeviceButton){{
   }});
 }}
 
+// Regenerate installer command click handler
+document.addEventListener("click", async (e) => {{
+  const btn = e.target.closest(".btn-regenerate-installer");
+  if (!btn) return;
+  const deviceId = btn.dataset.deviceId;
+  const card = btn.closest(".registered-device");
+  const container = card.querySelector(".installer-command-wrap");
+  const textarea = card.querySelector(".regenerated-installer-command");
+  
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = "Regenerating...";
+  
+  try {{
+    const result = await deviceApi(`/api/device/${{encodeURIComponent(deviceId)}}/installer-token/reset`, {{
+      method: "POST"
+    }});
+    if (result.ok && result.install_command) {{
+      textarea.value = result.install_command;
+      container.style.display = "block";
+      textarea.focus();
+      textarea.select();
+      btn.textContent = "Regenerated!";
+    }} else {{
+      alert("Failed to regenerate installer command");
+      btn.textContent = originalText;
+    }}
+  }} catch (err) {{
+    alert("Error: " + err.message);
+    btn.textContent = originalText;
+  }} finally {{
+    btn.disabled = false;
+  }}
+}});
+
 // Initialize select state
 applySelectedDevice(localStorage.getItem(selectedDeviceKey) || "default-kindle");
 
@@ -4279,6 +4347,10 @@ def make_handler(
                 if device_pair_match is not None:
                     self.handle_device_pair(device_pair_match.group(1))
                     return
+                device_reset_match = DEVICE_RESET_INSTALLER_RE.fullmatch(parsed.path)
+                if device_reset_match is not None:
+                    self.handle_installer_token_reset(device_reset_match.group(1))
+                    return
                 known_paths = {
                     "/api/device/start-dashboard",
                     "/api/device/home",
@@ -4370,6 +4442,47 @@ def make_handler(
                 self.send_json(400, {"ok": False, "error": str(exc)})
             except Exception:
                 self.send_json(500, {"ok": False, "error": "device creation failed"})
+
+        def handle_installer_token_reset(self, device_id):
+            if not self.device_csrf_valid():
+                self.send_json(
+                    403,
+                    {"ok": False, "error": "invalid request token"},
+                )
+                return
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            if selected.type != "kindle_pw1":
+                self.send_json(400, {"ok": False, "error": "not a Kindle device"})
+                return
+
+            with update_lock:
+                config = read_raw_device_config(selected)
+                new_token = generate_device_token()
+                config["pairing_token"] = new_token
+                
+                data = (
+                    json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+                ).encode("utf-8")
+                atomic_write_bytes(selected.config_path, data)
+
+            server_host = public_host_from_headers(self.headers)
+            install_command = (
+                "curl -fsS "
+                f"http://{server_host}:{self.server.server_port}/install/kindle/{device_id}"
+                f"?token={quote(new_token)} | sh"
+            )
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "pairing_token": new_token,
+                    "install_command": install_command,
+                },
+            )
 
         def handle_device_pair(self, device_id):
             if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":

@@ -2192,6 +2192,9 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "kindle_dashboard_selected_device",
             text,
         )
+        self.assertIn('class="btn-regenerate-installer"', text)
+        self.assertIn('class="installer-command-wrap"', text)
+        self.assertIn('class="regenerated-installer-command"', text)
         self.assertNotIn("/home/user/.ssh", text)
         self.assertNotIn("known_hosts", text)
 
@@ -2208,6 +2211,92 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "Device registry is currently unavailable.",
             body.decode("utf-8"),
         )
+
+    def test_installer_token_reset_endpoint_and_token_persistence(self):
+        # 1. Create a Kindle device
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Reset Test Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        self.assertEqual(status, 201)
+        created = json.loads(body)
+        device_id = created["device"]["device_id"]
+        old_pairing_token = created["pairing_token"]
+        old_status_token = created["status_token"]
+
+        # 2. Simulate pairing token deletion (e.g. status after successful pair)
+        device = self.registry.get(device_id)
+        from settings_server import read_raw_device_config, atomic_write_bytes
+        config = read_raw_device_config(device)
+        self.assertIn("pairing_token", config)
+        config.pop("pairing_token")
+        
+        # Write it back without pairing_token
+        atomic_write_bytes(
+            device.config_path,
+            (json.dumps(config, indent=2) + "\n").encode("utf-8")
+        )
+
+        # Verify old pairing token is now invalid / forbidden
+        status, _ = self.request(f"/install/kindle/{device_id}?token={old_pairing_token}")
+        self.assertEqual(status, 403)
+
+        # Retrieve CSRF token
+        status, settings_body = self.request("/settings")
+        match = re.search(
+            rb'name="csrf_token" value="([^"]+)"',
+            settings_body,
+        )
+        self.assertIsNotNone(match)
+        csrf = match.group(1).decode("ascii")
+
+        # 3. Call reset endpoint to generate new token
+        status, _, body = self.post_json(
+            f"/api/device/{device_id}/installer-token/reset",
+            {},
+            headers={"X-CSRF-Token": csrf}
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(payload["ok"])
+        new_token = payload["pairing_token"]
+        self.assertNotEqual(new_token, old_pairing_token)
+        self.assertIn("install_command", payload)
+        self.assertIn(new_token, payload["install_command"])
+
+        # 4. Verify status_token and other fields are preserved
+        config = read_raw_device_config(device)
+        self.assertEqual(config.get("status_token"), old_status_token)
+        self.assertEqual(device.name, "Reset Test Kindle")
+        self.assertEqual(config.get("pairing_token"), new_token)
+
+        # 5. Verify public config/API does not expose pairing_token/status_token
+        status, body = self.request(f"/api/device/{device_id}/config")
+        self.assertEqual(status, 200)
+        pub_config = json.loads(body)
+        self.assertNotIn("pairing_token", pub_config)
+        self.assertNotIn("status_token", pub_config)
+
+        # 6. Verify that the new pairing token successfully fetches installer script
+        status, body = self.request(f"/install/kindle/{device_id}?token={new_token}")
+        self.assertEqual(status, 200)
+        script = body.decode("utf-8")
+        self.assertIn("status.sh", script)
+
+        # 7. Verify token persistence: save settings via forms and ensure tokens are not stripped
+        from settings_server import atomic_write_config
+        config["theme"] = "family_dashboard"
+        atomic_write_config(device.config_path, config)
+        
+        # Reload and check
+        config_after = read_raw_device_config(device)
+        self.assertEqual(config_after.get("pairing_token"), new_token)
+        self.assertEqual(config_after.get("status_token"), old_status_token)
+        self.assertEqual(config_after.get("theme"), "family_dashboard")
 
 
 if __name__ == "__main__":

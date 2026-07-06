@@ -5075,12 +5075,86 @@ def make_handler(
                     )
                     payload = {"ok": True, "message": message}
                 elif action_suffix == "push":
-                    message = device.push(
-                        connection=selected.connection,
-                        device_id=selected.id,
-                        device_type=selected.type,
-                    )
-                    payload = {"ok": True, "message": message}
+                    # 1. Resolve device IP address
+                    ip_address = None
+                    
+                    # 1.a. Check status.json
+                    status_file = device_status.status_path(selected)
+                    if status_file.exists():
+                        try:
+                            status_data = json.loads(status_file.read_text(encoding="utf-8"))
+                            ip_address = status_data.get("ip_address")
+                        except Exception:
+                            pass
+                            
+                    # 1.b. Check registry connection host
+                    if not ip_address:
+                        if selected.connection and isinstance(selected.connection, dict):
+                            ip_address = selected.connection.get("host")
+                            
+                    # 1.c. Check raw device config connection host
+                    if not ip_address:
+                        try:
+                            raw_config = read_raw_device_config(selected)
+                            conn_conf = raw_config.get("connection")
+                            if conn_conf and isinstance(conn_conf, dict):
+                                ip_address = conn_conf.get("host")
+                        except Exception:
+                            pass
+                            
+                    # 1.d. Fallback to static IPs for known devices
+                    if not ip_address:
+                        fallback_ips = {
+                            "kitchen": "192.168.68.122",
+                            "kitchen-kindle": "192.168.68.122",
+                            "default-kindle": "192.168.68.119",
+                        }
+                        ip_address = fallback_ips.get(selected.id)
+
+                    if not ip_address:
+                        self.send_json(
+                            400,
+                            {"ok": False, "error": "missing IP address for device"},
+                        )
+                        return
+
+                    # 2. Render selected device dashboard image
+                    render_selected(selected.id)
+
+                    # 3. Trigger remote refresh on Kindle via SSH
+                    cmd = ["ssh", "-o", "BatchMode=yes", f"root@{ip_address}", "/mnt/us/dashboard/refresh.sh"]
+                    try:
+                        result = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            check=False,
+                        )
+                    except OSError as exc:
+                        print(f"[Error] Failed to start SSH process: {exc}")
+                        self.send_json(
+                            500,
+                            {"ok": False, "error": f"Kindle command failed: {str(exc)}"},
+                        )
+                        return
+                    except subprocess.TimeoutExpired as exc:
+                        print(f"[Error] SSH process timed out: {exc}")
+                        self.send_json(
+                            503,
+                            {"ok": False, "error": "Kindle command timed out"},
+                        )
+                        return
+
+                    if result.returncode != 0:
+                        print(f"[Error] Kindle command failed with exit code {result.returncode}. Stderr: {result.stderr}")
+                        self.send_json(
+                            500,
+                            {"ok": False, "error": "Kindle command failed"},
+                        )
+                        return
+
+                    payload = {"ok": True, "message": "Dashboard generated and pushed"}
                 elif action_suffix == "light":
                     candidate = self.read_json()
                     level = candidate.get("level")

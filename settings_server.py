@@ -564,6 +564,15 @@ if [ -r /etc/prettyversion.txt ]; then
     FIRMWARE_VERSION=$(cat /etc/prettyversion.txt 2>/dev/null | tr -d '\\r\\n' | sed 's/"/\\"/g')
 fi
 
+# Detect dashboard loop status
+LOOP_STATUS="stopped"
+if [ -f "$DASHBOARD_DIR/dashboard_loop.pid" ]; then
+    PID=$(cat "$DASHBOARD_DIR/dashboard_loop.pid")
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        LOOP_STATUS="running"
+    fi
+fi
+
 # Build JSON using POSIX-compliant method
 JSON="{"
 SEP=""
@@ -581,7 +590,9 @@ if [ -n "$IP_ADDRESS" ]; then
 fi
 if [ -n "$FIRMWARE_VERSION" ]; then
     JSON="${JSON}${SEP}\\"firmware_version\\":\\"$FIRMWARE_VERSION\\""
+    SEP=","
 fi
+JSON="${JSON}${SEP}\\"loop_status\\":\\"$LOOP_STATUS\\""
 JSON="${JSON}}"
 
 if [ -n "${STATUS_URL:-}" ]; then
@@ -661,13 +672,102 @@ fi
 exit 0
 EOF"""
 
+    # dashboard_loop.sh heredoc
+    dashboard_loop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/dashboard_loop.sh"
+#!/bin/sh
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+if [ -f "$DASHBOARD_DIR/device.env" ]; then
+    . "$DASHBOARD_DIR/device.env"
+fi
+
+wait_for_ip() {
+    for i in $(seq 1 60); do
+        IP=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p')
+        if [ -z "$IP" ]; then
+            IP=$(ifconfig 2>/dev/null | grep "inet addr:" | grep -v "127.0.0.1" | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' | head -n 1)
+        fi
+        if [ -n "$IP" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+while true; do
+    wait_for_ip || true
+    if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
+        "$DASHBOARD_DIR/refresh.sh" || true
+    fi
+    SLEEP_MINUTES="${REFRESH_INTERVAL_MINUTES:-60}"
+    SLEEP_SECONDS=$((SLEEP_MINUTES * 60))
+    if [ "$SLEEP_SECONDS" -le 0 ]; then
+        SLEEP_SECONDS=3600
+    fi
+    sleep "$SLEEP_SECONDS"
+done
+EOF"""
+
+    # watchdog.sh heredoc
+    watchdog_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/watchdog.sh"
+#!/bin/sh
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
+
+while true; do
+    RUNNING=0
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            RUNNING=1
+        fi
+    fi
+    if [ "$RUNNING" -eq 0 ]; then
+        if [ -x "$DASHBOARD_DIR/dashboard_loop.sh" ]; then
+            "$DASHBOARD_DIR/dashboard_loop.sh" >/dev/null 2>&1 &
+            echo $! > "$PID_FILE"
+        fi
+    fi
+    sleep 10
+done
+EOF"""
+
     # start.sh heredoc
     start_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/start.sh"
 #!/bin/sh
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
-    exec "$DASHBOARD_DIR/refresh.sh"
+if [ -x "$DASHBOARD_DIR/stop.sh" ]; then
+    "$DASHBOARD_DIR/stop.sh" || true
 fi
+if [ -x "$DASHBOARD_DIR/watchdog.sh" ]; then
+    "$DASHBOARD_DIR/watchdog.sh" >/dev/null 2>&1 &
+    echo $! > "$DASHBOARD_DIR/watchdog.pid"
+fi
+exit 0
+EOF"""
+
+    # stop.sh heredoc
+    stop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/stop.sh"
+#!/bin/sh
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+WATCHDOG_PID_FILE="$DASHBOARD_DIR/watchdog.pid"
+if [ -f "$WATCHDOG_PID_FILE" ]; then
+    PID=$(cat "$WATCHDOG_PID_FILE")
+    if [ -n "$PID" ]; then
+        kill "$PID" 2>/dev/null || true
+        sleep 1
+    fi
+    rm -f "$WATCHDOG_PID_FILE"
+fi
+LOOP_PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
+if [ -f "$LOOP_PID_FILE" ]; then
+    PID=$(cat "$LOOP_PID_FILE")
+    if [ -n "$PID" ]; then
+        kill "$PID" 2>/dev/null || true
+    fi
+    rm -f "$LOOP_PID_FILE"
+fi
+exit 0
 EOF"""
 
     lines = [
@@ -689,14 +789,32 @@ EOF"""
         'STATUS_TOKEN="$STATUS_TOKEN"',
         'IMAGE_URL="$IMAGE_URL"',
         'STATUS_URL="$STATUS_URL"',
+        f'REFRESH_INTERVAL_MINUTES="{int(config.get("refresh_interval_minutes", 60))}"',
         "EOF",
         'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',
         status_sh_content,
         refresh_sh_content,
+        dashboard_loop_sh_content,
+        watchdog_sh_content,
         start_sh_content,
-        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/start.sh" 2>/dev/null || true',
-        'if [ -x "$DASHBOARD_DIR/status.sh" ]; then',
-        '    "$DASHBOARD_DIR/status.sh" >/dev/null 2>&1 || true',
+        stop_sh_content,
+        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" "$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true',
+        'if [ -d /etc/upstart ]; then',
+        '    mntroot rw 2>/dev/null || true',
+        '    cat <<\'UPSTART\' > /etc/upstart/dashboard.conf',
+        'start on started lab126',
+        'stop on stopping lab126',
+        'export DASHBOARD_DIR=/mnt/us/dashboard',
+        'exec /bin/sh -c \'',
+        '    if [ ! -f /mnt/us/dashboard/NOAUTOSTART ]; then',
+        '        /mnt/us/dashboard/start.sh >/dev/null 2>&1',
+        '    fi',
+        '\'',
+        'UPSTART',
+        '    mntroot ro 2>/dev/null || true',
+        'fi',
+        'if [ -x "$DASHBOARD_DIR/start.sh" ]; then',
+        '    "$DASHBOARD_DIR/start.sh" >/dev/null 2>&1 || true',
         'fi',
         'echo "Configured Kindle dashboard device: $DEVICE_ID"',
     ]
@@ -839,6 +957,7 @@ def render_settings(
         last_refresh_label = status.get("last_refresh_at") or "—"
         ip_label = status.get("ip_address") or connection.get("host") or "—"
         firmware_label = status.get("firmware_version") or "—"
+        loop_status = status.get("loop_status") or "stopped"
         last_error = status.get("last_error")
         connection_items = []
         for key in ("host", "user", "ssh_profile", "port", "method"):
@@ -935,6 +1054,7 @@ def render_settings(
             f'<div><dt>Last Refresh</dt><dd>{html.escape(last_refresh_label)}</dd></div>'
             f'<div><dt>IP Address</dt><dd>{html.escape(str(ip_label))}</dd></div>'
             f'<div><dt>Firmware</dt><dd>{html.escape(firmware_label)}</dd></div>'
+            f'<div><dt>Runtime Loop</dt><dd>{html.escape(loop_status)}</dd></div>'
             "</dl>"
             + connection_html
             + installer_command_html

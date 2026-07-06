@@ -2105,12 +2105,21 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("status.sh", script)
         self.assertIn("refresh.sh", script)
         self.assertIn("start.sh", script)
+        self.assertIn("dashboard_loop.sh", script)
+        self.assertIn("watchdog.sh", script)
+        self.assertIn("stop.sh", script)
         self.assertIn("STATUS_URL=", script)
         self.assertIn("IMAGE_URL=", script)
         self.assertIn("Authorization: Bearer", script)
+        # Verify REFRESH_INTERVAL_MINUTES is written to device.env
+        self.assertIn('REFRESH_INTERVAL_MINUTES="30"', script)
         # Verify BusyBox-compatible syntax and chmod executions
         self.assertIn('chmod +x "$DASHBOARD_DIR/status.sh"', script)
         self.assertIn('"$DASHBOARD_DIR/status.sh" >/dev/null 2>&1', script)
+        # Verify upstart config creation
+        self.assertIn('/etc/upstart/dashboard.conf', script)
+        self.assertIn('mntroot rw', script)
+        self.assertIn('mntroot ro', script)
         # Verify wlan0 IP preference, lipc battery level fallback, and prettyversion.txt firmware version extraction
         self.assertIn("ifconfig wlan0", script)
         self.assertIn("lipc-get-prop", script)

@@ -36,7 +36,7 @@ SSH_PROFILES = {
 
 ACTION_COMMANDS = {
     "start": (
-        "/mnt/us/dashboard/start-dashboard.sh --manual",
+        "/mnt/us/dashboard/start.sh",
         "Dashboard started",
         20,
     ),

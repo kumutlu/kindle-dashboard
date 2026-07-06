@@ -512,8 +512,27 @@ do
     fi
 done
 
+# Fallback to lipc properties if sysfs power supply was empty (e.g. on PW1)
+if [ -z "$BATTERY_PERCENT" ] && command -v lipc-get-prop >/dev/null 2>&1; then
+    LIPC_BAT=$(lipc-get-prop com.lab126.powerd batteryLevel 2>/dev/null | tr -d '\\r\\n')
+    case "$LIPC_BAT" in
+        ""|*[!0-9]*) ;;
+        *) BATTERY_PERCENT="$LIPC_BAT" ;;
+    esac
+fi
+if [ -z "$CHARGING" ] && command -v lipc-get-prop >/dev/null 2>&1; then
+    LIPC_CHG=$(lipc-get-prop com.lab126.powerd isCharging 2>/dev/null | tr -d '\\r\\n')
+    case "$LIPC_CHG" in
+        1|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]) CHARGING="true" ;;
+        0|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]) CHARGING="false" ;;
+    esac
+fi
+
 IP_ADDRESS=""
-if command -v ip >/dev/null 2>&1; then
+if command -v ifconfig >/dev/null 2>&1; then
+    IP_ADDRESS=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\\([0-9.][0-9.]*\\).*/\\1/p' | sed -n '1p')
+fi
+if [ -z "$IP_ADDRESS" ] && command -v ip >/dev/null 2>&1; then
     IP_ADDRESS=$(ip route get "${SERVER_HOST:-127.0.0.1}" 2>/dev/null | sed -n 's/.* src \\([0-9.][0-9.]*\\).*/\\1/p' | sed -n '1p')
     if [ -z "$IP_ADDRESS" ]; then
         IP_ADDRESS=$(ip addr show 2>/dev/null | sed -n 's/.*inet \\([0-9.][0-9.]*\\)\\/.*/\\1/p' | grep -v '^127\\.' | sed -n '1p')
@@ -521,6 +540,11 @@ if command -v ip >/dev/null 2>&1; then
 fi
 if [ -z "$IP_ADDRESS" ] && command -v ifconfig >/dev/null 2>&1; then
     IP_ADDRESS=$(ifconfig 2>/dev/null | sed -n 's/.*inet addr:\\([0-9.][0-9.]*\\).*/\\1/p' | grep -v '^127\\.' | sed -n '1p')
+fi
+
+FIRMWARE_VERSION=""
+if [ -r /etc/prettyversion.txt ]; then
+    FIRMWARE_VERSION=$(cat /etc/prettyversion.txt 2>/dev/null | tr -d '\\r\\n' | sed 's/"/\\"/g')
 fi
 
 # Build JSON using POSIX-compliant method
@@ -536,6 +560,10 @@ if [ -n "$CHARGING" ]; then
 fi
 if [ -n "$IP_ADDRESS" ]; then
     JSON="${JSON}${SEP}\\"ip_address\\":\\"$IP_ADDRESS\\""
+    SEP=","
+fi
+if [ -n "$FIRMWARE_VERSION" ]; then
+    JSON="${JSON}${SEP}\\"firmware_version\\":\\"$FIRMWARE_VERSION\\""
 fi
 JSON="${JSON}}"
 

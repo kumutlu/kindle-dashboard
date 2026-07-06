@@ -2100,6 +2100,11 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         # Verify BusyBox-compatible syntax and chmod executions
         self.assertIn('chmod +x "$DASHBOARD_DIR/status.sh"', script)
         self.assertIn('"$DASHBOARD_DIR/status.sh" >/dev/null 2>&1', script)
+        # Verify wlan0 IP preference, lipc battery level fallback, and prettyversion.txt firmware version extraction
+        self.assertIn("ifconfig wlan0", script)
+        self.assertIn("lipc-get-prop", script)
+        self.assertIn("/etc/prettyversion.txt", script)
+        self.assertIn("firmware_version", script)
 
     def test_pair_endpoint_requires_token_and_marks_status_seen(self):
         status, _, body = self.post_json(

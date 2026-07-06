@@ -2298,6 +2298,90 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(config_after.get("status_token"), old_status_token)
         self.assertEqual(config_after.get("theme"), "family_dashboard")
 
+    def test_installer_generates_status_token_if_missing(self):
+        # 1. Create a Kindle device
+        status, _, body = self.post_json(
+            "/api/devices",
+            {
+                "type": "kindle_pw1",
+                "name": "Missing Status Token Kindle",
+                "theme": "home_dashboard",
+            },
+        )
+        self.assertEqual(status, 201)
+        created = json.loads(body)
+        device_id = created["device"]["device_id"]
+        pairing_token = created["pairing_token"]
+
+        # 2. Simulate status_token missing but pairing_token present
+        device = self.registry.get(device_id)
+        from settings_server import read_raw_device_config, atomic_write_bytes
+        config = read_raw_device_config(device)
+        self.assertIn("status_token", config)
+        config.pop("status_token")
+        
+        # Write it back without status_token
+        atomic_write_bytes(
+            device.config_path,
+            (json.dumps(config, indent=2) + "\n").encode("utf-8")
+        )
+
+        # 3. Request installer script using pairing_token
+        status, body = self.request(f"/install/kindle/{device_id}?token={pairing_token}")
+        self.assertEqual(status, 200)
+        script = body.decode("utf-8")
+        
+        # Verify installer script contains status.sh, refresh.sh, start.sh
+        self.assertIn("status.sh", script)
+        self.assertIn("refresh.sh", script)
+        self.assertIn("start.sh", script)
+        
+        # Verify STATUS_TOKEN in script is non-empty
+        self.assertIn('STATUS_TOKEN="', script)
+        self.assertNotIn('STATUS_TOKEN=""', script)
+
+        # 4. Verify status_token is now saved and present in the device config file
+        config_after = read_raw_device_config(device)
+        self.assertIn("status_token", config_after)
+        self.assertTrue(config_after["status_token"])
+        self.assertEqual(config_after["pairing_token"], pairing_token)
+
+        # 5. Reset endpoint generates both pairing_token and status_token if status_token is missing
+        # Delete status_token and pairing_token
+        config_after.pop("status_token")
+        config_after.pop("pairing_token")
+        atomic_write_bytes(
+            device.config_path,
+            (json.dumps(config_after, indent=2) + "\n").encode("utf-8")
+        )
+
+        # Retrieve CSRF token
+        status, settings_body = self.request("/settings")
+        match = re.search(
+            rb'name="csrf_token" value="([^"]+)"',
+            settings_body,
+        )
+        self.assertIsNotNone(match)
+        csrf = match.group(1).decode("ascii")
+
+        # Call reset endpoint
+        status, _, body = self.post_json(
+            f"/api/device/{device_id}/installer-token/reset",
+            {},
+            headers={"X-CSRF-Token": csrf}
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(payload["ok"])
+        new_pairing_token = payload["pairing_token"]
+
+        # Verify device config contains both pairing_token and status_token
+        config_final = read_raw_device_config(device)
+        self.assertIn("pairing_token", config_final)
+        self.assertEqual(config_final["pairing_token"], new_pairing_token)
+        self.assertIn("status_token", config_final)
+        self.assertTrue(config_final["status_token"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -468,6 +468,8 @@ def kindle_installer_script(device, config, server_host, image_port, settings_po
         raise ValueError("Kindle installer is available only for Kindle devices")
     device_id = device.id
     status_token = config.get("status_token", "")
+    if not status_token:
+        raise ValueError("status_token is required for Kindle installer")
     image_url = (
         f"http://{server_host}:{image_port}/device/{device_id}/image.png"
     )
@@ -4463,6 +4465,8 @@ def make_handler(
                 config = read_raw_device_config(selected)
                 new_token = generate_device_token()
                 config["pairing_token"] = new_token
+                if "status_token" not in config or not config["status_token"]:
+                    config["status_token"] = generate_device_token()
                 
                 data = (
                     json.dumps(config, indent=2, ensure_ascii=False) + "\n"
@@ -4535,6 +4539,17 @@ def make_handler(
             if selected.type != "kindle_pw1":
                 self.send_json(400, {"ok": False, "error": "not a Kindle device"})
                 return
+
+            if "status_token" not in config or not config["status_token"]:
+                with update_lock:
+                    # Reload to avoid race conditions and generate status_token
+                    config = read_raw_device_config(selected)
+                    config["status_token"] = generate_device_token()
+                    data = (
+                        json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+                    ).encode("utf-8")
+                    atomic_write_bytes(selected.config_path, data)
+
             server_host = public_host_from_headers(self.headers)
             script = kindle_installer_script(
                 selected,

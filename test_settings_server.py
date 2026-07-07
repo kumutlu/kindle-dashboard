@@ -1342,8 +1342,8 @@ class SettingsServerTests(unittest.TestCase):
         self.assertIn('[data-theme="dark"]', text)
         self.assertIn('kindle_dashboard_ui_theme', text)
 
-    def test_push_named_device_renders_and_refreshes(self):
-        # Add a named Kindle PW1 device
+    @mock.patch("settings_server.render_device")
+    def test_push_named_device_renders_copies_and_displays_image(self, mock_render_device):
         kitchen = self.registry.add({
             "id": "kitchen-kindle",
             "name": "Kitchen Kindle",
@@ -1365,9 +1365,26 @@ class SettingsServerTests(unittest.TestCase):
             "/api/device/kitchen-kindle/push",
             headers={"X-CSRF-Token": csrf},
         )
+
         self.assertEqual(status, 200)
-        self.assertIn(("push", "kitchen-kindle"), self.device_calls)
-        self.mock_run.assert_not_called()
+        mock_render_device.assert_called_once_with(
+            "kitchen-kindle",
+            force=True,
+            registry=self.registry,
+        )
+        self.assertNotIn(("push", "kitchen-kindle"), self.device_calls)
+        self.assertEqual(self.mock_run.call_count, 2)
+        scp_args = self.mock_run.call_args_list[0].args[0]
+        ssh_args = self.mock_run.call_args_list[1].args[0]
+        self.assertEqual(scp_args[:3], ["scp", "-i", "/home/user/.ssh/kindle_ed25519"])
+        self.assertEqual(
+            scp_args[-1],
+            "root@192.168.68.150:/mnt/us/dashboard/image.png",
+        )
+        self.assertEqual(ssh_args[:3], ["ssh", "-i", "/home/user/.ssh/kindle_ed25519"])
+        self.assertEqual(ssh_args[-2], "root@192.168.68.150")
+        self.assertIn("/usr/sbin/eips -c", ssh_args[-1])
+        self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", ssh_args[-1])
 
     def test_push_non_kindle_is_rejected(self):
         # Add a generic PNG display
@@ -2776,7 +2793,12 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         content_b = path_b.read_bytes()
         self.assertNotEqual(content_k, content_b)
 
-    def test_push_requires_csrf_and_rejects_status_token(self):
+    @mock.patch("settings_server.subprocess.run")
+    @mock.patch("settings_server.render_device")
+    def test_push_requires_csrf_and_rejects_status_token(self, mock_render_device, mock_run):
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
         status_k, _, body_k = self.post_json(
             "/api/devices",
             {
@@ -2800,16 +2822,21 @@ class DeviceConfigEndpointTests(unittest.TestCase):
 
         csrf = self.csrf_token()
         status, _, body = self.post_json(
-            f"/api/device/{id_k}/push",
+            "/api/device/default-kindle/push",
             {},
             headers={"X-CSRF-Token": csrf},
         )
         self.assertEqual(status, 200)
         self.assertEqual(
             json.loads(body.decode("utf-8")),
-            {"ok": True, "message": "generated and pushed"},
+            {"ok": True, "message": "Dashboard generated and pushed"},
         )
-        self.mock_device.push.assert_called()
+        mock_render_device.assert_called_once_with(
+            "default-kindle",
+            force=True,
+            registry=self.registry,
+        )
+        self.mock_device.push.assert_not_called()
 
     def test_push_with_invalid_csrf_fails(self):
         status_k, _, body_k = self.post_json(
@@ -2854,30 +2881,34 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body.decode("utf-8"))["ok"])
 
-    @mock.patch("subprocess.run")
-    def test_push_endpoint_uses_kindle_device_runner_not_raw_ssh(self, mock_run):
-        status_k, _, body_k = self.post_json(
-            "/api/devices",
-            {
-                "type": "kindle_pw1",
-                "name": "Kitchen Kindle",
-                "theme": "home_dashboard",
-            },
-        )
-        self.assertEqual(status_k, 201)
-        res_k = json.loads(body_k)
-        id_k = res_k["device"]["id"]
+    @mock.patch("settings_server.subprocess.run")
+    @mock.patch("settings_server.render_device")
+    def test_push_endpoint_uses_direct_render_scp_and_absolute_eips(self, mock_render_device, mock_run):
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
 
         csrf = self.csrf_token()
         status, _, body = self.post_json(
-            f"/api/device/{id_k}/push",
+            "/api/device/default-kindle/push",
             {},
             headers={"X-CSRF-Token": csrf},
         )
 
         self.assertEqual(status, 200)
-        mock_run.assert_not_called()
-        self.mock_device.push.assert_called_once()
+        mock_render_device.assert_called_once_with(
+            "default-kindle",
+            force=True,
+            registry=self.registry,
+        )
+        self.mock_device.push.assert_not_called()
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(mock_run.call_args_list[0].args[0][0], "scp")
+        self.assertIn("/home/user/.ssh/kindle_ed25519", mock_run.call_args_list[0].args[0])
+        self.assertIn("root@192.168.68.119:/mnt/us/dashboard/image.png", mock_run.call_args_list[0].args[0])
+        self.assertEqual(mock_run.call_args_list[1].args[0][0], "ssh")
+        self.assertIn("root@192.168.68.119", mock_run.call_args_list[1].args[0])
+        self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", mock_run.call_args_list[1].args[0][-1])
 
 
 if __name__ == "__main__":

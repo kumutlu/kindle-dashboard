@@ -36,6 +36,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
+KINDLE_PUSH_KEY = Path("/home/user/.ssh/kindle_ed25519")
+KINDLE_REMOTE_IMAGE_PATH = "/mnt/us/dashboard/image.png"
 DEVICE_CONFIG_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/config$"
 )
@@ -68,6 +70,52 @@ DEVICE_PROFILES = {
         "resolution": [960, 540],
     },
 }
+
+
+def _run_push_command(args, timeout, label):
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            raise DeviceError(f"{label} failed: {detail[-500:]}")
+        raise DeviceError(f"{label} failed")
+    return result.stdout
+
+
+def push_rendered_device_to_kindle(device, registry):
+    if device.type != "kindle_pw1":
+        raise ValueError("unsupported device type")
+    connection = device.connection or {}
+    host = connection.get("host")
+    user = connection.get("user", "root")
+    port = int(connection.get("port", 22) or 22)
+    if not host:
+        raise DeviceError("Push is not configured for this device")
+
+    render_device(device.id, force=True, registry=registry)
+    remote = f"{user}@{host}:{KINDLE_REMOTE_IMAGE_PATH}"
+    target = f"{user}@{host}"
+
+    scp_args = ["scp", "-i", str(KINDLE_PUSH_KEY)]
+    if port != 22:
+        scp_args.extend(["-P", str(port)])
+    scp_args.extend([str(device.image_path), remote])
+    _run_push_command(scp_args, 30, "Kindle image copy")
+
+    ssh_args = ["ssh", "-i", str(KINDLE_PUSH_KEY)]
+    if port != 22:
+        ssh_args.extend(["-p", str(port)])
+    ssh_args.extend([
+        target,
+        f"/usr/sbin/eips -c; /usr/sbin/eips -c; /usr/sbin/eips -g {KINDLE_REMOTE_IMAGE_PATH}",
+    ])
+    _run_push_command(ssh_args, 20, "Kindle screen refresh")
+    return "Dashboard generated and pushed"
 
 
 def public_device_config(device, config):
@@ -5105,10 +5153,9 @@ def make_handler(
                 for selected in registry.load():
                     if selected.enabled and selected.type == "kindle_pw1":
                         try:
-                            device.push(
-                                connection=selected.connection,
-                                device_id=selected.id,
-                                device_type=selected.type,
+                            push_rendered_device_to_kindle(
+                                selected,
+                                registry,
                             )
                             pushed_devices.append(selected.name)
                         except Exception as exc:
@@ -5240,10 +5287,9 @@ def make_handler(
                     )
                     payload = {"ok": True, "message": message}
                 elif action_suffix == "push":
-                    message = device.push(
-                        connection=selected.connection,
-                        device_id=selected.id,
-                        device_type=selected.type,
+                    message = push_rendered_device_to_kindle(
+                        selected,
+                        registry,
                     )
                     payload = {"ok": True, "message": message}
                 elif action_suffix == "light":

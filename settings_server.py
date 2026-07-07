@@ -974,16 +974,19 @@ def render_settings(
         f'<p class="message" role="status">{html.escape(status_message)}</p>'
         if status_message else ""
     )
+    device_button_defs = (
+        ("start-dashboard", "Start Dashboard", "device"),
+        ("stop-dashboard", "Stop Dashboard", "device"),
+        ("home", "Return Home", "device"),
+        ("push", "Refresh Now", "push"),
+        ("autostart/enable", "Enable Autostart", "device"),
+        ("autostart/disable", "Disable Autostart", "device"),
+    )
     device_buttons = "".join(
-        f'<button type="button" data-device-action="{action}">{label}</button>'
-        for action, label in (
-            ("start-dashboard", "Start Dashboard"),
-            ("stop-dashboard", "Stop Dashboard"),
-            ("home", "Return Home"),
-            ("refresh", "Refresh Now"),
-            ("autostart/enable", "Enable Autostart"),
-            ("autostart/disable", "Disable Autostart"),
-        )
+        f'<button type="button" data-settings-action="push">{label}</button>'
+        if kind == "push"
+        else f'<button type="button" data-device-action="{action}">{label}</button>'
+        for action, label, kind in device_button_defs
     )
     light_buttons = "".join(
         f'<button type="button" data-light="{level}">{label}</button>'

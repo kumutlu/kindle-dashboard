@@ -368,6 +368,8 @@ class SettingsServerTests(unittest.TestCase):
         ):
             self.assertIn(f">{label}</button>", text)
         self.assertIn('id="push-kindle"', text)
+        self.assertIn('data-settings-action="push">Refresh Now</button>', text)
+        self.assertNotIn('data-device-action="refresh">Refresh Now</button>', text)
         self.assertNotIn("Coming soon — these controls", text)
         self.assertNotIn("lipc-", text)
         self.assertNotIn("ssh ", text)

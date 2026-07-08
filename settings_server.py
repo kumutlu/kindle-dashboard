@@ -5274,25 +5274,24 @@ def make_handler(
                     "start-dashboard": "start",
                     "stop-dashboard": "stop",
                     "home": "home",
-                    "refresh": "refresh",
                     "autostart/enable": "autostart_enable",
                     "autostart/disable": "autostart_disable",
                 }
                 action_suffix = path.split("/")[-1]
                 if "autostart" in path:
                     action_suffix = "autostart/" + action_suffix
-                if action_suffix in action_paths:
+                if action_suffix in ("push", "refresh"):
+                    message = push_rendered_device_to_kindle(
+                        selected,
+                        registry,
+                    )
+                    payload = {"ok": True, "message": message}
+                elif action_suffix in action_paths:
                     message = device.run_action(
                         action_paths[action_suffix],
                         connection=selected.connection,
                         device_id=selected.id,
                         device_type=selected.type,
-                    )
-                    payload = {"ok": True, "message": message}
-                elif action_suffix == "push":
-                    message = push_rendered_device_to_kindle(
-                        selected,
-                        registry,
                     )
                     payload = {"ok": True, "message": message}
                 elif action_suffix == "light":

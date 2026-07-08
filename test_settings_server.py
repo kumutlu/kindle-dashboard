@@ -849,13 +849,25 @@ class SettingsServerTests(unittest.TestCase):
 
     def test_device_action_and_light_use_whitelisted_routes(self):
         csrf = self.csrf_token()
-        status, _, body = self.request(
-            "POST",
-            "/api/device/refresh",
-            headers={"X-CSRF-Token": csrf},
-        )
+        with mock.patch("settings_server.render_device") as mock_render_device:
+            self.mock_run.reset_mock()
+            status, _, body = self.request(
+                "POST",
+                "/api/device/refresh",
+                headers={"X-CSRF-Token": csrf},
+            )
         self.assertEqual(status, 200, body)
-        self.assertIn(("action", "refresh"), self.device_calls)
+        self.assertEqual(
+            json.loads(body.decode("utf-8"))["message"],
+            "Dashboard generated and pushed",
+        )
+        mock_render_device.assert_called_once_with(
+            "default-kindle",
+            force=True,
+            registry=self.registry,
+        )
+        self.assertNotIn(("action", "refresh"), self.device_calls)
+        self.assertEqual(self.mock_run.call_count, 2)
 
         status, _, body = self.request(
             "POST",
@@ -1387,6 +1399,43 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(ssh_args[-2], "root@192.168.68.150")
         self.assertIn("/usr/sbin/eips -c", ssh_args[-1])
         self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", ssh_args[-1])
+
+    @mock.patch("settings_server.render_device")
+    def test_refresh_now_endpoint_uses_selected_device_push_path(self, mock_render_device):
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.150",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            }
+        })
+
+        csrf = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/device/kitchen-kindle/refresh",
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8"))["message"], "Dashboard generated and pushed")
+        mock_render_device.assert_called_once_with(
+            "kitchen-kindle",
+            force=True,
+            registry=self.registry,
+        )
+        self.assertNotIn(("action", "refresh", "kitchen-kindle"), self.device_calls)
+        self.assertEqual(self.mock_run.call_count, 2)
+        self.assertEqual(self.mock_run.call_args_list[0].args[0][0], "scp")
+        self.assertEqual(self.mock_run.call_args_list[1].args[0][0], "ssh")
+        self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", self.mock_run.call_args_list[1].args[0][-1])
 
     def test_push_non_kindle_is_rejected(self):
         # Add a generic PNG display

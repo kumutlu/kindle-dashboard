@@ -312,6 +312,96 @@ class DeviceRendererTests(unittest.TestCase):
                 registry=self.registry,
             )
 
+    def test_minimal_weather_renders_600x800_kindle_device(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+            "connection": {
+                "host": "192.168.68.131",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            },
+            "use_screensaver_overlay": True,
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "title": "KINDLE 131",
+            "theme": "minimal_weather",
+        })
+        kt4.config_path.write_text(
+            json.dumps(config),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(weather_image, "collect_dashboard_data", return_value={
+            "now": mock.Mock(
+                strftime=lambda fmt: {
+                    "%A": "Friday",
+                    "%d %B %Y": "10 July 2026",
+                    "%H:%M": "12:00",
+                }.get(fmt, "Friday"),
+            ),
+            "current": {"weatherCode": "113"},
+            "temp": 20,
+            "desc": "Clear",
+            "feels": 18,
+            "hi": 24,
+            "lo": 12,
+            "humidity": 45,
+            "wind": 9,
+            "wind_dir": "W",
+            "pressure": 1012,
+            "days": [
+                {
+                    "date": "2026-07-10",
+                    "maxtempC": 24,
+                    "mintempC": 12,
+                    "hourly": [{"weatherCode": "113", "chanceofrain": 10}],
+                }
+            ] * 3,
+            "ph": {"queries": 0, "blocked": 0, "clients": 0},
+            "ts": {"online": 0, "total": 0},
+        }):
+            result = weather_image.render_device(
+                kt4.id,
+                registry=self.registry,
+            )
+
+        self.assertEqual(result["resolution"], [600, 800])
+        self.assertEqual(result["theme"], "minimal_weather")
+        with Image.open(kt4.image_path) as generated:
+            self.assertEqual(generated.size, (600, 800))
+
+    def test_600x800_rejects_non_minimal_theme_safely(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+            "connection": {
+                "host": "192.168.68.131",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            },
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "family_dashboard"
+        kt4.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "600x800.*minimal_weather"):
+            weather_image.render_device(
+                kt4.id,
+                registry=self.registry,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1819,6 +1819,77 @@ def render_minimal_weather(config):
     save_dashboard(img, data)
 
 
+def render_minimal_weather_600x800(config):
+    data = collect_dashboard_data(config)
+    fonts = dashboard_fonts()
+    current = data["current"]
+    img = Image.new("L", (600, 800), 255)
+    d = ImageDraw.Draw(img)
+    box(d, (8, 8, 592, 792), 8, 2)
+
+    title = config["title"][:24]
+    location = config["location_label"][:34]
+    txt(d, 24, 24, title, fonts["FB24"])
+    txt(d, 24, 58, location, fonts["FR16"])
+    txt(d, 576, 24, data["now"].strftime("%A").upper(), fonts["FB18"], anchor="ra")
+    txt(d, 576, 55, data["now"].strftime("%d %B %Y"), fonts["FR16"], anchor="ra")
+    d.line((20, 92, 580, 92), fill=0, width=2)
+
+    box(d, (20, 115, 580, 405), 8, 2)
+    txt(d, 40, 142, "CURRENT WEATHER", fonts["FB18"])
+    draw_weather_icon(
+        d, weather_kind(current.get("weatherCode")), 122, 255, 120
+    )
+    txt(d, 360, 218, f"{data['temp']}°C", fonts["FB72"], anchor="mm")
+    txt(d, 360, 288, data["desc"].upper()[:18], fonts["FB24"], anchor="mm")
+    txt(
+        d, 360, 330, f"Feels like {data['feels']}°C",
+        fonts["FR18"], anchor="mm",
+    )
+    d.line((40, 358, 560, 358), fill=0, width=1)
+    txt(d, 45, 380, f"H/L {data['hi']}°/{data['lo']}°", fonts["FR14"])
+    txt(d, 235, 380, f"Humidity {data['humidity']}%", fonts["FR14"])
+    txt(d, 415, 380, f"Wind {data['wind']} mph", fonts["FR14"])
+
+    txt(d, 24, 445, "FORECAST", fonts["FB20"])
+    card_w = 176
+    gap = 12
+    top = 482
+    for i, day in enumerate(data["days"][:3]):
+        x = 24 + i * (card_w + gap)
+        box(d, (x, top, x + card_w, top + 205), 8, 2)
+        try:
+            date_obj = datetime.strptime(day["date"], "%Y-%m-%d")
+            label = date_obj.strftime("%a").upper()
+        except Exception:
+            label = str(day.get("date", ""))[:6].upper()
+        noon = day.get("hourly", [{}])[0]
+        txt(d, x + card_w // 2, top + 24, label, fonts["FB18"], anchor="mm")
+        draw_weather_icon(
+            d,
+            weather_kind(noon.get("weatherCode", day.get("weatherCode"))),
+            x + card_w // 2,
+            top + 82,
+            64,
+        )
+        txt(
+            d, x + card_w // 2, top + 138,
+            f"{day['maxtempC']}°/{day['mintempC']}°",
+            fonts["FB20"], anchor="mm",
+        )
+        txt(
+            d, x + card_w // 2, top + 174,
+            f"{noon.get('chanceofrain', 0)}% rain",
+            fonts["FR14"], anchor="mm",
+        )
+
+    d.line((20, 730, 580, 730), fill=0, width=2)
+    txt(d, 24, 760, f"Updated {data['now'].strftime('%H:%M')}", fonts["FR14"])
+    txt(d, 220, 760, f"Pressure {data['pressure']} hPa", fonts["FR14"])
+    txt(d, 430, 760, f"Humidity {data['humidity']}%", fonts["FR14"])
+    save_dashboard(img, data)
+
+
 def render_server_monitor(config):
     data = collect_dashboard_data(config)
     fonts = dashboard_fonts()
@@ -2694,6 +2765,25 @@ def render_dashboard(
     state_file=None,
 ):
     resolution = tuple(resolution or (W, H))
+    if resolution == (600, 800):
+        if config["theme"] != "minimal_weather":
+            raise ValueError(
+                "600x800 devices currently support only minimal_weather"
+            )
+        token = ACTIVE_OUTPUT.set(Path(output_path))
+        try:
+            render_minimal_weather_600x800(config)
+        finally:
+            ACTIVE_OUTPUT.reset(token)
+        with Image.open(output_path) as generated:
+            if generated.size != resolution:
+                raise ValueError(
+                    "generated image does not match device resolution"
+                )
+        if state_file is not None:
+            _write_render_state(config, state_file)
+        return Path(output_path)
+
     if resolution != (W, H):
         raise ValueError(
             "existing dashboard themes currently require 758x1024"

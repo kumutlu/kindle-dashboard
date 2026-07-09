@@ -19,7 +19,7 @@ from device_registry import (
     DeviceRegistry,
     RegistryValidationError,
 )
-from kindle_device import DeviceError, KindleDevice
+from kindle_device import DeviceError, KindleDevice, SSH_PROFILES
 from weather_image import (
     DEFAULT_CONFIG,
     geocode_locations,
@@ -36,7 +36,6 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
-KINDLE_PUSH_KEY = Path("/home/user/.ssh/kindle_ed25519")
 KINDLE_REMOTE_IMAGE_PATH = "/mnt/us/dashboard/image.png"
 DEVICE_CONFIG_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/config$"
@@ -59,6 +58,11 @@ DEVICE_PROFILES = {
         "type": "kindle_pw1",
         "resolution": [758, 1024],
     },
+    "kindle_kt4": {
+        "label": "Kindle Basic / KT4 600×800",
+        "type": "kindle_kt4",
+        "resolution": [600, 800],
+    },
     "esp32_800x480": {
         "label": "ESP32 e-paper 800×480",
         "type": "esp32_epaper",
@@ -70,6 +74,7 @@ DEVICE_PROFILES = {
         "resolution": [960, 540],
     },
 }
+KINDLE_DEVICE_TYPES = {"kindle_pw1", "kindle_kt4"}
 
 
 def _run_push_command(args, timeout, label):
@@ -87,10 +92,44 @@ def _run_push_command(args, timeout, label):
     return result.stdout
 
 
+def _push_ssh_profile(connection):
+    profile_name = connection.get("ssh_profile")
+    if not profile_name or profile_name not in SSH_PROFILES:
+        raise DeviceError("invalid or missing SSH profile")
+    profile = SSH_PROFILES[profile_name]
+    return profile
+
+
+def _push_common_ssh_options(profile):
+    args = [
+        "-i",
+        str(profile["key_path"]),
+        "-o",
+        f"UserKnownHostsFile={profile['known_hosts']}",
+    ]
+    args.extend(profile.get("options", ()))
+    args.extend(
+        [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "LogLevel=ERROR",
+        ]
+    )
+    return args
+
+
 def push_rendered_device_to_kindle(device, registry):
-    if device.type != "kindle_pw1":
+    if device.type not in KINDLE_DEVICE_TYPES:
         raise ValueError("unsupported device type")
     connection = device.connection or {}
+    profile = _push_ssh_profile(connection)
     host = connection.get("host")
     user = connection.get("user", "root")
     port = int(connection.get("port", 22) or 22)
@@ -101,19 +140,31 @@ def push_rendered_device_to_kindle(device, registry):
     remote = f"{user}@{host}:{KINDLE_REMOTE_IMAGE_PATH}"
     target = f"{user}@{host}"
 
-    scp_args = ["scp", "-i", str(KINDLE_PUSH_KEY)]
+    scp_args = ["scp"]
+    scp_args.extend(_push_common_ssh_options(profile))
     if port != 22:
         scp_args.extend(["-P", str(port)])
     scp_args.extend([str(device.image_path), remote])
     _run_push_command(scp_args, 30, "Kindle image copy")
 
-    ssh_args = ["ssh", "-i", str(KINDLE_PUSH_KEY)]
+    remote_command = (
+        f"/usr/sbin/eips -c; /usr/sbin/eips -c; "
+        f"/usr/sbin/eips -g {KINDLE_REMOTE_IMAGE_PATH}"
+    )
+    if getattr(device, "use_screensaver_overlay", False):
+        remote_command = (
+            "if [ ! -x /mnt/us/dashboard/apply-screensaver-overlay.sh ]; then "
+            "echo \"missing required screensaver overlay script: "
+            "/mnt/us/dashboard/apply-screensaver-overlay.sh\" >&2; exit 127; "
+            "fi; /mnt/us/dashboard/apply-screensaver-overlay.sh && sync; "
+            + remote_command
+        )
+
+    ssh_args = ["ssh"]
+    ssh_args.extend(_push_common_ssh_options(profile))
     if port != 22:
         ssh_args.extend(["-p", str(port)])
-    ssh_args.extend([
-        target,
-        f"/usr/sbin/eips -c; /usr/sbin/eips -c; /usr/sbin/eips -g {KINDLE_REMOTE_IMAGE_PATH}",
-    ])
+    ssh_args.extend([target, remote_command])
     _run_push_command(ssh_args, 20, "Kindle screen refresh")
     return "Dashboard generated and pushed"
 
@@ -156,7 +207,7 @@ def public_device_config(device, config):
     payload["image_url"] = f"/device/{device.id}/image.png"
     if device.type == "esp32_epaper":
         payload["bmp_url"] = f"/device/{device.id}/image.bmp"
-    elif device.type == "kindle_pw1":
+    elif device.type in KINDLE_DEVICE_TYPES:
         if "kindle_frontlight" in config:
             payload["kindle_frontlight"] = config["kindle_frontlight"]
     return payload
@@ -443,15 +494,15 @@ def create_device(registry, legacy_config_path, payload, headers, settings_port)
     if not isinstance(payload, dict):
         raise ValueError("device request must be a JSON object")
     device_type = str(payload.get("type", "")).strip()
-    if device_type not in ("kindle_pw1", "esp32_epaper"):
-        raise ValueError("device type must be kindle_pw1 or esp32_epaper")
+    if device_type not in ("kindle_pw1", "kindle_kt4", "esp32_epaper"):
+        raise ValueError("device type must be kindle_pw1, kindle_kt4 or esp32_epaper")
     name = str(payload.get("name", "")).strip()
     if not name or len(name) > 100:
         raise ValueError("device name is required")
 
     profile_key = str(payload.get("profile", "")).strip()
     if not profile_key:
-        profile_key = "kindle_pw1" if device_type == "kindle_pw1" else "esp32_800x480"
+        profile_key = device_type if device_type in KINDLE_DEVICE_TYPES else "esp32_800x480"
     profile = DEVICE_PROFILES.get(profile_key)
     if profile is None or profile["type"] != device_type:
         raise ValueError("device profile is invalid")
@@ -474,7 +525,7 @@ def create_device(registry, legacy_config_path, payload, headers, settings_port)
 
     host = str(payload.get("host", "")).strip()
     if host:
-        if device_type == "kindle_pw1":
+        if device_type in KINDLE_DEVICE_TYPES:
             new_record["connection"] = {
                 "host": host,
                 "user": str(payload.get("user", "root")).strip() or "root",
@@ -516,7 +567,7 @@ def create_device(registry, legacy_config_path, payload, headers, settings_port)
 
     public_host = public_host_from_headers(headers)
     install_command = ""
-    if device_type == "kindle_pw1":
+    if device_type in KINDLE_DEVICE_TYPES:
         install_command = (
             "curl -fsS "
             f"http://{public_host}:{settings_port}/install/kindle/{device_id}"
@@ -535,7 +586,7 @@ def create_device(registry, legacy_config_path, payload, headers, settings_port)
 
 
 def kindle_installer_script(device, config, server_host, image_port, settings_port):
-    if device.type != "kindle_pw1":
+    if device.type not in KINDLE_DEVICE_TYPES:
         raise ValueError("Kindle installer is available only for Kindle devices")
     device_id = device.id
     status_token = config.get("status_token", "")
@@ -1076,7 +1127,7 @@ def render_settings(
         links_html = '<div class="device-links">' + "".join(links) + '</div>'
         
         regenerate_installer_html = ""
-        if listed_device["type"] == "kindle_pw1":
+        if listed_device["type"] in KINDLE_DEVICE_TYPES:
             regenerate_installer_html = (
                 f'<div style="margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 12px;">'
                 f'<button type="button" class="btn-regenerate-installer" data-device-id="{html.escape(listed_device["id"])}" '
@@ -1092,7 +1143,7 @@ def render_settings(
             )
 
         installer_command_html = ""
-        if listed_device["type"] == "kindle_pw1" and listed_device.get("pairing_token"):
+        if listed_device["type"] in KINDLE_DEVICE_TYPES and listed_device.get("pairing_token"):
             p_token = listed_device["pairing_token"]
             install_cmd = (
                 "curl -fsS "
@@ -4698,7 +4749,7 @@ def make_handler(
             try:
                 selected = registry.get(device_id, require_enabled=True)
                 payload = device_status.status_summary(selected)
-                if selected.type == "kindle_pw1":
+                if selected.type in KINDLE_DEVICE_TYPES:
                     try:
                         live = device.get_status(
                             connection=selected.connection,
@@ -4774,7 +4825,7 @@ def make_handler(
             except DeviceNotFoundError:
                 self.send_bytes(404, b"", "text/plain")
                 return
-            if selected.type != "kindle_pw1":
+            if selected.type not in KINDLE_DEVICE_TYPES:
                 self.send_json(400, {"ok": False, "error": "not a Kindle device"})
                 return
 
@@ -4853,7 +4904,7 @@ def make_handler(
             if not expected or not hmac.compare_digest(str(supplied or ""), expected):
                 self.send_json(403, {"ok": False, "error": "invalid pairing token"})
                 return
-            if selected.type != "kindle_pw1":
+            if selected.type not in KINDLE_DEVICE_TYPES:
                 self.send_json(400, {"ok": False, "error": "not a Kindle device"})
                 return
 
@@ -5154,7 +5205,7 @@ def make_handler(
                 pushed_devices = []
                 errors = []
                 for selected in registry.load():
-                    if selected.enabled and selected.type == "kindle_pw1":
+                    if selected.enabled and selected.type in KINDLE_DEVICE_TYPES:
                         try:
                             push_rendered_device_to_kindle(
                                 selected,
@@ -5190,7 +5241,7 @@ def make_handler(
                 device_id = "default-kindle"
             try:
                 selected = registry.get(device_id)
-                if selected.type != "kindle_pw1":
+                if selected.type not in KINDLE_DEVICE_TYPES:
                     self.send_json(
                         400,
                         {"ok": False, "error": "unsupported device type"},
@@ -5264,7 +5315,7 @@ def make_handler(
                         )
                         return
 
-                if selected.type != "kindle_pw1":
+                if selected.type not in KINDLE_DEVICE_TYPES:
                     self.send_json(
                         400,
                         {"ok": False, "error": "unsupported device type"},

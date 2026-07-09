@@ -1390,15 +1390,18 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(self.mock_run.call_count, 2)
         scp_args = self.mock_run.call_args_list[0].args[0]
         ssh_args = self.mock_run.call_args_list[1].args[0]
-        self.assertEqual(scp_args[:3], ["scp", "-i", "/home/user/.ssh/kindle_ed25519"])
+        self.assertEqual(scp_args[:3], ["scp", "-i", "/home/user/.ssh/kindle_dashboard_ed25519"])
+        self.assertIn("-o", scp_args)
+        self.assertIn("IdentitiesOnly=yes", scp_args)
         self.assertEqual(
             scp_args[-1],
             "root@192.168.68.150:/mnt/us/dashboard/image.png",
         )
-        self.assertEqual(ssh_args[:3], ["ssh", "-i", "/home/user/.ssh/kindle_ed25519"])
+        self.assertEqual(ssh_args[:3], ["ssh", "-i", "/home/user/.ssh/kindle_dashboard_ed25519"])
         self.assertEqual(ssh_args[-2], "root@192.168.68.150")
         self.assertIn("/usr/sbin/eips -c", ssh_args[-1])
         self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", ssh_args[-1])
+        self.assertNotIn("apply-screensaver-overlay.sh", ssh_args[-1])
 
     @mock.patch("settings_server.render_device")
     def test_refresh_now_endpoint_uses_selected_device_push_path(self, mock_render_device):
@@ -2955,11 +2958,139 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.mock_device.push.assert_not_called()
         self.assertEqual(mock_run.call_count, 2)
         self.assertEqual(mock_run.call_args_list[0].args[0][0], "scp")
-        self.assertIn("/home/user/.ssh/kindle_ed25519", mock_run.call_args_list[0].args[0])
+        self.assertIn("/home/user/.ssh/kindle_dashboard_ed25519", mock_run.call_args_list[0].args[0])
         self.assertIn("root@192.168.68.119:/mnt/us/dashboard/image.png", mock_run.call_args_list[0].args[0])
         self.assertEqual(mock_run.call_args_list[1].args[0][0], "ssh")
         self.assertIn("root@192.168.68.119", mock_run.call_args_list[1].args[0])
         self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", mock_run.call_args_list[1].args[0][-1])
+        self.assertNotIn("apply-screensaver-overlay.sh", mock_run.call_args_list[1].args[0][-1])
+
+    @mock.patch("settings_server.subprocess.run")
+    @mock.patch("settings_server.render_device")
+    def test_push_kitchen_kindle_reapplies_overlay_when_configured(self, mock_render_device, mock_run):
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+            "use_screensaver_overlay": True,
+        })
+
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            "/api/device/kitchen-kindle/push",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(status, 200)
+        ssh_args = mock_run.call_args_list[1].args[0]
+        self.assertIn("root@192.168.68.122", ssh_args)
+        self.assertIn(
+            "if [ ! -x /mnt/us/dashboard/apply-screensaver-overlay.sh ]; then",
+            ssh_args[-1],
+        )
+        self.assertIn(
+            "missing required screensaver overlay script",
+            ssh_args[-1],
+        )
+        self.assertIn("/mnt/us/dashboard/apply-screensaver-overlay.sh && sync", ssh_args[-1])
+
+    @mock.patch("settings_server.subprocess.run")
+    @mock.patch("settings_server.render_device")
+    def test_push_kindle_131_uses_profile_key_and_reapplies_overlay(self, mock_render_device, mock_run):
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
+        self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+            "connection": {
+                "host": "192.168.68.131",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+            "use_screensaver_overlay": True,
+        })
+
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            "/api/device/kindle-131/push",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(status, 200)
+        mock_render_device.assert_called_once_with(
+            "kindle-131",
+            force=True,
+            registry=self.registry,
+        )
+        scp_args = mock_run.call_args_list[0].args[0]
+        ssh_args = mock_run.call_args_list[1].args[0]
+        self.assertEqual(scp_args[:3], ["scp", "-i", "/home/user/.ssh/kindle_dashboard_ed25519"])
+        self.assertIn("UserKnownHostsFile=/home/user/.ssh/kindle_dashboard_known_hosts", scp_args)
+        self.assertIn("root@192.168.68.131:/mnt/us/dashboard/image.png", scp_args)
+        self.assertEqual(ssh_args[:3], ["ssh", "-i", "/home/user/.ssh/kindle_dashboard_ed25519"])
+        self.assertIn("root@192.168.68.131", ssh_args)
+        self.assertIn("/mnt/us/dashboard/apply-screensaver-overlay.sh && sync", ssh_args[-1])
+        self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", ssh_args[-1])
+
+    @mock.patch("settings_server.subprocess.run")
+    @mock.patch("settings_server.render_device")
+    def test_push_overlay_missing_returns_useful_error(self, mock_render_device, mock_run):
+        copy_result = mock.Mock(returncode=0, stdout="", stderr="")
+        overlay_result = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="missing required screensaver overlay script: /mnt/us/dashboard/apply-screensaver-overlay.sh\n",
+        )
+        mock_run.side_effect = [copy_result, overlay_result]
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+            "use_screensaver_overlay": True,
+        })
+
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            "/api/device/kitchen-kindle/push",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(status, 503)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("missing required screensaver overlay script", payload["error"])
 
 
 if __name__ == "__main__":

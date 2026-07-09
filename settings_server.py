@@ -5215,18 +5215,44 @@ def make_handler(
                         except Exception as exc:
                             errors.append(f"{selected.name}: {exc}")
                 if errors:
-                    self.send_json(
-                        500,
-                        {
-                            "ok": False,
-                            "error": f"Failed pushing to some devices: {', '.join(errors)}",
-                        },
-                    )
+                    if pushed_devices:
+                        self.send_json(
+                            200,
+                            {
+                                "ok": True,
+                                "partial": True,
+                                "pushed": pushed_devices,
+                                "errors": errors,
+                                "message": (
+                                    "Pushed to "
+                                    f"{', '.join(pushed_devices)}. "
+                                    "Some devices failed: "
+                                    f"{', '.join(errors)}"
+                                ),
+                            },
+                        )
+                    else:
+                        self.send_json(
+                            503,
+                            {
+                                "ok": False,
+                                "partial": False,
+                                "pushed": [],
+                                "errors": errors,
+                                "error": (
+                                    "Failed pushing to all enabled Kindles: "
+                                    f"{', '.join(errors)}"
+                                ),
+                            },
+                        )
                 else:
                     self.send_json(
                         200,
                         {
                             "ok": True,
+                            "partial": False,
+                            "pushed": pushed_devices,
+                            "errors": [],
                             "message": f"Successfully pushed to all enabled Kindles: {', '.join(pushed_devices)}",
                         },
                     )

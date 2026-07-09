@@ -2965,6 +2965,106 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", mock_run.call_args_list[1].args[0][-1])
         self.assertNotIn("apply-screensaver-overlay.sh", mock_run.call_args_list[1].args[0][-1])
 
+    def test_special_events_push_button_uses_relative_push_all_api(self):
+        status, body = self.request("/settings")
+        text = body.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        self.assertIn('id="btn-push-all-special"', text)
+        self.assertIn('deviceApi("/api/devices/push-all", { method: "POST" })', text)
+        self.assertNotIn(":8765/api/devices/push-all", text)
+
+    @mock.patch("settings_server.subprocess.run")
+    @mock.patch("settings_server.render_device")
+    def test_special_event_push_all_endpoint_pushes_all_enabled_kindles(self, mock_render_device, mock_run):
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+            "use_screensaver_overlay": True,
+        })
+
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            "/api/devices/push-all",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["pushed"], ["Default Kindle", "Kitchen Kindle"])
+        self.assertEqual(payload["errors"], [])
+        mock_render_device.assert_has_calls([
+            mock.call("default-kindle", force=True, registry=self.registry),
+            mock.call("kitchen-kindle", force=True, registry=self.registry),
+        ])
+        kitchen_ssh_args = mock_run.call_args_list[3].args[0]
+        self.assertIn("/mnt/us/dashboard/apply-screensaver-overlay.sh && sync", kitchen_ssh_args[-1])
+
+    @mock.patch("settings_server.subprocess.run")
+    @mock.patch("settings_server.render_device")
+    def test_special_event_push_all_returns_partial_success(self, mock_render_device, mock_run):
+        success = mock.Mock(returncode=0, stdout="", stderr="")
+        failure = mock.Mock(
+            returncode=255,
+            stdout="",
+            stderr="ssh: connect to host 192.168.68.122 port 22: No route to host\n",
+        )
+        mock_run.side_effect = [
+            success,
+            success,
+            success,
+            failure,
+        ]
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+            "use_screensaver_overlay": True,
+        })
+
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            "/api/devices/push-all",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["pushed"], ["Default Kindle"])
+        self.assertEqual(len(payload["errors"]), 1)
+        self.assertIn("Kitchen Kindle", payload["errors"][0])
+        self.assertIn("No route to host", payload["errors"][0])
+
     @mock.patch("settings_server.subprocess.run")
     @mock.patch("settings_server.render_device")
     def test_push_kitchen_kindle_reapplies_overlay_when_configured(self, mock_render_device, mock_run):

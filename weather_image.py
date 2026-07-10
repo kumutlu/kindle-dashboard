@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from dashboard_themes import effective_visibility, validate_theme
 from device_registry import (
@@ -21,6 +21,7 @@ from device_registry import (
     DeviceRegistry,
     RegistryValidationError,
 )
+import special_events
 
 W, H = 758, 1024
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -1568,7 +1569,10 @@ def save_dashboard(img, data):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = Path(f"{output_path}.tmp")
     try:
-        img.save(temporary_output, format="PNG")
+        save_kwargs = {"format": "PNG", "optimize": False}
+        if img.size == (600, 800):
+            save_kwargs["compress_level"] = 0
+        img.save(temporary_output, **save_kwargs)
         os.replace(temporary_output, output_path)
     finally:
         temporary_output.unlink(missing_ok=True)
@@ -2766,15 +2770,52 @@ def render_dashboard(
 ):
     resolution = tuple(resolution or (W, H))
     if resolution == (600, 800):
-        if config["theme"] != "minimal_weather":
+        output_path = Path(output_path)
+        if config["theme"] == "minimal_weather":
+            token = ACTIVE_OUTPUT.set(output_path)
+            try:
+                render_minimal_weather_600x800(config)
+            finally:
+                ACTIVE_OUTPUT.reset(token)
+        elif config["theme"] == "family_dashboard":
+            renderer = THEME_RENDERERS.get(config["theme"])
+            if renderer is None:
+                raise ValueError("theme renderer is not available")
+            temp_legacy_output = output_path.with_suffix(".758x1024.tmp.png")
+            token = ACTIVE_OUTPUT.set(temp_legacy_output)
+            try:
+                renderer(config)
+            finally:
+                ACTIVE_OUTPUT.reset(token)
+            with Image.open(temp_legacy_output) as generated:
+                resized = ImageOps.fit(
+                    generated.convert("L"),
+                    resolution,
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5),
+                )
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{output_path.name}.",
+                    suffix=".tmp",
+                    dir=output_path.parent,
+                )
+                os.close(descriptor)
+                temporary_output = Path(temporary_name)
+                try:
+                    resized.save(
+                        temporary_output,
+                        format="PNG",
+                        optimize=False,
+                        compress_level=0,
+                    )
+                    os.replace(temporary_output, output_path)
+                finally:
+                    temporary_output.unlink(missing_ok=True)
+            temp_legacy_output.unlink(missing_ok=True)
+        else:
             raise ValueError(
-                "600x800 devices currently support only minimal_weather"
+                "600x800 devices currently support minimal_weather and family_dashboard"
             )
-        token = ACTIVE_OUTPUT.set(Path(output_path))
-        try:
-            render_minimal_weather_600x800(config)
-        finally:
-            ACTIVE_OUTPUT.reset(token)
         with Image.open(output_path) as generated:
             if generated.size != resolution:
                 raise ValueError(
@@ -2833,15 +2874,39 @@ def render_device(device_id, force=False, registry=None):
     config["device_id"] = device.id
     lock_path = device.image_path.with_name(".render.lock")
     state_path = device.image_path.with_name("render_state.json")
+    valid_device_ids = [record.id for record in registry.load()]
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        output_path = render_dashboard(
-            config,
-            device.image_path,
-            resolution=resolution,
-            state_file=state_path,
+        active_event = special_events.active_event_for_device(
+            registry.project_root,
+            device,
+            config["timezone"],
+            valid_device_ids,
         )
+        if active_event is not None:
+            special_events.render_event_image(
+                special_events.event_image_absolute(registry.project_root, active_event),
+                device.image_path,
+                resolution,
+                kt4_safe=(resolution == (600, 800)),
+            )
+            output_path = Path(device.image_path)
+            _write_render_state(
+                {
+                    **config,
+                    "theme": "special_event",
+                    "special_event_id": active_event.id,
+                },
+                state_path,
+            )
+        else:
+            output_path = render_dashboard(
+                config,
+                device.image_path,
+                resolution=resolution,
+                state_file=state_path,
+            )
         if device.id == "default-kindle":
             _atomic_copy(
                 output_path,

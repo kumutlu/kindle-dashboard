@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import html
 import http.client
 import json
@@ -11,8 +12,22 @@ from unittest import mock
 from urllib.parse import urlencode
 
 import settings_server
+import special_events
 import weather_image
 from device_registry import DeviceRegistry
+
+
+TEST_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    + base64.b64encode(
+        (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x00\x00\x00\x00"
+            b"\x3a\x7e\x9b\x55\x00\x00\x00\x0bIDATx\x9cc`\x00\x02\x00\x00\x05\x00\x01"
+            b"\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+    ).decode("ascii")
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -291,6 +306,17 @@ class SettingsServerTests(unittest.TestCase):
         )
         self.assertIsNotNone(match)
         return match.group(1).decode("ascii")
+
+    def post_json(self, path, payload, headers=None):
+        req_headers = {"Content-Type": "application/json"}
+        if headers:
+            req_headers.update(headers)
+        return self.request(
+            "POST",
+            path,
+            body=json.dumps(payload),
+            headers=req_headers,
+        )
 
     def test_binding_allows_remote_access(self):
         self.assertEqual(settings_server.BIND_HOST, "0.0.0.0")
@@ -1461,6 +1487,52 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("unsupported device type", json.loads(body.decode("utf-8"))["error"])
 
+    def test_kindle_kt4_light_get_set_and_saved_default(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+            "connection": {
+                "host": "192.168.68.131",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+        })
+        kt4_config = dict(weather_image.DEFAULT_CONFIG)
+        kt4_config.update({
+            "theme": "minimal_weather",
+            "kindle_frontlight": 4,
+        })
+        settings_server.atomic_write_config(kt4.config_path, kt4_config)
+
+        status, _, body = self.request("GET", "/api/device/kindle-131/light")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertTrue(payload["connected"])
+        self.assertEqual(payload["brightness"], 8)
+        self.assertIn(("get_light", "kindle-131"), self.device_calls)
+
+        token = self.csrf_token()
+        status, _, body = self.request(
+            "POST",
+            "/api/device/kindle-131/light",
+            body=json.dumps({"level": 12}),
+            headers={"X-CSRF-Token": token, "Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["brightness"], 12)
+        self.assertIn(("set_light", 12, "kindle-131"), self.device_calls)
+
+        saved = json.loads(kt4.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["kindle_frontlight"], 12)
+
     def test_device_qualified_get_status(self):
         kitchen = self.registry.add({
             "id": "kitchen-kindle",
@@ -2243,6 +2315,55 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         )
         self.assertEqual(default_after, default_before)
 
+    def test_kindle_kt4_can_switch_between_supported_themes(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+            "connection": {
+                "host": "192.168.68.131",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            },
+        })
+        kt4_config = dict(weather_image.DEFAULT_CONFIG)
+        kt4_config["theme"] = "minimal_weather"
+        settings_server.atomic_write_config(kt4.config_path, kt4_config)
+        csrf = self.csrf_token()
+
+        base_form = {
+            "csrf_token": csrf,
+            "selected_device_id": "kindle-131",
+            "title": "KINDLE 131",
+            "location": "Nottingham",
+            "country": "United Kingdom",
+            "latitude": "52.9536",
+            "longitude": "-1.1505",
+            "location_display": "Nottingham, England, United Kingdom",
+            "location_label": "Nottingham, UK",
+            "weather_query": "Nottingham",
+            "timezone": "Europe/London",
+            "show_weather": "on",
+            "show_forecast": "on",
+            "refresh_interval_minutes": "60",
+        }
+
+        form = dict(base_form, theme="family_dashboard")
+        status, _, _ = self.post_form("/settings", form)
+        self.assertEqual(status, 303)
+        saved = json.loads(kt4.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "family_dashboard")
+
+        form = dict(base_form, theme="minimal_weather")
+        status, _, _ = self.post_form("/settings", form)
+        self.assertEqual(status, 303)
+        saved = json.loads(kt4.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["theme"], "minimal_weather")
+
     def test_devices_api_includes_status_summary_without_token(self):
         self.post_json(
             "/api/device/default-kindle/status",
@@ -2965,14 +3086,215 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("/usr/sbin/eips -g /mnt/us/dashboard/image.png", mock_run.call_args_list[1].args[0][-1])
         self.assertNotIn("apply-screensaver-overlay.sh", mock_run.call_args_list[1].args[0][-1])
 
-    def test_special_events_push_button_uses_relative_push_all_api(self):
+    def test_special_events_push_button_uses_relative_special_event_api(self):
         status, body = self.request("/settings")
         text = body.decode("utf-8")
 
         self.assertEqual(status, 200)
         self.assertIn('id="btn-push-all-special"', text)
-        self.assertIn('deviceApi("/api/devices/push-all", { method: "POST" })', text)
-        self.assertNotIn(":8765/api/devices/push-all", text)
+        self.assertIn('/api/special-events/${encodeURIComponent(selectedSpecialEventId)}/push-all', text)
+        self.assertNotIn(":8765/api/special-events", text)
+
+    def test_special_event_crud_round_trip(self):
+        csrf = self.csrf_token()
+        status, _, body = self.post_json(
+            "/api/special-events",
+            {
+                "title": "Happy Test Day",
+                "start_date": "2026-07-10",
+                "end_date": "2026-07-12",
+                "image_data": TEST_PNG_DATA_URL,
+                "devices": ["default-kindle"],
+                "enabled": True,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200, body)
+        self.assertTrue(payload["ok"])
+        event_id = payload["event"]["id"]
+        self.assertEqual(payload["event"]["devices"], ["default-kindle"])
+        self.assertTrue((self.registry.project_root / payload["event"]["image_path"]).exists())
+
+        status, body = self.request("/api/special-events")
+        listed = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listed["events"]), 1)
+        self.assertEqual(listed["events"][0]["id"], event_id)
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        connection.request(
+            "PUT",
+            f"/api/special-events/{event_id}",
+            body=json.dumps({
+                "title": "Updated Test Day",
+                "start_date": "2026-07-11",
+                "end_date": "2026-07-13",
+                "devices": ["default-kindle"],
+                "enabled": False,
+            }),
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": csrf,
+            },
+        )
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        connection.close()
+        updated = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(updated["event"]["title"], "Updated Test Day")
+        self.assertFalse(updated["event"]["enabled"])
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        connection.request(
+            "DELETE",
+            f"/api/special-events/{event_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        connection.close()
+        self.assertEqual(status, 200, body)
+        status, body = self.request("/api/special-events")
+        listed = json.loads(body.decode("utf-8"))
+        self.assertEqual(listed["events"], [])
+
+    @mock.patch("settings_server.push_image_to_kindle")
+    @mock.patch("settings_server.render_special_event_for_device")
+    def test_special_event_push_uses_selected_event_image(self, mock_render_special, mock_push):
+        csrf = self.csrf_token()
+        created = special_events.create_event(
+            self.registry.project_root,
+            {
+                "title": "Event Push",
+                "start_date": "2026-07-10",
+                "end_date": "2026-07-10",
+                "image_data": TEST_PNG_DATA_URL,
+                "devices": ["default-kindle"],
+                "enabled": True,
+            },
+            ["default-kindle"],
+        )
+        special_events.save_events(self.registry.project_root, [created])
+        mock_render_special.return_value = self.registry.project_root / "cache" / "special.png"
+
+        status, _, body = self.post_json(
+            f"/api/special-events/{created.id}/push",
+            {"device_id": "default-kindle"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200, body)
+        self.assertTrue(payload["ok"])
+        mock_render_special.assert_called_once()
+        pushed_device = mock_push.call_args.args[0]
+        self.assertEqual(pushed_device.id, "default-kindle")
+        self.assertEqual(mock_push.call_args.args[1], self.registry.project_root / "cache" / "special.png")
+
+    @mock.patch("settings_server.push_image_to_kindle")
+    @mock.patch("settings_server.render_special_event_for_device")
+    def test_special_event_push_all_respects_target_devices_and_partial_failures(self, mock_render_special, mock_push):
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+        })
+        created = special_events.create_event(
+            self.registry.project_root,
+            {
+                "title": "Targeted Push",
+                "start_date": "2026-07-10",
+                "end_date": "2026-07-10",
+                "image_data": TEST_PNG_DATA_URL,
+                "devices": ["default-kindle", "kitchen-kindle"],
+                "enabled": True,
+            },
+            ["default-kindle", "kitchen-kindle"],
+        )
+        special_events.save_events(self.registry.project_root, [created])
+        mock_render_special.side_effect = [
+            self.registry.project_root / "cache" / "default.png",
+            self.registry.project_root / "cache" / "kitchen.png",
+        ]
+        mock_push.side_effect = [None, RuntimeError("No route to host")]
+        csrf = self.csrf_token()
+
+        status, _, body = self.post_json(
+            f"/api/special-events/{created.id}/push-all",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200, body)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["pushed"], ["Default Kindle"])
+        self.assertEqual(len(payload["errors"]), 1)
+        self.assertIn("Kitchen Kindle", payload["errors"][0])
+
+    @mock.patch("settings_server.push_image_to_kindle")
+    @mock.patch("settings_server.render_special_event_for_device")
+    def test_special_event_push_all_complete_failure(self, mock_render_special, mock_push):
+        self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+            "connection": {
+                "host": "192.168.68.122",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+        })
+        created = special_events.create_event(
+            self.registry.project_root,
+            {
+                "title": "Targeted Push",
+                "start_date": "2026-07-10",
+                "end_date": "2026-07-10",
+                "image_data": TEST_PNG_DATA_URL,
+                "devices": ["default-kindle", "kitchen-kindle"],
+                "enabled": True,
+            },
+            ["default-kindle", "kitchen-kindle"],
+        )
+        special_events.save_events(self.registry.project_root, [created])
+        mock_render_special.side_effect = [
+            self.registry.project_root / "cache" / "default.png",
+            self.registry.project_root / "cache" / "kitchen.png",
+        ]
+        mock_push.side_effect = [RuntimeError("offline"), RuntimeError("No route to host")]
+        csrf = self.csrf_token()
+
+        status, _, body = self.post_json(
+            f"/api/special-events/{created.id}/push-all",
+            {},
+            headers={"X-CSRF-Token": csrf},
+        )
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 503, body)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["pushed"], [])
+        self.assertEqual(len(payload["errors"]), 2)
+        self.assertIn("Default Kindle", payload["error"])
 
     @mock.patch("settings_server.subprocess.run")
     @mock.patch("settings_server.render_device")

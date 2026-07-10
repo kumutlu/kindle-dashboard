@@ -4,6 +4,8 @@
 import subprocess
 from pathlib import Path
 
+from device_registry import KINDLE_DEVICE_TYPES
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
@@ -237,7 +239,7 @@ class KindleDevice:
         return self._run(ssh_base + [command], timeout)
 
     def run_action(self, action, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         definition = ACTION_COMMANDS.get(action)
         if definition is None:
@@ -254,7 +256,7 @@ class KindleDevice:
         return message
 
     def push(self, connection=None, device_id="default-kindle", device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -273,7 +275,7 @@ class KindleDevice:
         return "Dashboard generated and pushed"
 
     def set_light(self, level, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         if isinstance(level, bool) or not isinstance(level, int):
             raise ValueError("brightness must be an integer")
@@ -289,7 +291,7 @@ class KindleDevice:
         return self.get_light(connection=conn, device_id=device_id, device_type=device_type)
 
     def get_light(self, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -304,7 +306,7 @@ class KindleDevice:
         return values[-1]
 
     def get_battery_status(self, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -343,7 +345,7 @@ class KindleDevice:
         }
 
     def get_status(self, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -365,7 +367,7 @@ class KindleDevice:
         }
 
     def get_log(self, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -373,7 +375,7 @@ class KindleDevice:
         return output.replace("\x00", "")[-32768:]
 
     def restart(self, confirmation, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         if confirmation != "RESTART":
             raise ValueError("restart confirmation is required")

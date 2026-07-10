@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
 import device_status
+import special_events
 from dashboard_themes import THEMES
 from device_registry import (
     DeviceNotFoundError,
@@ -37,6 +38,7 @@ CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
 KINDLE_REMOTE_IMAGE_PATH = "/mnt/us/dashboard/image.png"
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
 DEVICE_CONFIG_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/config$"
 )
@@ -75,6 +77,15 @@ DEVICE_PROFILES = {
     },
 }
 KINDLE_DEVICE_TYPES = {"kindle_pw1", "kindle_kt4"}
+SPECIAL_EVENT_RE = re.compile(
+    r"^/api/special-events/([a-z0-9][a-z0-9-]{0,63})$"
+)
+SPECIAL_EVENT_PUSH_RE = re.compile(
+    r"^/api/special-events/([a-z0-9][a-z0-9-]{0,63})/push$"
+)
+SPECIAL_EVENT_PUSH_ALL_RE = re.compile(
+    r"^/api/special-events/([a-z0-9][a-z0-9-]{0,63})/push-all$"
+)
 
 
 def _run_push_command(args, timeout, label):
@@ -167,6 +178,69 @@ def push_rendered_device_to_kindle(device, registry):
     ssh_args.extend([target, remote_command])
     _run_push_command(ssh_args, 20, "Kindle screen refresh")
     return "Dashboard generated and pushed"
+
+
+def push_image_to_kindle(device, image_path):
+    if device.type not in KINDLE_DEVICE_TYPES:
+        raise ValueError("unsupported device type")
+    connection = device.connection or {}
+    profile = _push_ssh_profile(connection)
+    host = connection.get("host")
+    user = connection.get("user", "root")
+    port = int(connection.get("port", 22) or 22)
+    if not host:
+        raise DeviceError("Push is not configured for this device")
+
+    remote = f"{user}@{host}:{KINDLE_REMOTE_IMAGE_PATH}"
+    target = f"{user}@{host}"
+    scp_args = ["scp"]
+    scp_args.extend(_push_common_ssh_options(profile))
+    if port != 22:
+        scp_args.extend(["-P", str(port)])
+    scp_args.extend([str(image_path), remote])
+    _run_push_command(scp_args, 30, "Kindle image copy")
+
+    remote_command = (
+        f"/usr/sbin/eips -c; /usr/sbin/eips -c; "
+        f"/usr/sbin/eips -g {KINDLE_REMOTE_IMAGE_PATH}"
+    )
+    if getattr(device, "use_screensaver_overlay", False):
+        remote_command = (
+            "if [ ! -x /mnt/us/dashboard/apply-screensaver-overlay.sh ]; then "
+            "echo \"missing required screensaver overlay script: "
+            "/mnt/us/dashboard/apply-screensaver-overlay.sh\" >&2; exit 127; "
+            "fi; /mnt/us/dashboard/apply-screensaver-overlay.sh && sync; "
+            + remote_command
+        )
+    ssh_args = ["ssh"]
+    ssh_args.extend(_push_common_ssh_options(profile))
+    if port != 22:
+        ssh_args.extend(["-p", str(port)])
+    ssh_args.extend([target, remote_command])
+    _run_push_command(ssh_args, 20, "Kindle screen refresh")
+    return "Dashboard generated and pushed"
+
+
+def render_special_event_for_device(event, device, project_root):
+    project_root = Path(project_root)
+    temporary_dir = project_root / "cache" / "special-events"
+    temporary_dir.mkdir(parents=True, exist_ok=True)
+    output_path = temporary_dir / f"{event.id}-{device.id}.png"
+    special_events.render_event_image(
+        special_events.event_image_absolute(project_root, event),
+        output_path,
+        tuple(device.resolution),
+        kt4_safe=(tuple(device.resolution) == (600, 800)),
+    )
+    return output_path
+
+
+def valid_special_event_device_ids(registry):
+    return [
+        device.id
+        for device in registry.load()
+        if device.type in KINDLE_DEVICE_TYPES
+    ]
 
 
 def public_device_config(device, config):
@@ -299,7 +373,6 @@ def save_daily_notes(data):
         temp_file.replace(DAILY_NOTES_PATH)
     except Exception as e:
         print(f"Error: Failed to save daily_notes.json: {e}")
-MAX_REQUEST_BYTES = 16 * 1024
 
 CITY_DATA = [
     ("Nottingham", "United Kingdom", "Nottingham, UK", "Europe/London",
@@ -2702,7 +2775,7 @@ button:disabled {{
             <div class="celebration-schedule" style="font-size:0.8rem; color:var(--muted); margin-bottom:12px;">01 Jan 2026 · <span class="badge badge-success-sm" style="font-size:0.65rem; padding:1px 4px;">Scheduled</span></div>
           </div>
           <p class="section-note" style="margin: 12px 0 14px; font-size: 0.82rem;">Schedule and display custom images for special occasions.</p>
-          <button type="button" class="btn btn-block btn-outline" id="btn-push-all-special">Push to all Kindles</button>
+          <button type="button" class="btn btn-block btn-outline" id="btn-push-all-special">Push to all target Kindles</button>
         </div>
       </div>
     </div>
@@ -3036,9 +3109,15 @@ button:disabled {{
       </label>
       
       <label class="field">
-        <span>Trigger Date</span>
+        <span>Start Date</span>
         <input type="date" id="event-date" style="width:100%; min-height:46px; padding:10px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); font-size:0.95rem;">
-        <span style="display:block; font-size:0.75rem; color:var(--muted); margin-top:4px;">The celebration image will automatically display on all active e-ink dashboards on this day.</span>
+        <span style="display:block; font-size:0.75rem; color:var(--muted); margin-top:4px;">The celebration image will automatically display from this date onward.</span>
+      </label>
+
+      <label class="field">
+        <span>End Date</span>
+        <input type="date" id="event-end-date" style="width:100%; min-height:46px; padding:10px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); font-size:0.95rem;">
+        <span style="display:block; font-size:0.75rem; color:var(--muted); margin-top:4px;">Optional. Leave empty to use the same day as the start date.</span>
       </label>
       
       <label class="field">
@@ -3055,6 +3134,14 @@ button:disabled {{
       <div class="button-grid" style="margin-top:24px;">
         <button type="button" id="btn-save-event" style="background:var(--ink); color:var(--card); border-color:var(--ink);">Save Event</button>
         <button type="button" id="btn-cancel-event">Clear</button>
+      </div>
+
+      <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-top: 18px; background: var(--soft);">
+        <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Target devices</span>
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; font-size:0.9rem;">
+          <input type="checkbox" id="event-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> All Kindle devices
+        </label>
+        <div id="event-individual-devices" style="display:none; grid-gap:8px; padding-left:20px; border-left:2px solid var(--line); margin-top:10px;"></div>
       </div>
     </div>
     
@@ -3793,6 +3880,7 @@ async function initNoteFormDevices() {{
     const data = await response.json();
     allDevicesList = data.devices || [];
     renderNoteDeviceCheckboxes();
+    renderEventDeviceCheckboxes();
   }} catch (e) {{
     console.error("Failed to load device list for note form:", e);
   }}
@@ -4279,12 +4367,15 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
 // Special Events Logic
 const eventTitle = document.getElementById("event-title");
 const eventDate = document.getElementById("event-date");
+const eventEndDate = document.getElementById("event-end-date");
 const eventImageInput = document.getElementById("tab-event-image-input");
 const btnTabChooseImage = document.getElementById("btn-tab-choose-image");
 const tabUploadBox = document.getElementById("tab-celebration-upload-box");
 const btnSaveEvent = document.getElementById("btn-save-event");
 const btnCancelEvent = document.getElementById("btn-cancel-event");
 const scheduledEventsList = document.getElementById("scheduled-events-list");
+const eventDeviceAllCb = document.getElementById("event-device-all");
+const eventIndividualDevicesBox = document.getElementById("event-individual-devices");
 
 // Main preview elements
 const celebrationImageInput = document.getElementById("celebration-image-input");
@@ -4296,6 +4387,8 @@ const btnRemoveCelebration = document.getElementById("btn-remove-celebration");
 const celebrationMetaInfo = document.getElementById("celebration-meta-info");
 
 let uploadedImageBase64 = "";
+let specialEventsState = [];
+let selectedSpecialEventId = null;
 
 function handleImageSelect(file) {{
   if (!file) return;
@@ -4341,32 +4434,108 @@ if (btnTabChooseImage && eventImageInput) {{
   }});
 }});
 
-// Special Events localStorage Persistence
-const SPECIAL_EVENTS_KEY = "kindle_dashboard_special_events";
-function loadSpecialEvents() {{
-  const raw = localStorage.getItem(SPECIAL_EVENTS_KEY);
-  return raw ? JSON.parse(raw) : [];
+function renderEventDeviceCheckboxes() {{
+  if (!eventIndividualDevicesBox) return;
+  eventIndividualDevicesBox.innerHTML = "";
+  const kindleDevices = allDevicesList.filter(dev => dev.type === "kindle_pw1" || dev.type === "kindle_kt4");
+  kindleDevices.forEach(dev => {{
+    const lbl = document.createElement("label");
+    lbl.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.85rem; font-weight:600;";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.name = "event_device";
+    cb.value = dev.id;
+    cb.style.cssText = "width:18px; height:18px; accent-color: var(--ink); margin:0;";
+    lbl.append(cb);
+    lbl.append(document.createTextNode(" " + dev.name + " (" + dev.id + ")"));
+    eventIndividualDevicesBox.append(lbl);
+  }});
 }}
-function saveSpecialEvents(events) {{
-  localStorage.setItem(SPECIAL_EVENTS_KEY, JSON.stringify(events));
+
+if (eventDeviceAllCb) {{
+  eventDeviceAllCb.addEventListener("change", () => {{
+    if (eventDeviceAllCb.checked) {{
+      eventIndividualDevicesBox.style.display = "none";
+      document.querySelectorAll('input[name="event_device"]').forEach(cb => cb.checked = false);
+    }} else {{
+      eventIndividualDevicesBox.style.display = "grid";
+    }}
+  }});
+}}
+
+function getSelectedEventDevices() {{
+  if (eventDeviceAllCb && eventDeviceAllCb.checked) return null;
+  const devices = [];
+  document.querySelectorAll('input[name="event_device"]:checked').forEach(cb => devices.push(cb.value));
+  return devices.length ? devices : null;
+}}
+
+function resetSpecialEventForm() {{
+  eventTitle.value = "";
+  eventDate.value = "";
+  if (eventEndDate) eventEndDate.value = "";
+  uploadedImageBase64 = "";
+  if (eventDeviceAllCb) {{
+    eventDeviceAllCb.checked = true;
+    eventIndividualDevicesBox.style.display = "none";
+  }}
+  document.querySelectorAll('input[name="event_device"]').forEach(cb => cb.checked = false);
+  if (celebrationPreviewBox) celebrationPreviewBox.style.display = "none";
+  if (celebrationUploadBox) celebrationUploadBox.style.display = "block";
+  if (celebrationMetaInfo) celebrationMetaInfo.style.display = "none";
+}}
+
+async function fetchSpecialEvents() {{
+  const result = await deviceApi("/api/special-events", {{ method: "GET" }});
+  specialEventsState = result.events || [];
+  if (!selectedSpecialEventId && specialEventsState.length) {{
+    selectedSpecialEventId = specialEventsState[0].id;
+  }}
+  if (selectedSpecialEventId && !specialEventsState.find(evt => evt.id === selectedSpecialEventId)) {{
+    selectedSpecialEventId = specialEventsState.length ? specialEventsState[0].id : null;
+  }}
   renderSpecialEvents();
 }}
 
+function syncSelectedEventPreview() {{
+  const evt = specialEventsState.find(item => item.id === selectedSpecialEventId);
+  if (!evt) {{
+    if (celebrationMetaInfo) celebrationMetaInfo.style.display = "none";
+    if (celebrationPreviewBox) celebrationPreviewBox.style.display = "none";
+    if (celebrationUploadBox) celebrationUploadBox.style.display = "block";
+    return;
+  }}
+  if (celebrationPreviewImg) celebrationPreviewImg.src = "/" + evt.image_path;
+  if (celebrationPreviewBox) celebrationPreviewBox.style.display = "block";
+  if (celebrationUploadBox) celebrationUploadBox.style.display = "none";
+  if (celebrationMetaInfo) {{
+    celebrationMetaInfo.style.display = "block";
+    document.getElementById("celebration-title-display").textContent = evt.title;
+  }}
+}}
+
 function renderSpecialEvents() {{
-  const events = loadSpecialEvents();
+  const events = specialEventsState;
   if (scheduledEventsList) {{
     scheduledEventsList.replaceChildren();
     if (events.length === 0) {{
       scheduledEventsList.innerHTML = `<div style="padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--soft); color:var(--muted); text-align:center; font-size:0.88rem;">No events scheduled yet.</div>`;
     }} else {{
-      events.forEach((evt, idx) => {{
+      events.forEach((evt) => {{
         const row = document.createElement("div");
-        row.style.cssText = "display:flex; gap:14px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--soft);";
+        row.style.cssText = "display:flex; gap:14px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--soft); cursor:pointer;";
+        if (evt.id === selectedSpecialEventId) {{
+          row.style.borderColor = "var(--ink)";
+        }}
+        row.addEventListener("click", () => {{
+          selectedSpecialEventId = evt.id;
+          renderSpecialEvents();
+        }});
         
         const thumb = document.createElement("div");
         thumb.style.cssText = "width:60px; height:80px; border-radius:6px; overflow:hidden; border:1px solid var(--line); flex-shrink:0;";
         const img = document.createElement("img");
-        img.src = evt.image || "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='80' viewBox='0 0 60 80'><rect width='100%25' height='100%25' fill='%23e2e8f0'/><circle cx='30' cy='40' r='12' fill='%23cbd5e1'/></svg>";
+        img.src = "/" + evt.image_path;
         img.style.cssText = "width:100%; height:100%; object-fit:cover;";
         thumb.append(img);
         
@@ -4378,7 +4547,7 @@ function renderSpecialEvents() {{
         title.style.fontSize = "0.95rem";
         
         const dateSpan = document.createElement("span");
-        dateSpan.textContent = evt.date;
+        dateSpan.textContent = evt.start_date === evt.end_date ? evt.start_date : `${{evt.start_date}} → ${{evt.end_date}}`;
         dateSpan.style.cssText = "font-size:0.8rem; color:var(--muted); margin-top:2px;";
         
         const actionRow = document.createElement("div");
@@ -4392,56 +4561,81 @@ function renderSpecialEvents() {{
         deleteBtn.type = "button";
         deleteBtn.style.cssText = "background:none; border:none; padding:0; color:var(--danger); font-size:0.75rem; font-weight:600; cursor:pointer;";
         deleteBtn.textContent = "Delete";
-        deleteBtn.addEventListener("click", () => {{
-          const list = loadSpecialEvents();
-          list.splice(idx, 1);
-          saveSpecialEvents(list);
+        deleteBtn.addEventListener("click", async (e) => {{
+          e.stopPropagation();
+          try {{
+            await deviceApi(`/api/special-events/${{encodeURIComponent(evt.id)}}`, {{ method: "DELETE" }});
+            if (selectedSpecialEventId === evt.id) selectedSpecialEventId = null;
+            await fetchSpecialEvents();
+          }} catch (error) {{
+            alert("Failed to delete special event: " + error.message);
+          }}
+        }});
+
+        const pushBtn = document.createElement("button");
+        pushBtn.type = "button";
+        pushBtn.style.cssText = "background:none; border:none; padding:0; color:var(--ink); font-size:0.75rem; font-weight:600; cursor:pointer;";
+        pushBtn.textContent = "Push to selected Kindle";
+        pushBtn.addEventListener("click", async (e) => {{
+          e.stopPropagation();
+          try {{
+            const selectedDevice = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
+            const result = await deviceApi(`/api/special-events/${{encodeURIComponent(evt.id)}}/push`, {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json" }},
+              body: JSON.stringify({{ device_id: selectedDevice }})
+            }});
+            alert(result.message || "Special event pushed");
+          }} catch (error) {{
+            alert("Failed to push special event: " + error.message);
+          }}
         }});
         
-        actionRow.append(badge, deleteBtn);
+        actionRow.append(badge, pushBtn, deleteBtn);
         body.append(title, dateSpan, actionRow);
         row.append(thumb, body);
         scheduledEventsList.append(row);
       }});
     }}
   }}
+  syncSelectedEventPreview();
 }}
 
 if (btnSaveEvent) {{
-  btnSaveEvent.addEventListener("click", () => {{
+  btnSaveEvent.addEventListener("click", async () => {{
     const title = eventTitle.value.trim();
     const date = eventDate.value;
+    const endDate = eventEndDate ? (eventEndDate.value || date) : date;
     if (!title || !date || !uploadedImageBase64) {{
-      alert("Please fill in the title, date, and choose an image!");
+      alert("Please fill in the title, start date, and choose an image!");
       return;
     }}
-    const list = loadSpecialEvents();
-    list.push({{
-      title,
-      date,
-      image: uploadedImageBase64
-    }});
-    saveSpecialEvents(list);
-    
-    // Reset form
-    eventTitle.value = "";
-    eventDate.value = "";
-    uploadedImageBase64 = "";
-    if (celebrationPreviewBox) celebrationPreviewBox.style.display = "none";
-    if (celebrationUploadBox) celebrationUploadBox.style.display = "block";
-    if (celebrationMetaInfo) celebrationMetaInfo.style.display = "none";
-    alert("Special event scheduled!");
+    try {{
+      const result = await deviceApi("/api/special-events", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          title: title,
+          start_date: date,
+          end_date: endDate,
+          image_data: uploadedImageBase64,
+          devices: getSelectedEventDevices(),
+          enabled: true
+        }})
+      }});
+      selectedSpecialEventId = result.event.id;
+      resetSpecialEventForm();
+      await fetchSpecialEvents();
+      alert("Special event scheduled!");
+    }} catch (error) {{
+      alert("Failed to save special event: " + error.message);
+    }}
   }});
 }}
 
 if (btnCancelEvent) {{
   btnCancelEvent.addEventListener("click", () => {{
-    eventTitle.value = "";
-    eventDate.value = "";
-    uploadedImageBase64 = "";
-    if (celebrationPreviewBox) celebrationPreviewBox.style.display = "none";
-    if (celebrationUploadBox) celebrationUploadBox.style.display = "block";
-    if (celebrationMetaInfo) celebrationMetaInfo.style.display = "none";
+    resetSpecialEventForm();
   }});
 }}
 
@@ -4455,14 +4649,23 @@ if (btnRemoveCelebration) {{
 }}
 
 // Push to all devices trigger
+const btnManageSpecialEvents = document.getElementById("btn-manage-special-events");
+if (btnManageSpecialEvents) {{
+  btnManageSpecialEvents.addEventListener("click", () => switchTab("special_events"));
+}}
+
 const btnPushAllSpecial = document.getElementById("btn-push-all-special");
 if (btnPushAllSpecial) {{
   btnPushAllSpecial.addEventListener("click", async () => {{
+    if (!selectedSpecialEventId) {{
+      alert("Select a scheduled special event first.");
+      return;
+    }}
     btnPushAllSpecial.disabled = true;
     const orig = btnPushAllSpecial.textContent;
     btnPushAllSpecial.textContent = "Pushing...";
     try {{
-      const result = await deviceApi("/api/devices/push-all", {{ method: "POST" }});
+      const result = await deviceApi(`/api/special-events/${{encodeURIComponent(selectedSpecialEventId)}}/push-all`, {{ method: "POST" }});
       alert(result.message || "Successfully pushed celebration image to all enabled Kindles!");
     }} catch (error) {{
       alert("Failed to push celebration: " + error.message);
@@ -4475,7 +4678,7 @@ if (btnPushAllSpecial) {{
 
 remindersPreviewReady = true;
 fetchReminders();
-renderSpecialEvents();
+fetchSpecialEvents();
 loadDeviceState();
 </script>
 </body>
@@ -4598,6 +4801,26 @@ def make_handler(
             if parsed.path == "/api/notes":
                 self.send_json(200, load_daily_notes())
                 return
+            if parsed.path == "/api/special-events":
+                try:
+                    events = special_events.load_events(
+                        registry.project_root,
+                        valid_special_event_device_ids(registry),
+                    )
+                except Exception as exc:
+                    self.send_json(500, {"ok": False, "error": str(exc)})
+                    return
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "events": [
+                            special_events.event_to_public_dict(event)
+                            for event in events
+                        ],
+                    },
+                )
+                return
             if parsed.path == "/api/geocode":
                 query = parse_qs(
                     parsed.query,
@@ -4689,6 +4912,9 @@ def make_handler(
             if parsed.path == "/api/devices/push-all":
                 self.handle_push_all()
                 return
+            if parsed.path == "/api/special-events":
+                self.handle_special_events_create()
+                return
             if parsed.path == "/settings":
                 self.handle_form_post()
                 return
@@ -4743,7 +4969,31 @@ def make_handler(
                     return
                 self.send_bytes(404, b"", "text/plain")
                 return
+            special_push_match = SPECIAL_EVENT_PUSH_RE.fullmatch(parsed.path)
+            if special_push_match is not None:
+                self.handle_special_event_push(special_push_match.group(1))
+                return
+            special_push_all_match = SPECIAL_EVENT_PUSH_ALL_RE.fullmatch(parsed.path)
+            if special_push_all_match is not None:
+                self.handle_special_event_push_all(special_push_all_match.group(1))
+                return
             self.send_bytes(404, b"", "text/plain")
+
+        def do_PUT(self):
+            parsed = urlsplit(self.path)
+            special_match = SPECIAL_EVENT_RE.fullmatch(parsed.path)
+            if special_match is None:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            self.handle_special_event_update(special_match.group(1))
+
+        def do_DELETE(self):
+            parsed = urlsplit(self.path)
+            special_match = SPECIAL_EVENT_RE.fullmatch(parsed.path)
+            if special_match is None:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            self.handle_special_event_delete(special_match.group(1))
 
         def handle_status_get(self, device_id):
             try:
@@ -5130,6 +5380,189 @@ def make_handler(
                 self.send_json(200, {"ok": True, "id": item_id})
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": str(e)})
+
+        def handle_special_events_create(self):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                candidate = self.read_json()
+                event = special_events.create_event(
+                    registry.project_root,
+                    candidate,
+                    valid_special_event_device_ids(registry),
+                )
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                events.append(event)
+                special_events.save_events(registry.project_root, events)
+                self.send_json(
+                    200,
+                    {"ok": True, "event": special_events.event_to_public_dict(event)},
+                )
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_update(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                candidate = self.read_json()
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                existing = special_events.find_event(events, event_id)
+                updated = special_events.update_event(
+                    existing,
+                    candidate,
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                new_events = [
+                    updated if item.id == event_id else item
+                    for item in events
+                ]
+                special_events.save_events(registry.project_root, new_events)
+                self.send_json(
+                    200,
+                    {"ok": True, "event": special_events.event_to_public_dict(updated)},
+                )
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_delete(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                existing = special_events.find_event(events, event_id)
+                remaining = [item for item in events if item.id != event_id]
+                special_events.save_events(registry.project_root, remaining)
+                special_events.delete_event_image(registry.project_root, existing.image_path)
+                self.send_json(200, {"ok": True})
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_push(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                event = special_events.find_event(events, event_id)
+                selected = registry.get(
+                    (self.read_json().get("device_id") if self.headers.get("Content-Length") not in (None, "0") else None)
+                    or "default-kindle",
+                    require_enabled=True,
+                )
+                if selected.type not in KINDLE_DEVICE_TYPES:
+                    self.send_json(400, {"ok": False, "error": "unsupported device type"})
+                    return
+                if selected.id not in event.devices:
+                    self.send_json(400, {"ok": False, "error": "event does not target this device"})
+                    return
+                image_path = render_special_event_for_device(event, selected, registry.project_root)
+                push_image_to_kindle(selected, image_path)
+                self.send_json(
+                    200,
+                    {"ok": True, "message": f"Special event pushed to {selected.name}"},
+                )
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except DeviceNotFoundError:
+                self.send_json(404, {"ok": False, "error": "selected device is unavailable"})
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_push_all(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                event = special_events.find_event(events, event_id)
+                pushed_devices = []
+                errors = []
+                for selected in registry.load():
+                    if (
+                        selected.enabled
+                        and selected.type in KINDLE_DEVICE_TYPES
+                        and selected.id in event.devices
+                    ):
+                        try:
+                            image_path = render_special_event_for_device(event, selected, registry.project_root)
+                            push_image_to_kindle(selected, image_path)
+                            pushed_devices.append(selected.name)
+                        except Exception as exc:
+                            errors.append(f"{selected.name}: {exc}")
+                if not pushed_devices and errors:
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "partial": False,
+                            "pushed": [],
+                            "errors": errors,
+                            "failed": [
+                                item.split(":", 1)[0] if ":" in item else item
+                                for item in errors
+                            ],
+                            "error": (
+                                "Failed pushing special event to all target Kindles: "
+                                + ", ".join(errors)
+                            ),
+                        },
+                    )
+                    return
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "partial": bool(errors),
+                        "pushed": pushed_devices,
+                        "failed": [
+                            item.split(":", 1)[0] if ":" in item else item
+                            for item in errors
+                        ],
+                        "errors": errors,
+                        "message": (
+                            f"Special event pushed to: {', '.join(pushed_devices)}"
+                            + (
+                                f". Failed: {', '.join(errors)}"
+                                if errors
+                                else ""
+                            )
+                        ),
+                    },
+                )
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
 
         def handle_notes_delete(self):
             if not self.device_csrf_valid():

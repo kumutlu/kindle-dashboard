@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import json
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from unittest import mock
 
 from PIL import Image
 
+import special_events
 import weather_image
 from device_registry import (
     DeviceNotFoundError,
@@ -44,6 +46,30 @@ class DeviceRendererTests(unittest.TestCase):
                 "ph": {"queries": 0},
                 "ts": {"online": 0, "total": 0},
             },
+        )
+
+    def create_test_event(self, start_date, end_date):
+        return special_events.create_event(
+            self.root,
+            {
+                "title": "Celebration",
+                "start_date": start_date,
+                "end_date": end_date,
+                "image_data": (
+                    "data:image/png;base64,"
+                    + base64.b64encode(
+                        (
+                            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x00\x00\x00\x00"
+                            b"\x3a\x7e\x9b\x55\x00\x00\x00\x0bIDATx\x9cc`\x00\x02\x00\x00\x05\x00\x01"
+                            b"\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+                        )
+                    ).decode("ascii")
+                ),
+                "devices": ["default-kindle"],
+                "enabled": True,
+            },
+            ["default-kindle"],
         )
 
     def test_legacy_generate_command_keeps_global_config_and_output(self):
@@ -234,6 +260,39 @@ class DeviceRendererTests(unittest.TestCase):
             legacy_before,
         )
 
+    def test_active_special_event_overrides_normal_rendering(self):
+        event = self.create_test_event("2000-01-01", "2100-01-01")
+        special_events.save_events(self.root, [event])
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"home_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(self.rendered_titles, [])
+        self.assertEqual(result["output_path"], self.default_device.image_path)
+        self.assertTrue(self.default_device.image_path.exists())
+
+    def test_expired_special_event_falls_back_to_normal_rendering(self):
+        event = self.create_test_event("2026-07-08", "2026-07-08")
+        special_events.save_events(self.root, [event])
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"home_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(self.rendered_titles, ["LEGACY DEFAULT"])
+        self.assertEqual(result["theme"], "home_dashboard")
+
     def test_default_missing_device_config_falls_back_to_legacy(self):
         self.default_device.config_path.unlink()
         with mock.patch.dict(
@@ -349,6 +408,7 @@ class DeviceRendererTests(unittest.TestCase):
             "current": {"weatherCode": "113"},
             "temp": 20,
             "desc": "Clear",
+            "weather_desc_localized": "Clear",
             "feels": 18,
             "hi": 24,
             "lo": 12,
@@ -356,6 +416,8 @@ class DeviceRendererTests(unittest.TestCase):
             "wind": 9,
             "wind_dir": "W",
             "pressure": 1012,
+            "sunrise": "04:52",
+            "sunset": "21:28",
             "days": [
                 {
                     "date": "2026-07-10",
@@ -377,7 +439,7 @@ class DeviceRendererTests(unittest.TestCase):
         with Image.open(kt4.image_path) as generated:
             self.assertEqual(generated.size, (600, 800))
 
-    def test_600x800_rejects_non_minimal_theme_safely(self):
+    def test_family_dashboard_renders_600x800_kindle_device(self):
         kt4 = self.registry.add({
             "id": "kindle-131",
             "name": "Kindle 131",
@@ -396,11 +458,20 @@ class DeviceRendererTests(unittest.TestCase):
         config["theme"] = "family_dashboard"
         kt4.config_path.write_text(json.dumps(config), encoding="utf-8")
 
-        with self.assertRaisesRegex(ValueError, "600x800.*minimal_weather"):
-            weather_image.render_device(
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"family_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
                 kt4.id,
                 registry=self.registry,
             )
+
+        self.assertEqual(result["resolution"], [600, 800])
+        self.assertEqual(result["theme"], "family_dashboard")
+        with Image.open(kt4.image_path) as generated:
+            self.assertEqual(generated.size, (600, 800))
 
 
 if __name__ == "__main__":

@@ -1562,7 +1562,7 @@ def dashboard_fonts():
 
 
 def save_dashboard(img, data):
-    img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+    img = img.convert("L")
     output_path = ACTIVE_OUTPUT.get() or Path(OUT)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

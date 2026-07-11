@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
     "prayer_high_latitude": 3,
     "hijri_adjustment": 0,
     "refresh_interval_minutes": 10,
+    "wifi_power_save": True,
+    "update_only_if_changed": True,
 }
 
 STRING_LIMITS = {
@@ -101,6 +103,8 @@ OPTIONAL_LOCATION_FIELDS = {
     "prayer_high_latitude",
     "hijri_adjustment",
     "refresh_interval_minutes",
+    "wifi_power_save",
+    "update_only_if_changed",
 }
 BOOLEAN_FIELDS = {
     "show_weather",
@@ -108,6 +112,8 @@ BOOLEAN_FIELDS = {
     "show_server",
     "show_pihole",
     "show_tailscale",
+    "wifi_power_save",
+    "update_only_if_changed",
 }
 
 

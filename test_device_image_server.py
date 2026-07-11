@@ -63,6 +63,20 @@ class DeviceImageServerTests(unittest.TestCase):
         connection.close()
         return status, headers, body
 
+    def request_with_headers(self, path, headers, method="GET"):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        response_headers = dict(response.getheaders())
+        status = response.status
+        connection.close()
+        return status, response_headers, body
+
     def test_default_device_image_returns_png_for_get_and_head(self):
         status, headers, body = self.request(
             "/device/default-kindle/image.png"
@@ -81,6 +95,31 @@ class DeviceImageServerTests(unittest.TestCase):
             int(headers["Content-Length"]),
             len(self.device_image.read_bytes()),
         )
+        self.assertEqual(body, b"")
+
+    def test_device_endpoint_returns_etag_and_last_modified(self):
+        status, headers, _ = self.request("/device/default-kindle/image.png")
+        self.assertEqual(status, 200)
+        self.assertIn("ETag", headers)
+        self.assertIn("Last-Modified", headers)
+
+    def test_device_endpoint_supports_if_none_match(self):
+        _, headers, _ = self.request("/device/default-kindle/image.png")
+        status, response_headers, body = self.request_with_headers(
+            "/device/default-kindle/image.png",
+            {"If-None-Match": headers["ETag"]},
+        )
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(response_headers["ETag"], headers["ETag"])
+
+    def test_device_endpoint_supports_if_modified_since(self):
+        _, headers, _ = self.request("/device/default-kindle/image.png")
+        status, _, body = self.request_with_headers(
+            "/device/default-kindle/image.png",
+            {"If-Modified-Since": headers["Last-Modified"]},
+        )
+        self.assertEqual(status, 304)
         self.assertEqual(body, b"")
 
     def test_weather_png_remains_legacy_alias_but_device_endpoint_is_isolated(self):

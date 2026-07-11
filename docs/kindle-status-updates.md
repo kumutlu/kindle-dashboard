@@ -1,7 +1,7 @@
 # Kindle status updates
 
 The repo-provided Kindle refresh scripts can report device health back to the
-settings server after a successful image refresh.
+settings server after a successful wake / refresh cycle.
 
 Install these files together on the Kindle dashboard folder:
 
@@ -9,8 +9,8 @@ Install these files together on the Kindle dashboard folder:
 - `refresh-once.sh`
 - `send-status.sh`
 
-After `refresh.sh` or `refresh-once.sh` successfully downloads and displays an
-image, it runs:
+After `refresh.sh` or `refresh-once.sh` successfully checks the dashboard
+endpoint and completes its cycle, it runs:
 
 ```sh
 SERVER_HOST="$SERVER_HOST" DEVICE_ID="$DEVICE_ID" DASHBOARD_DIR="$DASHBOARD_DIR" sh "$(dirname "$0")/send-status.sh"

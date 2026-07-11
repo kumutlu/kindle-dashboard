@@ -268,6 +268,8 @@ def public_device_config(device, config):
         "show_pihole",
         "show_tailscale",
         "refresh_interval_minutes",
+        "wifi_power_save",
+        "update_only_if_changed",
         "prayer_method",
         "prayer_school",
         "prayer_high_latitude",
@@ -483,7 +485,7 @@ def update_config(config_path, candidate, regenerate):
     previous_data = config_path.read_bytes() if previous_exists else None
 
     # Preserve custom Maarif and Display fields from existing config if not in candidate
-    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes"):
+    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes", "wifi_power_save", "update_only_if_changed"):
         if previous_exists and field not in candidate:
             try:
                 prev_config = json.loads(previous_data.decode("utf-8"))
@@ -536,6 +538,8 @@ def update_device_config(
         "prayer_high_latitude",
         "hijri_adjustment",
         "refresh_interval_minutes",
+        "wifi_power_save",
+        "update_only_if_changed",
     ):
         if field not in candidate and field in current:
             candidate[field] = current[field]
@@ -671,6 +675,15 @@ def kindle_installer_script(device, config, server_host, image_port, settings_po
     status_url = (
         f"http://{server_host}:{settings_port}/api/device/{device_id}/status"
     )
+
+    def bundled_script_heredoc(script_name):
+        script_path = PROJECT_DIR / "kindle_scripts" / script_name
+        payload = script_path.read_text(encoding="utf-8").rstrip()
+        return (
+            f"cat <<'EOF' > \"$DASHBOARD_DIR/{script_name}\"\n"
+            f"{payload}\n"
+            "EOF"
+        )
 
     # status.sh heredoc
     status_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/status.sh"
@@ -826,46 +839,8 @@ fi
 exit 0
 EOF"""
 
-    # refresh.sh heredoc
-    refresh_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/refresh.sh"
-#!/bin/sh
-set -eu
-
-DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-if [ -f "$DASHBOARD_DIR/device.env" ]; then
-    . "$DASHBOARD_DIR/device.env"
-fi
-
-if [ -n "${IMAGE_URL:-}" ]; then
-    CURL_BIN=""
-    if command -v curl >/dev/null 2>&1; then
-        CURL_BIN=$(command -v curl)
-    elif [ -x /mnt/us/usbnet/bin/curl ]; then
-        CURL_BIN="/mnt/us/usbnet/bin/curl"
-    fi
-
-    if [ -n "$CURL_BIN" ]; then
-        "$CURL_BIN" -fsS --connect-timeout 10 --max-time 30 \
-            -o "$DASHBOARD_DIR/image.png" "$IMAGE_URL" >/dev/null 2>&1 || true
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$DASHBOARD_DIR/image.png" "$IMAGE_URL" >/dev/null 2>&1 || true
-    fi
-fi
-
-EIPS_BIN="/usr/sbin/eips"
-if [ -x "$EIPS_BIN" ]; then
-    "$EIPS_BIN" -c || true
-    "$EIPS_BIN" -f || true
-    "$EIPS_BIN" -g "$DASHBOARD_DIR/image.png" || true
-else
-    echo "missing eips: $EIPS_BIN" >&2
-fi
-
-if [ -x "$DASHBOARD_DIR/status.sh" ]; then
-    "$DASHBOARD_DIR/status.sh" >/dev/null 2>&1 || true
-fi
-exit 0
-EOF"""
+    refresh_sh_content = bundled_script_heredoc("refresh.sh")
+    refresh_once_sh_content = bundled_script_heredoc("refresh-once.sh")
 
     # dashboard_loop.sh heredoc
     dashboard_loop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/dashboard_loop.sh"
@@ -875,32 +850,7 @@ if [ -f "$DASHBOARD_DIR/device.env" ]; then
     . "$DASHBOARD_DIR/device.env"
 fi
 
-wait_for_ip() {
-    for i in $(seq 1 60); do
-        IP=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p')
-        if [ -z "$IP" ]; then
-            IP=$(ifconfig 2>/dev/null | grep "inet addr:" | grep -v "127.0.0.1" | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' | head -n 1)
-        fi
-        if [ -n "$IP" ]; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-while true; do
-    wait_for_ip || true
-    if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
-        "$DASHBOARD_DIR/refresh.sh" || true
-    fi
-    SLEEP_MINUTES="${REFRESH_INTERVAL_MINUTES:-60}"
-    SLEEP_SECONDS=$((SLEEP_MINUTES * 60))
-    if [ "$SLEEP_SECONDS" -le 0 ]; then
-        SLEEP_SECONDS=3600
-    fi
-    sleep "$SLEEP_SECONDS"
-done
+exec "$DASHBOARD_DIR/refresh.sh"
 EOF"""
 
     # watchdog.sh heredoc
@@ -975,6 +925,7 @@ EOF"""
         f"STATUS_TOKEN={shell_double_quote(status_token)}",
         f"IMAGE_URL={shell_double_quote(image_url)}",
         f"STATUS_URL={shell_double_quote(status_url)}",
+        f'CONFIG_URL="http://{server_host}:{settings_port}/api/device/{device_id}/config"',
         'printf "%s\\n" "$DEVICE_ID" > "$DASHBOARD_DIR/device-id"',
         'printf "%s\\n" "$STATUS_TOKEN" > "$DASHBOARD_DIR/status-token"',
         'chmod 600 "$DASHBOARD_DIR/status-token" 2>/dev/null || true',
@@ -984,16 +935,20 @@ EOF"""
         'STATUS_TOKEN="$STATUS_TOKEN"',
         'IMAGE_URL="$IMAGE_URL"',
         'STATUS_URL="$STATUS_URL"',
+        'CONFIG_URL="$CONFIG_URL"',
         f'REFRESH_INTERVAL_MINUTES="{int(config.get("refresh_interval_minutes", 60))}"',
+        f'WIFI_POWER_SAVE="{"1" if config.get("wifi_power_save", True) else "0"}"',
+        f'UPDATE_ONLY_IF_CHANGED="{"1" if config.get("update_only_if_changed", True) else "0"}"',
         "EOF",
         'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',
         status_sh_content,
         refresh_sh_content,
+        refresh_once_sh_content,
         dashboard_loop_sh_content,
         watchdog_sh_content,
         start_sh_content,
         stop_sh_content,
-        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" "$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true',
+        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/refresh-once.sh" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" "$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true',
         'if [ -d /etc/upstart ]; then',
         '    mntroot rw 2>/dev/null || true',
         '    cat <<\'UPSTART\' > /etc/upstart/dashboard.conf',
@@ -2941,6 +2896,10 @@ button:disabled {{
       </select>
     </label>
     <p class="section-note" style="margin-top: -10px;">How often the Kindle dashboard image should refresh automatically. For Maarif Calendar, 60 minutes is usually enough.</p>
+    <div class="toggle-list" style="margin-top: 16px;">
+      <label class="toggle"><input type="checkbox" name="wifi_power_save"{checked('wifi_power_save')}> <span>Wi-Fi power save (turn Wi-Fi off between refreshes)</span></label>
+      <label class="toggle"><input type="checkbox" name="update_only_if_changed"{checked('update_only_if_changed')}> <span>Only refresh when image changed (ETag / Last-Modified)</span></label>
+    </div>
   </div>
 </section>
 
@@ -5982,7 +5941,8 @@ def make_handler(
                     candidate["latitude"] = None
                     candidate["longitude"] = None
                 for key in ("show_weather", "show_forecast", "show_server",
-                            "show_pihole", "show_tailscale"):
+                            "show_pihole", "show_tailscale",
+                            "wifi_power_save", "update_only_if_changed"):
                     candidate[key] = key in form
                 for key in ("prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes"):
                     if key in form:

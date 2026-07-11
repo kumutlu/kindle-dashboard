@@ -1987,6 +1987,8 @@ class DeviceConfigEndpointTests(unittest.TestCase):
                 "show_pihole",
                 "show_tailscale",
                 "refresh_interval_minutes",
+                "wifi_power_save",
+                "update_only_if_changed",
                 "kindle_frontlight",
                 "prayer_method",
                 "prayer_school",
@@ -2000,6 +2002,8 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(payload["resolution"], [758, 1024])
         self.assertEqual(payload["theme"], "family_dashboard")
         self.assertEqual(payload["refresh_interval_minutes"], 30)
+        self.assertEqual(payload["wifi_power_save"], True)
+        self.assertEqual(payload["update_only_if_changed"], True)
         self.assertEqual(payload["kindle_frontlight"], 12)
         self.assertEqual(
             payload["image_url"],
@@ -2228,6 +2232,8 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "timezone": "Europe/Istanbul",
             "theme": "travel_weather",
             "refresh_interval_minutes": 30,
+            "wifi_power_save": False,
+            "update_only_if_changed": True,
             "kindle_frontlight": 4,
             "status_token": "secret-status-token",
             "pairing_token": "secret-pairing-token",
@@ -2253,6 +2259,8 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "timezone",
             "theme",
             "refresh_interval_minutes",
+            "wifi_power_save",
+            "update_only_if_changed",
             "kindle_frontlight",
         ):
             self.assertEqual(payload[key], config[key])
@@ -2296,6 +2304,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "show_weather": "on",
             "show_forecast": "on",
             "refresh_interval_minutes": "30",
+            "update_only_if_changed": "on",
         }
 
         status, headers, _ = self.post_form(
@@ -2308,6 +2317,8 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(saved["theme"], "travel_weather")
         self.assertEqual(saved["weather_query"], "Istanbul")
         self.assertEqual(saved["timezone"], "Europe/Istanbul")
+        self.assertFalse(saved["wifi_power_save"])
+        self.assertTrue(saved["update_only_if_changed"])
         default_after = json.loads(
             self.registry.get("default-kindle").config_path.read_text(
                 encoding="utf-8",
@@ -2483,13 +2494,17 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("watchdog.sh", script)
         self.assertIn("stop.sh", script)
         self.assertIn("STATUS_URL=", script)
+        self.assertIn("CONFIG_URL=", script)
         self.assertIn("IMAGE_URL=", script)
         self.assertIn("Authorization: Bearer", script)
         # Verify REFRESH_INTERVAL_MINUTES is written to device.env
         self.assertIn('REFRESH_INTERVAL_MINUTES="30"', script)
+        self.assertIn('WIFI_POWER_SAVE="1"', script)
+        self.assertIn('UPDATE_ONLY_IF_CHANGED="1"', script)
+        self.assertIn("refresh-once.sh", script)
         # Verify BusyBox-compatible syntax and chmod executions
         self.assertIn('chmod +x "$DASHBOARD_DIR/status.sh"', script)
-        self.assertIn('"$DASHBOARD_DIR/status.sh" >/dev/null 2>&1', script)
+        self.assertIn('cat <<\'EOF\' > "$DASHBOARD_DIR/status.sh"', script)
         # Verify upstart config creation
         self.assertIn('/etc/upstart/dashboard.conf', script)
         self.assertIn('mntroot rw', script)
@@ -2521,8 +2536,8 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         script = body.decode("utf-8")
 
         self.assertEqual(status, 200)
-        self.assertIn('EIPS_BIN="/usr/sbin/eips"', script)
-        self.assertIn('"$EIPS_BIN" -g "$DASHBOARD_DIR/image.png"', script)
+        self.assertIn('EIPS_BIN="${EIPS_BIN:-/usr/sbin/eips}"', script)
+        self.assertIn('"$EIPS_BIN" -g "$IMG"', script)
         self.assertNotIn("command -v eips", script)
         self.assertNotIn("\neips ", script)
 

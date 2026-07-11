@@ -2,6 +2,7 @@
 """Strict HTTP server for legacy and per-device dashboard images."""
 
 import datetime
+import email.utils
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -122,6 +123,55 @@ def make_handler(
 
             try:
                 image_path = self._resolve_image(route_path)
+                stat_result = image_path.stat()
+                etag = f'W/"{int(stat_result.st_mtime)}-{stat_result.st_size}"'
+                last_modified = email.utils.formatdate(
+                    stat_result.st_mtime,
+                    usegmt=True,
+                )
+                request_etag = self.headers.get("If-None-Match", "")
+                request_last_modified = self.headers.get(
+                    "If-Modified-Since",
+                    "",
+                )
+                if request_etag and request_etag == etag:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Last-Modified", last_modified)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if request_last_modified:
+                    try:
+                        modified_since = email.utils.parsedate_to_datetime(
+                            request_last_modified
+                        )
+                        if modified_since is not None:
+                            modified_since_ts = int(
+                                modified_since.timestamp()
+                            )
+                            if int(stat_result.st_mtime) <= modified_since_ts:
+                                self.send_response(304)
+                                self.send_header("ETag", etag)
+                                self.send_header(
+                                    "Last-Modified",
+                                    last_modified,
+                                )
+                                self.send_header(
+                                    "Cache-Control",
+                                    "no-store",
+                                )
+                                self.send_header(
+                                    "X-Content-Type-Options",
+                                    "nosniff",
+                                )
+                                self.send_header("Content-Length", "0")
+                                self.end_headers()
+                                return
+                    except Exception:
+                        pass
                 image = image_path.read_bytes()
             except (DeviceNotFoundError, FileNotFoundError, OSError):
                 self._send_empty(404)
@@ -131,6 +181,8 @@ def make_handler(
             self.send_header("Content-Type", "image/png")
             self.send_header("Content-Length", str(len(image)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_modified)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             if include_body:

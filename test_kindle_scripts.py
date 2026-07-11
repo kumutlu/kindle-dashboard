@@ -23,7 +23,7 @@ class KindleScriptsTests(unittest.TestCase):
             "#!/bin/sh\n"
             "echo \"wget $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
             "if echo \"$@\" | grep -q \"config\"; then\n"
-            "  echo '{\"refresh_interval_minutes\":30,\"kindle_frontlight\":12}'\n"
+            "  echo '{\"refresh_interval_minutes\":30,\"kindle_frontlight\":12,\"wifi_power_save\":true,\"update_only_if_changed\":true}'\n"
             "  exit 0\n"
             "fi\n"
             "OUT=''\n"
@@ -36,10 +36,24 @@ class KindleScriptsTests(unittest.TestCase):
         self.create_mock_bin("curl", (
             "#!/bin/sh\n"
             "echo \"curl $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
+            "HDR=''\n"
+            "OUT=''\n"
             "while [ $# -gt 0 ]; do\n"
+            "  if [ \"$1\" = \"-D\" ]; then shift; HDR=\"$1\"; fi\n"
+            "  if [ \"$1\" = \"-o\" ]; then shift; OUT=\"$1\"; fi\n"
+            "  if [ \"$1\" = \"-H\" ]; then shift; echo \"curl-header $1\" >> \"$DASHBOARD_DIR/calls.log\"; fi\n"
             "  if [ \"$1\" = \"--data\" ] || [ \"$1\" = \"--data-binary\" ] || [ \"$1\" = \"-d\" ]; then shift; echo \"curl-data $1\" >> \"$DASHBOARD_DIR/calls.log\"; fi\n"
             "  shift\n"
             "done\n"
+            "if [ -n \"$HDR\" ]; then\n"
+            "  if [ \"${MOCK_CURL_MODE:-ok}\" = \"not_modified\" ]; then\n"
+            "    printf 'HTTP/1.1 304 Not Modified\\nETag: test-etag\\nLast-Modified: Wed, 10 Jul 2026 10:00:00 GMT\\n\\n' > \"$HDR\"\n"
+            "    : > \"$OUT\"\n"
+            "    exit 0\n"
+            "  fi\n"
+            "  printf 'HTTP/1.1 200 OK\\nETag: test-etag\\nLast-Modified: Wed, 10 Jul 2026 10:00:00 GMT\\n\\n' > \"$HDR\"\n"
+            "fi\n"
+            "if [ -n \"$OUT\" ]; then printf '%s' \"${MOCK_IMAGE_CONTENT:-image-bytes}\" > \"$OUT\"; fi\n"
         ))
         self.create_mock_bin("ip", (
             "#!/bin/sh\n"
@@ -57,6 +71,7 @@ class KindleScriptsTests(unittest.TestCase):
         self.env["PATH"] = f"{self.bin_dir}:{self.env.get('PATH', '')}"
         self.env["DASHBOARD_DIR"] = str(self.sandbox)
         self.env["EIPS_BIN"] = str(self.bin_dir / "eips")
+        self.env["MOCK_CURL_MODE"] = "ok"
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -104,6 +119,69 @@ class KindleScriptsTests(unittest.TestCase):
         self.assertIn("http://192.168.68.167:8765/device/kitchen-kindle/image.png", calls or "")
         self.assertIn("http://192.168.68.167:8767/api/device/kitchen-kindle/status", calls)
 
+    def test_refresh_once_toggles_wifi_and_saves_conditional_headers(self):
+        code, _, _ = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("lipc-set-prop com.lab126.wifid enable 1", calls)
+        self.assertIn("lipc-set-prop com.lab126.wifid enable 0", calls)
+        self.assertEqual(
+            (self.sandbox / "image.etag").read_text(encoding="utf-8").strip(),
+            "test-etag",
+        )
+        self.assertEqual(
+            (self.sandbox / "image.last_modified").read_text(
+                encoding="utf-8"
+            ).strip(),
+            "Wed, 10 Jul 2026 10:00:00 GMT",
+        )
+        self.assertTrue((self.sandbox / "image.png").exists())
+
+    def test_refresh_once_skips_display_refresh_when_server_returns_304(self):
+        first_image = "first-image"
+        self.env["MOCK_IMAGE_CONTENT"] = first_image
+        code, _, _ = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            (self.sandbox / "image.png").read_text(encoding="utf-8"),
+            first_image,
+        )
+
+        (self.sandbox / "calls.log").unlink(missing_ok=True)
+        self.env["MOCK_CURL_MODE"] = "not_modified"
+        code, _, _ = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("curl-header If-None-Match: test-etag", calls)
+        self.assertIn(
+            "curl-header If-Modified-Since: Wed, 10 Jul 2026 10:00:00 GMT",
+            calls,
+        )
+        self.assertNotIn("eips -g", calls)
+        self.assertEqual(
+            (self.sandbox / "image.png").read_text(encoding="utf-8"),
+            first_image,
+        )
+
+    def test_refresh_loop_delegates_to_refresh_once_and_sleeps(self):
+        shutil.copy2(REFRESH_ONCE_SH, self.sandbox / "refresh-once.sh")
+        (self.sandbox / "refresh-once.sh").chmod(0o755)
+        (self.sandbox / "device.env").write_text(
+            "REFRESH_INTERVAL_MINUTES=\"30\"\n",
+            encoding="utf-8",
+        )
+        code, _, _ = self.run_script(REFRESH_SH, timeout=3)
+        self.assertEqual(code, -1)
+        calls_log = self.sandbox / "calls.log"
+        self.assertTrue(calls_log.exists())
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn(
+            "http://192.168.68.167:8765/device/default-kindle/image.png",
+            calls,
+        )
+
     def test_send_status_posts_available_battery_json(self):
         power = self.sandbox / "power_supply" / "battery"
         power.mkdir(parents=True)
@@ -143,7 +221,10 @@ class KindleScriptsTests(unittest.TestCase):
                 (self.sandbox / "device-id").write_text(invalid + "\n")
                 code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
                 self.assertEqual(code, 0)
-                
+                self.assertTrue(
+                    calls_log.exists(),
+                    msg=f"stdout={stdout} stderr={stderr}",
+                )
                 calls = calls_log.read_text(encoding="utf-8")
                 self.assertIn("default-kindle", calls)
                 if invalid:
@@ -161,15 +242,15 @@ class KindleScriptsTests(unittest.TestCase):
                 if "&" in clean_line:
                     self.fail(f"Background process leak detected in line: {line}")
 
-        self.assertIn("LEGACY_LOCAL_URL=", refresh_content)
-        self.assertIn("LEGACY_CONFIG_URL=", refresh_content)
         self.assertIn("LEGACY_LOCAL_URL=", once_content)
         self.assertIn("LEGACY_CONFIG_URL=", once_content)
-        self.assertIn('SERVER_HOST="${SERVER_HOST:-192.168.68.167}"', refresh_content)
-        self.assertIn('DEVICE_ID="${DEVICE_ID:-default-kindle}"', refresh_content)
+        self.assertIn('REFRESH_ONCE_SH="$DASHBOARD_DIR/refresh-once.sh"', refresh_content)
         self.assertIn('SERVER_HOST="${SERVER_HOST:-192.168.68.167}"', once_content)
         self.assertIn('DEVICE_ID="${DEVICE_ID:-default-kindle}"', once_content)
-        self.assertIn("send-status.sh", refresh_content)
+        self.assertIn("If-None-Match", once_content)
+        self.assertIn("If-Modified-Since", once_content)
+        self.assertIn("com.lab126.wifid enable 1", once_content)
+        self.assertIn("com.lab126.wifid enable 0", once_content)
         self.assertIn("send-status.sh", once_content)
 
 

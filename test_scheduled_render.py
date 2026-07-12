@@ -8,7 +8,7 @@ import scheduled_render
 
 class ScheduledRenderTests(unittest.TestCase):
     @mock.patch("scheduled_render.subprocess.run")
-    def test_legacy_then_default_device_render_once(self, run):
+    def test_production_targets_render_once_in_order(self, run):
         run.return_value.returncode = 0
 
         result = scheduled_render.main()
@@ -24,6 +24,12 @@ class ScheduledRenderTests(unittest.TestCase):
                     "--device",
                     "default-kindle",
                 ],
+                [
+                    scheduled_render.sys.executable,
+                    "weather_image.py",
+                    "--device",
+                    "kindle-131",
+                ],
             ],
         )
 
@@ -31,6 +37,7 @@ class ScheduledRenderTests(unittest.TestCase):
     def test_both_renders_run_and_failure_is_reported(self, run):
         run.side_effect = [
             mock.Mock(returncode=3),
+            mock.Mock(returncode=0),
             mock.Mock(returncode=0),
         ]
         stdout = io.StringIO()
@@ -40,11 +47,12 @@ class ScheduledRenderTests(unittest.TestCase):
             result = scheduled_render.main()
 
         self.assertEqual(result, 1)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
         self.assertIn("render_failed target=legacy rc=3", stderr.getvalue())
         self.assertIn(
             "render_complete target=default-kindle", stdout.getvalue()
         )
+        self.assertIn("render_complete target=kindle-131", stdout.getvalue())
 
 
 if __name__ == "__main__":

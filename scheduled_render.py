@@ -19,6 +19,15 @@ RENDERS = (
             "default-kindle",
         ],
     ),
+    (
+        "kindle-131",
+        [
+            sys.executable,
+            "weather_image.py",
+            "--device",
+            "kindle-131",
+        ],
+    ),
 )
 
 

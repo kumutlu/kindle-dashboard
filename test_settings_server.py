@@ -3530,5 +3530,52 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("missing required screensaver overlay script", payload["error"])
 
 
+class LowPowerDeploymentIntegrationTests(unittest.TestCase):
+    def test_prepare_low_power_deployment_requires_explicit_default_device(self):
+        default = mock.Mock(
+            id="default-kindle",
+            name="Default Kindle",
+            type="kindle_pw1",
+            enabled=True,
+            resolution=(758, 1024),
+            connection={
+                "host": "192.168.68.119",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+                "port": 22,
+            },
+        )
+        registry = mock.Mock()
+        registry.get.return_value = default
+
+        deployment = settings_server.prepare_low_power_deployment(
+            registry,
+            "default-kindle",
+            {"refresh_interval_minutes": 60},
+            "192.168.68.167",
+            8765,
+        )
+
+        registry.get.assert_called_once_with(
+            "default-kindle", require_enabled=True
+        )
+        self.assertEqual(deployment.device_id, "default-kindle")
+        self.assertIn(
+            "/mnt/us/dashboard/low-power-cycle.sh", deployment.files
+        )
+
+    def test_prepare_low_power_deployment_rejects_other_device_ids(self):
+        registry = mock.Mock()
+        with self.assertRaises(ValueError):
+            settings_server.prepare_low_power_deployment(
+                registry,
+                "kitchen-kindle",
+                {"refresh_interval_minutes": 60},
+                "192.168.68.167",
+                8765,
+            )
+        registry.get.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

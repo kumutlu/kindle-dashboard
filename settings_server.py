@@ -21,6 +21,7 @@ from device_registry import (
     RegistryValidationError,
 )
 from kindle_device import DeviceError, KindleDevice, SSH_PROFILES
+from kindle_low_power import build_low_power_deployment
 from weather_image import (
     DEFAULT_CONFIG,
     geocode_locations,
@@ -86,6 +87,27 @@ SPECIAL_EVENT_PUSH_RE = re.compile(
 SPECIAL_EVENT_PUSH_ALL_RE = re.compile(
     r"^/api/special-events/([a-z0-9][a-z0-9-]{0,63})/push-all$"
 )
+
+
+def prepare_low_power_deployment(
+    registry,
+    device_id,
+    config,
+    server_host,
+    image_port=8765,
+):
+    """Build, but never install, the explicit default-kindle pilot bundle."""
+    if device_id != "default-kindle":
+        raise ValueError(
+            "true low-power pilot is restricted to default-kindle"
+        )
+    selected = registry.get(device_id, require_enabled=True)
+    return build_low_power_deployment(
+        selected,
+        config,
+        server_host,
+        image_port,
+    )
 
 
 def _run_push_command(args, timeout, label):

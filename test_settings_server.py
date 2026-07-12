@@ -2496,6 +2496,14 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("STATUS_URL=", script)
         self.assertIn("CONFIG_URL=", script)
         self.assertIn("IMAGE_URL=", script)
+        self.assertIn(
+            "http://127.0.0.1:8765/device/kitchen-kindle/image.png",
+            script,
+        )
+        self.assertNotIn(
+            "http://127.0.0.1:8767/device/kitchen-kindle/image.png",
+            script,
+        )
         self.assertIn("Authorization: Bearer", script)
         # Verify REFRESH_INTERVAL_MINUTES is written to device.env
         self.assertIn('REFRESH_INTERVAL_MINUTES="30"', script)

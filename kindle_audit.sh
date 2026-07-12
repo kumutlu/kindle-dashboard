@@ -7,7 +7,6 @@ EIPS="/usr/sbin/eips"
 
 DEVICES=(
   "default-kindle:192.168.68.119"
-  "kindle-no3:192.168.68.109"
   "kindle-no4:192.168.68.131"
   "kitchen-kindle:192.168.68.122"
 )

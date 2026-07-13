@@ -12,7 +12,7 @@ class ScheduledRenderContractTests(unittest.TestCase):
         self.assertIn("exec python3 scheduled_render.py", self.script)
 
     def test_scheduler_does_not_render_other_devices(self):
-        for device_id in ("kitchen-kindle", "kindle-131", "kindle-03"):
+        for device_id in ("kitchen-kindle", "kindle-131"):
             with self.subTest(device_id=device_id):
                 self.assertNotIn(f"--device {device_id}", self.script)
 

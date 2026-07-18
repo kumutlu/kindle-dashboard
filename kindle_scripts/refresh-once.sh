@@ -100,6 +100,13 @@ wifi_disable() {
 	lipc-set-prop com.lab126.wifid enable 0 2>/dev/null || true
 }
 
+fail() {
+	MESSAGE=$1
+	echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: $MESSAGE" >&2
+	wifi_disable
+	exit 1
+}
+
 extract_json_int() {
 	KEY=$1
 	echo "$CONFIG_JSON" | grep -o "\"$KEY\":[[:space:]]*[0-9][0-9]*" | tail -n 1 | grep -o '[0-9][0-9]*' || true
@@ -164,7 +171,7 @@ save_response_headers() {
 
 is_valid_png() {
 	[ -s "$TMP" ] || return 1
-	MAGIC=$(dd if="$TMP" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n\r')
+	MAGIC=$(hexdump -n 8 -e '8/1 "%02x"' "$TMP" 2>/dev/null)
 	[ "$MAGIC" = "89504e470d0a1a0a" ]
 }
 

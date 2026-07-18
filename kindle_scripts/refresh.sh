@@ -19,8 +19,13 @@ echo $$ > "$PID_FILE"
 
 while true
 do
-	if [ -x "$REFRESH_ONCE_SH" ]; then
-		"$REFRESH_ONCE_SH" || true
+	if [ ! -x "$REFRESH_ONCE_SH" ]; then
+		echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: missing $REFRESH_ONCE_SH" >&2
+		exit 1
+	fi
+	if ! "$REFRESH_ONCE_SH"; then
+		echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: refresh cycle failed" >&2
+		exit 1
 	fi
 
 	if [ -f "$DEVICE_ENV_FILE" ]; then

@@ -3,6 +3,7 @@
 
 import datetime
 import email.utils
+import hashlib
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -87,11 +88,6 @@ def make_handler(
                 match.group(1),
                 require_enabled=True,
             )
-            if (
-                device.id == "default-kindle"
-                and not device.image_path.exists()
-            ):
-                return legacy_image_path
             return device.image_path
 
         def _serve_image(self, include_body=True):
@@ -124,6 +120,8 @@ def make_handler(
             try:
                 image_path = self._resolve_image(route_path)
                 stat_result = image_path.stat()
+                image = image_path.read_bytes()
+                image_sha256 = hashlib.sha256(image).hexdigest()
                 etag = f'W/"{int(stat_result.st_mtime)}-{stat_result.st_size}"'
                 last_modified = email.utils.formatdate(
                     stat_result.st_mtime,
@@ -138,6 +136,7 @@ def make_handler(
                     self.send_response(304)
                     self.send_header("ETag", etag)
                     self.send_header("Last-Modified", last_modified)
+                    self.send_header("X-Image-SHA256", image_sha256)
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("X-Content-Type-Options", "nosniff")
                     self.send_header("Content-Length", "0")
@@ -159,6 +158,7 @@ def make_handler(
                                     "Last-Modified",
                                     last_modified,
                                 )
+                                self.send_header("X-Image-SHA256", image_sha256)
                                 self.send_header(
                                     "Cache-Control",
                                     "no-store",
@@ -172,7 +172,6 @@ def make_handler(
                                 return
                     except Exception:
                         pass
-                image = image_path.read_bytes()
             except (DeviceNotFoundError, FileNotFoundError, OSError):
                 self._send_empty(404)
                 return
@@ -183,6 +182,7 @@ def make_handler(
             self.send_header("Cache-Control", "no-store")
             self.send_header("ETag", etag)
             self.send_header("Last-Modified", last_modified)
+            self.send_header("X-Image-SHA256", image_sha256)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             if include_body:

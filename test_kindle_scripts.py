@@ -53,7 +53,7 @@ class KindleScriptsTests(unittest.TestCase):
             "  fi\n"
             "  printf 'HTTP/1.1 200 OK\\nETag: test-etag\\nLast-Modified: Wed, 10 Jul 2026 10:00:00 GMT\\n\\n' > \"$HDR\"\n"
             "fi\n"
-            "if [ -n \"$OUT\" ]; then printf '%s' \"${MOCK_IMAGE_CONTENT:-image-bytes}\" > \"$OUT\"; fi\n"
+            "if [ -n \"$OUT\" ]; then printf '%b' \"${MOCK_IMAGE_CONTENT:-\\211PNG\\r\\n\\032\\nimage-bytes}\" > \"$OUT\"; fi\n"
         ))
         self.create_mock_bin("ip", (
             "#!/bin/sh\n"
@@ -139,13 +139,13 @@ class KindleScriptsTests(unittest.TestCase):
         self.assertTrue((self.sandbox / "image.png").exists())
 
     def test_refresh_once_skips_display_refresh_when_server_returns_304(self):
-        first_image = "first-image"
+        first_image = "\\211PNG\\r\\n\\032\\nfirst-image"
         self.env["MOCK_IMAGE_CONTENT"] = first_image
         code, _, _ = self.run_script(REFRESH_ONCE_SH)
         self.assertEqual(code, 0)
         self.assertEqual(
-            (self.sandbox / "image.png").read_text(encoding="utf-8"),
-            first_image,
+            (self.sandbox / "image.png").read_bytes(),
+            first_image.encode("latin-1").decode("unicode_escape").encode("latin-1"),
         )
 
         (self.sandbox / "calls.log").unlink(missing_ok=True)
@@ -161,8 +161,8 @@ class KindleScriptsTests(unittest.TestCase):
         )
         self.assertNotIn("eips -g", calls)
         self.assertEqual(
-            (self.sandbox / "image.png").read_text(encoding="utf-8"),
-            first_image,
+            (self.sandbox / "image.png").read_bytes(),
+            first_image.encode("latin-1").decode("unicode_escape").encode("latin-1"),
         )
 
     def test_refresh_loop_delegates_to_refresh_once_and_sleeps(self):
@@ -221,14 +221,9 @@ class KindleScriptsTests(unittest.TestCase):
                 (self.sandbox / "device-id").write_text(invalid + "\n")
                 code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
                 self.assertEqual(code, 0)
-                self.assertTrue(
-                    calls_log.exists(),
-                    msg=f"stdout={stdout} stderr={stderr}",
-                )
+                self.assertTrue(calls_log.exists(), msg=f"stdout={stdout} stderr={stderr}")
                 calls = calls_log.read_text(encoding="utf-8")
-                self.assertIn("default-kindle", calls)
-                if invalid:
-                    self.assertNotIn(f"/device/{invalid}/", calls)
+                self.assertIn("/device/default-kindle/image.png", calls)
 
     def test_static_analysis_for_process_leaks_and_sleep(self):
         refresh_content = REFRESH_SH.read_text(encoding="utf-8")
@@ -242,13 +237,16 @@ class KindleScriptsTests(unittest.TestCase):
                 if "&" in clean_line:
                     self.fail(f"Background process leak detected in line: {line}")
 
-        self.assertIn("LEGACY_LOCAL_URL=", once_content)
-        self.assertIn("LEGACY_CONFIG_URL=", once_content)
+        self.assertNotIn("weather.png", once_content)
+        self.assertNotIn("PUBLIC_URL", once_content)
         self.assertIn('REFRESH_ONCE_SH="$DASHBOARD_DIR/refresh-once.sh"', refresh_content)
         self.assertIn('SERVER_HOST="${SERVER_HOST:-192.168.68.167}"', once_content)
         self.assertIn('DEVICE_ID="${DEVICE_ID:-default-kindle}"', once_content)
         self.assertIn("If-None-Match", once_content)
         self.assertIn("If-Modified-Since", once_content)
+        self.assertIn("Cache-Control: no-cache", once_content)
+        self.assertIn("?t=", once_content)
+        self.assertIn("sha256sum", once_content)
         self.assertIn("com.lab126.wifid enable 1", once_content)
         self.assertIn("com.lab126.wifid enable 0", once_content)
         self.assertIn("send-status.sh", once_content)

@@ -28,6 +28,12 @@ class ScheduledRenderTests(unittest.TestCase):
                     scheduled_render.sys.executable,
                     "weather_image.py",
                     "--device",
+                    "kitchen-kindle",
+                ],
+                [
+                    scheduled_render.sys.executable,
+                    "weather_image.py",
+                    "--device",
                     "kindle-131",
                 ],
             ],
@@ -39,6 +45,7 @@ class ScheduledRenderTests(unittest.TestCase):
             mock.Mock(returncode=3),
             mock.Mock(returncode=0),
             mock.Mock(returncode=0),
+            mock.Mock(returncode=0),
         ]
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -47,7 +54,7 @@ class ScheduledRenderTests(unittest.TestCase):
             result = scheduled_render.main()
 
         self.assertEqual(result, 1)
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 4)
         self.assertIn("render_failed target=legacy rc=3", stderr.getvalue())
         self.assertIn(
             "render_complete target=default-kindle", stdout.getvalue()

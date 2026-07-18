@@ -1,9 +1,6 @@
 #!/bin/sh
 set -eu
 
-LEGACY_LOCAL_URL="http://192.168.68.167:8765/weather.png"
-LEGACY_CONFIG_URL="http://192.168.68.167:8767/api/config"
-
 SERVER_HOST="${SERVER_HOST:-192.168.68.167}"
 DEVICE_ID="${DEVICE_ID:-default-kindle}"
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
@@ -23,23 +20,23 @@ if [ -s "$DEVICE_ID_FILE" ] && [ "$DEVICE_ID" = "default-kindle" ]; then
 fi
 
 LOCAL_URL="${IMAGE_URL:-http://$SERVER_HOST:8765/device/$DEVICE_ID/image.png}"
-PUBLIC_URL="https://user-zbox-ci320nano-series.taildabdfd.ts.net/weather.png"
 CONFIG_URL="${CONFIG_URL:-http://$SERVER_HOST:8767/api/device/$DEVICE_ID/config}"
 TOKEN_FILE="$DASHBOARD_DIR/public-token"
 IMG="$DASHBOARD_DIR/image.png"
-LEGACY_IMG="$DASHBOARD_DIR/weather.png"
 TMP="$DASHBOARD_DIR/image.once.$$"
 HDR_TMP="$DASHBOARD_DIR/image.once.headers.$$"
+ERR_TMP="$DASHBOARD_DIR/image.once.error.$$"
 LOCK_FILE="/tmp/kindle-refresh.lock"
 ETAG_FILE="$DASHBOARD_DIR/image.etag"
 LAST_MODIFIED_FILE="$DASHBOARD_DIR/image.last_modified"
+SERVER_SHA_FILE="$DASHBOARD_DIR/image.server.sha256"
 STATUS_SENDER="${STATUS_SENDER:-$(dirname "$0")/send-status.sh}"
 EIPS_BIN="${EIPS_BIN:-/usr/sbin/eips}"
 WIFI_POWER_SAVE="${WIFI_POWER_SAVE:-1}"
 UPDATE_ONLY_IF_CHANGED="${UPDATE_ONLY_IF_CHANGED:-1}"
 
 cleanup() {
-	rm -f "$TMP" "$HDR_TMP"
+	rm -f "$TMP" "$HDR_TMP" "$ERR_TMP"
 	rm -f "$LOCK_FILE"
 	unset TOKEN
 }
@@ -124,9 +121,6 @@ apply_runtime_config() {
 	fi
 
 	CONFIG_JSON=$(wget -q -O- "$CONFIG_URL" 2>/dev/null || true)
-	if [ -z "$CONFIG_JSON" ]; then
-		CONFIG_JSON=$(wget -q -O- "$LEGACY_CONFIG_URL" 2>/dev/null || true)
-	fi
 
 	LIGHT=$(extract_json_int "kindle_frontlight")
 	if [ -n "$LIGHT" ] && { [ "$LIGHT" -eq 0 ] || [ "$LIGHT" -eq 1 ] || [ "$LIGHT" -eq 4 ] || [ "$LIGHT" -eq 8 ] || [ "$LIGHT" -eq 12 ] || [ "$LIGHT" -eq 18 ]; }; then
@@ -162,37 +156,63 @@ save_response_headers() {
 	if [ -n "$LAST_MODIFIED" ]; then
 		printf '%s\n' "$LAST_MODIFIED" > "$LAST_MODIFIED_FILE"
 	fi
+	SERVER_SHA=$(grep -i '^X-Image-SHA256:' "$HDR_TMP" | tail -n 1 | sed 's/^[Xx]-[Ii][Mm][Aa][Gg][Ee]-[Ss][Hh][Aa]256:[[:space:]]*//' | tr -d '\r' || true)
+	if [ -n "$SERVER_SHA" ]; then
+		printf '%s\n' "$SERVER_SHA" > "$SERVER_SHA_FILE"
+	fi
+}
+
+is_valid_png() {
+	[ -s "$TMP" ] || return 1
+	MAGIC=$(dd if="$TMP" bs=1 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n\r')
+	[ "$MAGIC" = "89504e470d0a1a0a" ]
+}
+
+request_url() {
+	printf '%s?t=%s\n' "$1" "$(date +%s)"
 }
 
 download_with_curl() {
-	URL=$1
 	CURL_BIN=$(find_curl_bin) || return 1
-	rm -f "$TMP" "$HDR_TMP"
+	REQUEST_URL=$(request_url "$LOCAL_URL")
+	rm -f "$TMP" "$HDR_TMP" "$ERR_TMP"
+	echo "$(date '+%Y-%m-%d %H:%M:%S') requested_url=$REQUEST_URL"
 
+	set +e
 	if [ "$UPDATE_ONLY_IF_CHANGED" = "1" ] && [ -s "$ETAG_FILE" ] && [ -s "$LAST_MODIFIED_FILE" ]; then
-		"$CURL_BIN" -sS --connect-timeout 15 --max-time 45 \
+		"$CURL_BIN" -fL -sS --connect-timeout 15 --max-time 45 \
 			-D "$HDR_TMP" \
+			-H "Cache-Control: no-cache" -H "Pragma: no-cache" \
 			-H "If-None-Match: $(sed -n '1p' "$ETAG_FILE")" \
 			-H "If-Modified-Since: $(sed -n '1p' "$LAST_MODIFIED_FILE")" \
 			-o "$TMP" \
-			"$URL" >/dev/null 2>&1 || return 1
+			"$REQUEST_URL" 2>"$ERR_TMP"
 	elif [ "$UPDATE_ONLY_IF_CHANGED" = "1" ] && [ -s "$ETAG_FILE" ]; then
-		"$CURL_BIN" -sS --connect-timeout 15 --max-time 45 \
+		"$CURL_BIN" -fL -sS --connect-timeout 15 --max-time 45 \
 			-D "$HDR_TMP" \
+			-H "Cache-Control: no-cache" -H "Pragma: no-cache" \
 			-H "If-None-Match: $(sed -n '1p' "$ETAG_FILE")" \
 			-o "$TMP" \
-			"$URL" >/dev/null 2>&1 || return 1
+			"$REQUEST_URL" 2>"$ERR_TMP"
 	elif [ "$UPDATE_ONLY_IF_CHANGED" = "1" ] && [ -s "$LAST_MODIFIED_FILE" ]; then
-		"$CURL_BIN" -sS --connect-timeout 15 --max-time 45 \
+		"$CURL_BIN" -fL -sS --connect-timeout 15 --max-time 45 \
 			-D "$HDR_TMP" \
+			-H "Cache-Control: no-cache" -H "Pragma: no-cache" \
 			-H "If-Modified-Since: $(sed -n '1p' "$LAST_MODIFIED_FILE")" \
 			-o "$TMP" \
-			"$URL" >/dev/null 2>&1 || return 1
+			"$REQUEST_URL" 2>"$ERR_TMP"
 	else
-		"$CURL_BIN" -sS --connect-timeout 15 --max-time 45 \
+		"$CURL_BIN" -fL -sS --connect-timeout 15 --max-time 45 \
 			-D "$HDR_TMP" \
+			-H "Cache-Control: no-cache" -H "Pragma: no-cache" \
 			-o "$TMP" \
-			"$URL" >/dev/null 2>&1 || return 1
+			"$REQUEST_URL" 2>"$ERR_TMP"
+	fi
+	STATUS=$?
+	set -e
+	if [ "$STATUS" -ne 0 ]; then
+		cat "$ERR_TMP" >&2
+		return 1
 	fi
 
 	HTTP_CODE=$(awk '/^HTTP/{code=$2} END{print code}' "$HDR_TMP")
@@ -201,7 +221,7 @@ download_with_curl() {
 			return 3
 			;;
 		200)
-			[ -s "$TMP" ] || return 1
+			is_valid_png || { echo "downloaded response is not a valid PNG" >&2; return 1; }
 			save_response_headers
 			return 0
 			;;
@@ -238,96 +258,47 @@ download_with_wget() {
 }
 
 download_image() {
-	URL=$1
-	download_with_curl "$URL"
-	STATUS=$?
-	if [ "$STATUS" -eq 0 ]; then
-		return 0
-	fi
-	if [ "$STATUS" -eq 3 ]; then
-		return 3
-	fi
-	download_with_wget "$URL"
-	STATUS=$?
-	if [ "$STATUS" -eq 0 ]; then
-		return 0
-	fi
-	if [ "$STATUS" -eq 3 ]; then
-		return 3
-	fi
-	return 1
+	download_with_curl
 }
 
 wifi_enable
 apply_runtime_config
 lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null || true
 
-SOURCE=""
 CHANGED=0
 CYCLE_OK=0
 
-if download_image "$LOCAL_URL"; then
-	SOURCE="local"
-else
-	STATUS=$?
-	if [ "$STATUS" -eq 3 ]; then
-		SOURCE="local-304"
-		CYCLE_OK=1
-	elif download_image "$LEGACY_LOCAL_URL"; then
-		SOURCE="legacy-local"
-	else
-		STATUS=$?
-		if [ "$STATUS" -eq 3 ]; then
-			SOURCE="legacy-local-304"
-			CYCLE_OK=1
-		else
-			rm -f "$TMP"
-			if [ -s "$TOKEN_FILE" ]; then
-				TOKEN=$(sed -n '1p' "$TOKEN_FILE")
-				CURL_BIN=$(find_curl_bin || true)
-				if [ -n "${CURL_BIN:-}" ] && [ -n "$TOKEN" ]; then
-					"$CURL_BIN" -fsS --connect-timeout 15 --max-time 45 \
-						-H "Authorization: Bearer $TOKEN" \
-						-o "$TMP" \
-						"$PUBLIC_URL" >/dev/null 2>&1 || true
-					if [ -s "$TMP" ]; then
-						SOURCE="public"
-					fi
-				fi
-				unset TOKEN
-			fi
-		fi
-	fi
-fi
-
-if [ "$SOURCE" = "local-304" ] || [ "$SOURCE" = "legacy-local-304" ]; then
-	echo "$(date '+%Y-%m-%d %H:%M:%S') image not modified via $SOURCE"
-elif [ -n "$SOURCE" ] && [ -s "$TMP" ]; then
+download_image || STATUS=$?
+STATUS=${STATUS:-0}
+if [ "$STATUS" -eq 3 ]; then
+	CYCLE_OK=1
+	echo "$(date '+%Y-%m-%d %H:%M:%S') image not modified via $LOCAL_URL"
+elif [ "$STATUS" -ne 0 ]; then
+	fail "download failed for $LOCAL_URL"
+elif [ -s "$TMP" ]; then
+	DOWNLOADED_SHA=$(sha256sum "$TMP" | awk '{print $1}')
+	SERVER_SHA=$(cat "$SERVER_SHA_FILE" 2>/dev/null || echo unknown)
+	echo "$(date '+%Y-%m-%d %H:%M:%S') downloaded_file=$TMP downloaded_sha256=$DOWNLOADED_SHA server_sha256=$SERVER_SHA"
 	if [ "$UPDATE_ONLY_IF_CHANGED" = "1" ] && [ -s "$IMG" ] && cmp -s "$TMP" "$IMG" 2>/dev/null; then
-		echo "$(date '+%Y-%m-%d %H:%M:%S') downloaded image unchanged via $SOURCE"
+		echo "$(date '+%Y-%m-%d %H:%M:%S') image unchanged via $LOCAL_URL"
+		rm -f "$TMP"
 		CYCLE_OK=1
 	else
-		mv -f "$TMP" "$IMG"
-		cp -f "$IMG" "$LEGACY_IMG" 2>/dev/null || true
-		echo "$(date '+%Y-%m-%d %H:%M:%S') image updated via $SOURCE"
+		mv -f "$TMP" "$IMG" || fail "atomic image replacement failed"
 		CHANGED=1
 		CYCLE_OK=1
+		echo "$(date '+%Y-%m-%d %H:%M:%S') image atomically replaced: $IMG"
 	fi
 else
-	echo "$(date '+%Y-%m-%d %H:%M:%S') download failed; using previous image"
+	fail "device-specific download produced no file: $LOCAL_URL"
 fi
 
 DISPLAY_OK=0
 if [ "$CHANGED" -eq 1 ] && [ -s "$IMG" ]; then
-	if ! "$EIPS_BIN" -c; then
-		echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed (eips -c)"
-	elif ! "$EIPS_BIN" -f; then
-		echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed (eips -f)"
-	elif ! "$EIPS_BIN" -g "$IMG"; then
-		echo "$(date '+%Y-%m-%d %H:%M:%S') display update failed (eips -g)"
-	else
-		DISPLAY_OK=1
-	fi
+	"$EIPS_BIN" -c; EIPS_STATUS=$?; echo "$(date '+%Y-%m-%d %H:%M:%S') eips_clear_exit=$EIPS_STATUS"; [ "$EIPS_STATUS" -eq 0 ] || fail "eips -c failed"
+	"$EIPS_BIN" -f; EIPS_STATUS=$?; echo "$(date '+%Y-%m-%d %H:%M:%S') eips_full_exit=$EIPS_STATUS"; [ "$EIPS_STATUS" -eq 0 ] || fail "eips -f failed"
+	"$EIPS_BIN" -g "$IMG"; EIPS_STATUS=$?; echo "$(date '+%Y-%m-%d %H:%M:%S') eips_display_file=$IMG eips_exit=$EIPS_STATUS"; [ "$EIPS_STATUS" -eq 0 ] || fail "eips -g failed"
+	DISPLAY_OK=1
 fi
 
 if [ "$CYCLE_OK" -eq 1 ] && [ -f "$STATUS_SENDER" ]; then

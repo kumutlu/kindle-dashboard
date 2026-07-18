@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import http.client
+import hashlib
 import json
 import tempfile
 import threading
@@ -102,6 +103,10 @@ class DeviceImageServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("ETag", headers)
         self.assertIn("Last-Modified", headers)
+        self.assertEqual(
+            headers["X-Image-SHA256"],
+            hashlib.sha256(self.device_image.read_bytes()).hexdigest(),
+        )
 
     def test_device_endpoint_supports_if_none_match(self):
         _, headers, _ = self.request("/device/default-kindle/image.png")

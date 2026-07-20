@@ -22,6 +22,11 @@ from device_registry import (
     RegistryValidationError,
 )
 import special_events
+from providers.local_task_provider import LocalTaskProvider
+from themes.registry import ThemeRegistry
+from themes.theme import ThemeRenderContext
+from themes.todo.theme import TodoTheme
+from themes.weather.theme import WeatherTheme
 
 W, H = 758, 1024
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -2768,89 +2773,115 @@ def _write_render_state(config, state_file):
         print(f"Warning: Failed to save render state: {exc}")
 
 
+def _render_existing_weather_theme(config, context):
+    """Run an existing renderer unchanged and return its Pillow image."""
+    resolution = tuple(context.resolution)
+    with tempfile.TemporaryDirectory(prefix="kindle-weather-theme-") as directory:
+        temporary_dir = Path(directory)
+        generated_path = temporary_dir / "weather.png"
+        if resolution == (600, 800):
+            if config["theme"] == "minimal_weather":
+                token = ACTIVE_OUTPUT.set(generated_path)
+                try:
+                    render_minimal_weather_600x800(config)
+                finally:
+                    ACTIVE_OUTPUT.reset(token)
+            elif config["theme"] == "family_dashboard":
+                renderer = THEME_RENDERERS.get(config["theme"])
+                if renderer is None:
+                    raise ValueError("theme renderer is not available")
+                legacy_path = temporary_dir / "weather-758x1024.png"
+                token = ACTIVE_OUTPUT.set(legacy_path)
+                try:
+                    renderer(config)
+                finally:
+                    ACTIVE_OUTPUT.reset(token)
+                with Image.open(legacy_path) as generated:
+                    return ImageOps.fit(
+                        generated.convert("L"),
+                        resolution,
+                        method=Image.Resampling.LANCZOS,
+                        centering=(0.5, 0.5),
+                    )
+            else:
+                raise ValueError(
+                    "600x800 devices currently support minimal_weather and family_dashboard"
+                )
+        else:
+            if resolution != (W, H):
+                raise ValueError(
+                    "existing dashboard themes currently require 758x1024"
+                )
+            renderer = THEME_RENDERERS.get(config["theme"])
+            if renderer is None:
+                raise ValueError("theme renderer is not available")
+            token = ACTIVE_OUTPUT.set(generated_path)
+            try:
+                renderer(config)
+            finally:
+                ACTIVE_OUTPUT.reset(token)
+
+        with Image.open(generated_path) as generated:
+            return generated.copy()
+
+
+def build_theme_registry(project_root=PROJECT_DIR, task_provider=None):
+    registry = ThemeRegistry()
+    weather_theme = WeatherTheme(_render_existing_weather_theme)
+    for theme_id in THEME_RENDERERS:
+        registry.register(theme_id, weather_theme)
+    provider = task_provider or LocalTaskProvider(project_root)
+    registry.register("todo", TodoTheme(provider))
+    return registry
+
+
+def _save_rendered_theme_image(image, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    os.close(descriptor)
+    temporary_output = Path(temporary_name)
+    try:
+        save_kwargs = {"format": "PNG", "optimize": False}
+        if image.size == (600, 800):
+            save_kwargs["compress_level"] = 0
+        image.save(temporary_output, **save_kwargs)
+        os.replace(temporary_output, output_path)
+        os.chmod(output_path, 0o644)
+    finally:
+        temporary_output.unlink(missing_ok=True)
+    return output_path
+
+
 def render_dashboard(
     config,
     output_path,
     resolution=(W, H),
     state_file=None,
+    device_id="default-kindle",
+    project_root=PROJECT_DIR,
+    task_provider=None,
+    theme_registry=None,
 ):
     resolution = tuple(resolution or (W, H))
-    if resolution == (600, 800):
-        output_path = Path(output_path)
-        if config["theme"] == "minimal_weather":
-            token = ACTIVE_OUTPUT.set(output_path)
-            try:
-                render_minimal_weather_600x800(config)
-            finally:
-                ACTIVE_OUTPUT.reset(token)
-        elif config["theme"] == "family_dashboard":
-            renderer = THEME_RENDERERS.get(config["theme"])
-            if renderer is None:
-                raise ValueError("theme renderer is not available")
-            temp_legacy_output = output_path.with_suffix(".758x1024.tmp.png")
-            token = ACTIVE_OUTPUT.set(temp_legacy_output)
-            try:
-                renderer(config)
-            finally:
-                ACTIVE_OUTPUT.reset(token)
-            with Image.open(temp_legacy_output) as generated:
-                resized = ImageOps.fit(
-                    generated.convert("L"),
-                    resolution,
-                    method=Image.Resampling.LANCZOS,
-                    centering=(0.5, 0.5),
-                )
-                descriptor, temporary_name = tempfile.mkstemp(
-                    prefix=f".{output_path.name}.",
-                    suffix=".tmp",
-                    dir=output_path.parent,
-                )
-                os.close(descriptor)
-                temporary_output = Path(temporary_name)
-                try:
-                    resized.save(
-                        temporary_output,
-                        format="PNG",
-                        optimize=False,
-                        compress_level=0,
-                    )
-                    os.replace(temporary_output, output_path)
-                finally:
-                    temporary_output.unlink(missing_ok=True)
-            temp_legacy_output.unlink(missing_ok=True)
-        else:
-            raise ValueError(
-                "600x800 devices currently support minimal_weather and family_dashboard"
-            )
-        with Image.open(output_path) as generated:
-            if generated.size != resolution:
-                raise ValueError(
-                    "generated image does not match device resolution"
-                )
-        if state_file is not None:
-            _write_render_state(config, state_file)
-        return Path(output_path)
-
-    if resolution != (W, H):
-        raise ValueError(
-            "existing dashboard themes currently require 758x1024"
-        )
-    renderer = THEME_RENDERERS.get(config["theme"])
-    if renderer is None:
-        raise ValueError("theme renderer is not available")
-    token = ACTIVE_OUTPUT.set(Path(output_path))
-    try:
-        renderer(config)
-    finally:
-        ACTIVE_OUTPUT.reset(token)
-    with Image.open(output_path) as generated:
-        if generated.size != resolution:
-            raise ValueError(
-                "generated image does not match device resolution"
-            )
+    context = ThemeRenderContext(
+        device_id=device_id,
+        resolution=resolution,
+        timezone=config["timezone"],
+    )
+    registry = theme_registry or build_theme_registry(
+        project_root=project_root,
+        task_provider=task_provider,
+    )
+    image = registry.render(config["theme"], config, context)
+    output_path = _save_rendered_theme_image(image, output_path)
     if state_file is not None:
         _write_render_state(config, state_file)
-    return Path(output_path)
+    return output_path
 
 
 def _atomic_copy(source, destination):
@@ -2912,6 +2943,8 @@ def render_device(device_id, force=False, registry=None):
                 device.image_path,
                 resolution=resolution,
                 state_file=state_path,
+                device_id=device.id,
+                project_root=registry.project_root,
             )
         if device.id == "default-kindle":
             _atomic_copy(

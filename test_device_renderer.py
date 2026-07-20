@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from device_registry import (
     DeviceNotFoundError,
     DeviceRegistry,
 )
+from providers.local_task_provider import LocalTaskProvider
 
 
 class DeviceRendererTests(unittest.TestCase):
@@ -47,6 +49,16 @@ class DeviceRendererTests(unittest.TestCase):
                 "ts": {"online": 0, "total": 0},
             },
         )
+
+    def test_atomic_rendered_image_has_world_readable_permissions(self):
+        output_path = self.root / "rendered.png"
+
+        weather_image._save_rendered_theme_image(
+            Image.new("1", (600, 800), 1),
+            output_path,
+        )
+
+        self.assertEqual(stat.S_IMODE(output_path.stat().st_mode), 0o644)
 
     def create_test_event(self, start_date, end_date):
         return special_events.create_event(
@@ -472,6 +484,53 @@ class DeviceRendererTests(unittest.TestCase):
         self.assertEqual(result["theme"], "family_dashboard")
         with Image.open(kt4.image_path) as generated:
             self.assertEqual(generated.size, (600, 800))
+
+    def test_todo_theme_renders_device_tasks_without_weather_fetches(self):
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "todo"
+        kitchen.config_path.write_text(json.dumps(config), encoding="utf-8")
+        provider = LocalTaskProvider(self.root)
+        provider.create_task(kitchen.id, "Buy milk")
+        provider.create_task(kitchen.id, "Call GP")
+
+        with mock.patch.object(weather_image, "collect_dashboard_data") as weather:
+            result = weather_image.render_device(kitchen.id, registry=self.registry)
+
+        weather.assert_not_called()
+        self.assertEqual(result["theme"], "todo")
+        with Image.open(kitchen.image_path) as generated:
+            self.assertEqual(generated.size, (758, 1024))
+            self.assertEqual(generated.mode, "1")
+
+    def test_todo_theme_renders_600x800_without_weather_theme_restriction(self):
+        kt4 = self.registry.add({
+            "id": "kindle-todo",
+            "name": "Todo Kindle",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-todo/config.json",
+            "image_path": "devices/kindle-todo/image.png",
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "todo"
+        kt4.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        result = weather_image.render_device(kt4.id, registry=self.registry)
+
+        self.assertEqual(result["resolution"], [600, 800])
+        with Image.open(kt4.image_path) as generated:
+            self.assertEqual(generated.size, (600, 800))
+            self.assertEqual(generated.mode, "1")
 
 
 if __name__ == "__main__":

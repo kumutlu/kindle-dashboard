@@ -433,6 +433,147 @@ class SettingsServerTests(unittest.TestCase):
                 text,
             )
 
+    def test_todo_theme_ui_has_selected_device_task_management(self):
+        status, _, body = self.request("GET", "/settings")
+        text = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn('name="theme" value="todo"', text)
+        for marker in (
+            'id="todo-manager"',
+            'id="todo-add-form"',
+            'id="todo-title"',
+            'id="todo-incomplete-list"',
+            'id="todo-completed-list"',
+            'data-todo-drag-handle',
+            "loadTodoTasks(selected)",
+            "/tasks/reorder",
+        ):
+            self.assertIn(marker, text)
+
+    def test_device_task_api_crud_toggle_reorder_and_csrf(self):
+        status, _, body = self.post_json(
+            "/api/device/default-kindle/tasks", {"title": "Denied"}
+        )
+        self.assertEqual(status, 403, body)
+
+        csrf = self.csrf_token()
+        first_status, _, first_body = self.post_json(
+            "/api/device/default-kindle/tasks",
+            {"title": "First"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        second_status, _, second_body = self.post_json(
+            "/api/device/default-kindle/tasks",
+            {"title": "Second"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual((first_status, second_status), (201, 201))
+        first = json.loads(first_body)["task"]
+        second = json.loads(second_body)["task"]
+
+        status, _, body = self.request(
+            "PUT",
+            f'/api/device/default-kindle/tasks/{first["id"]}',
+            body=json.dumps({"title": "First edited", "completed": True}),
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": csrf,
+            },
+        )
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["task"]["completed"])
+
+        status, _, body = self.request(
+            "PUT",
+            f'/api/device/default-kindle/tasks/{first["id"]}',
+            body=json.dumps({"completed": False}),
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": csrf,
+            },
+        )
+        self.assertEqual(status, 200, body)
+
+        status, _, body = self.request(
+            "PUT",
+            "/api/device/default-kindle/tasks/reorder",
+            body=json.dumps({
+                "completed": False,
+                "task_ids": [first["id"], second["id"]],
+            }),
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": csrf,
+            },
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            [task["title"] for task in json.loads(body)["tasks"]],
+            ["First edited", "Second"],
+        )
+
+        status, _, body = self.request(
+            "DELETE",
+            f'/api/device/default-kindle/tasks/{second["id"]}',
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 200, body)
+        status, _, body = self.request(
+            "GET", "/api/device/default-kindle/tasks"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [task["title"] for task in json.loads(body)["tasks"]],
+            ["First edited"],
+        )
+
+    def test_task_api_is_device_isolated_and_renders_only_todo_devices(self):
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+        })
+        kitchen_config = dict(weather_image.DEFAULT_CONFIG)
+        kitchen_config["theme"] = "todo"
+        settings_server.atomic_write_config(kitchen.config_path, kitchen_config)
+        csrf = self.csrf_token()
+
+        status, _, _ = self.post_json(
+            "/api/device/default-kindle/tasks",
+            {"title": "Default task"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self.rendered_device_ids, [])
+
+        status, _, _ = self.post_json(
+            "/api/device/kitchen-kindle/tasks",
+            {"title": "Kitchen task"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self.rendered_device_ids, ["kitchen-kindle"])
+
+        _, _, default_body = self.request(
+            "GET", "/api/device/default-kindle/tasks"
+        )
+        _, _, kitchen_body = self.request(
+            "GET", "/api/device/kitchen-kindle/tasks"
+        )
+        self.assertEqual(
+            json.loads(default_body)["tasks"][0]["title"], "Default task"
+        )
+        self.assertEqual(
+            json.loads(kitchen_body)["tasks"][0]["title"], "Kitchen task"
+        )
+
+        status, _, _ = self.request("GET", "/api/device/missing/tasks")
+        self.assertEqual(status, 404)
+
     def test_location_card_uses_city_search_with_advanced_fallback(self):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")

@@ -22,6 +22,7 @@ from device_registry import (
 )
 from kindle_device import DeviceError, KindleDevice, SSH_PROFILES
 from kindle_low_power import build_low_power_deployment
+from providers.local_task_provider import LocalTaskProvider, TaskNotFoundError
 from weather_image import (
     DEFAULT_CONFIG,
     geocode_locations,
@@ -51,6 +52,15 @@ DEVICE_PAIR_RE = re.compile(
 )
 DEVICE_RESET_INSTALLER_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/installer-token/reset$"
+)
+DEVICE_TASKS_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/tasks$"
+)
+DEVICE_TASK_REORDER_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/tasks/reorder$"
+)
+DEVICE_TASK_ITEM_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/tasks/([0-9a-f-]{36})$"
 )
 KINDLE_INSTALL_RE = re.compile(
     r"^/install/kindle/([a-z0-9][a-z0-9-]{0,63})$"
@@ -2167,6 +2177,55 @@ button:disabled {{
   opacity: 0.5;
   cursor: not-allowed;
 }}
+.todo-manager {{
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}}
+.todo-add-row {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  margin-bottom: 18px;
+}}
+.todo-add-row input {{ min-width: 0; }}
+.todo-group {{ margin-top: 18px; }}
+.todo-group h3 {{
+  margin: 0 0 8px;
+  font-size: .86rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}}
+.todo-list {{ display: grid; gap: 8px; }}
+.todo-row {{
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--card);
+}}
+.todo-row.dragging {{ opacity: .45; }}
+.todo-row-title {{ overflow-wrap: anywhere; font-weight: 650; }}
+.todo-row.completed .todo-row-title {{ text-decoration: line-through; color: var(--muted); }}
+.todo-drag, .todo-mini-action {{
+  min-height: 32px;
+  min-width: 32px;
+  padding: 4px 8px;
+  font-size: .8rem;
+}}
+.todo-drag {{ cursor: grab; color: var(--muted); }}
+.todo-row-actions {{ display: flex; gap: 5px; }}
+.todo-status {{ min-height: 22px; color: var(--muted); font-size: .82rem; }}
+.todo-empty {{ padding: 14px; color: var(--muted); border: 1px dashed var(--line); border-radius: 9px; }}
+@media (max-width: 640px) {{
+  .todo-row {{ grid-template-columns: auto auto minmax(0, 1fr); }}
+  .todo-row-actions {{ grid-column: 2 / -1; justify-content: flex-end; }}
+}}
 
 /* Content tab Display Toggles */
 .toggle-list {{
@@ -2894,6 +2953,24 @@ button:disabled {{
   <h2>Appearance</h2>
   <p class="section-note">Choose the dashboard’s visual focus.</p>
   <div class="theme-list">{theme_cards}</div>
+  <div class="todo-manager" id="todo-manager" hidden>
+    <h3>Todo List</h3>
+    <p class="section-note">Tasks belong only to the currently selected device. Drag within a section or use the arrow buttons to reorder.</p>
+    <div class="todo-add-row" id="todo-add-form">
+      <label class="sr-only" for="todo-title">New task</label>
+      <input type="text" id="todo-title" maxlength="200" placeholder="Add a task" autocomplete="off">
+      <button type="button" id="todo-add-button">Add task</button>
+    </div>
+    <p class="todo-status" id="todo-status" role="status"></p>
+    <div class="todo-group">
+      <h3>Incomplete</h3>
+      <div class="todo-list" id="todo-incomplete-list"></div>
+    </div>
+    <div class="todo-group">
+      <h3>Completed</h3>
+      <div class="todo-list" id="todo-completed-list"></div>
+    </div>
+  </div>
 </section>
 
 <!-- 5. Content Tab -->
@@ -3279,6 +3356,7 @@ async function loadDeviceState() {{
   }} catch (e) {{
     console.error("Failed to load device config:", e);
   }}
+  loadTodoTasks(selected);
   
   // Relative image paths belong to the image server, never the settings port.
   const resolvedImageUrl = resolveDeviceImageUrl(imageUrl, selected);
@@ -3381,6 +3459,7 @@ function applyDeviceConfigToForm(config) {{
     const themeInput = document.querySelector(`input[name="theme"][value="${{config.theme}}"]`);
     if (themeInput && !themeInput.disabled) themeInput.checked = true;
   }}
+  updateTodoManagerVisibility();
   if (config.refresh_interval_minutes !== undefined) {{
     const refreshInput = document.querySelector('[name="refresh_interval_minutes"]');
     if (refreshInput) refreshInput.value = String(config.refresh_interval_minutes);
@@ -3404,6 +3483,232 @@ function applyDeviceConfigToForm(config) {{
     if (input && typeof config[name] === "boolean") input.checked = config[name];
   }});
 }}
+
+const todoManager = document.getElementById("todo-manager");
+const todoTitleInput = document.getElementById("todo-title");
+const todoAddButton = document.getElementById("todo-add-button");
+const todoIncompleteList = document.getElementById("todo-incomplete-list");
+const todoCompletedList = document.getElementById("todo-completed-list");
+const todoStatus = document.getElementById("todo-status");
+let todoTasks = [];
+let draggedTodoId = null;
+
+function selectedTodoDevice() {{
+  return localStorage.getItem(selectedDeviceKey) || "default-kindle";
+}}
+
+function updateTodoManagerVisibility() {{
+  if (!todoManager) return;
+  const selectedTheme = document.querySelector('input[name="theme"]:checked');
+  todoManager.hidden = !selectedTheme || selectedTheme.value !== "todo";
+}}
+
+function todoSetStatus(message, isError = false) {{
+  if (!todoStatus) return;
+  todoStatus.textContent = message || "";
+  todoStatus.style.color = isError ? "var(--danger)" : "var(--muted)";
+}}
+
+async function todoMutation(path, options) {{
+  todoSetStatus("Saving…");
+  try {{
+    const result = await deviceApi(path, options);
+    todoTasks = result.tasks || [];
+    renderTodoTasks();
+    todoSetStatus(result.rendered ? "Saved and preview regenerated" : "Saved");
+    if (result.rendered) {{
+      const preview = document.getElementById("live-dashboard-preview");
+      if (preview) preview.src = resolveDeviceImageUrl(null, selectedTodoDevice()) + `?t=${{Date.now()}}`;
+    }}
+    return result;
+  }} catch (error) {{
+    todoSetStatus(error.message, true);
+    throw error;
+  }}
+}}
+
+async function loadTodoTasks(deviceId) {{
+  if (!todoManager) return;
+  try {{
+    const result = await deviceApi(`/api/device/${{encodeURIComponent(deviceId)}}/tasks`);
+    if (deviceId !== selectedTodoDevice()) return;
+    todoTasks = result.tasks || [];
+    renderTodoTasks();
+    todoSetStatus("");
+  }} catch (error) {{
+    todoTasks = [];
+    renderTodoTasks();
+    todoSetStatus("Could not load tasks: " + error.message, true);
+  }}
+}}
+
+async function saveTodoOrder(completed) {{
+  const list = completed ? todoCompletedList : todoIncompleteList;
+  const taskIds = Array.from(list.querySelectorAll(".todo-row")).map(row => row.dataset.taskId);
+  await todoMutation(
+    `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/reorder`,
+    {{
+      method: "PUT",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ completed, task_ids: taskIds }})
+    }}
+  );
+}}
+
+function moveTodoTask(task, direction) {{
+  const group = todoTasks.filter(item => item.completed === task.completed);
+  const index = group.findIndex(item => item.id === task.id);
+  const target = index + direction;
+  if (target < 0 || target >= group.length) return;
+  [group[index], group[target]] = [group[target], group[index]];
+  const other = todoTasks.filter(item => item.completed !== task.completed);
+  todoTasks = task.completed ? other.concat(group) : group.concat(other);
+  renderTodoTasks();
+  saveTodoOrder(task.completed).catch(() => loadTodoTasks(selectedTodoDevice()));
+}}
+
+function createTodoRow(task) {{
+  const row = document.createElement("div");
+  row.className = "todo-row" + (task.completed ? " completed" : "");
+  row.dataset.taskId = task.id;
+  row.dataset.completed = String(task.completed);
+  row.draggable = true;
+
+  const drag = document.createElement("button");
+  drag.type = "button";
+  drag.className = "todo-drag";
+  drag.setAttribute("data-todo-drag-handle", "true");
+  drag.setAttribute("aria-label", "Drag to reorder");
+  drag.title = "Drag to reorder";
+  drag.textContent = "≡";
+
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.checked = task.completed;
+  toggle.setAttribute("aria-label", `Mark ${{task.title}} ${{task.completed ? "incomplete" : "complete"}}`);
+  toggle.addEventListener("change", () => {{
+    todoMutation(
+      `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/${{task.id}}`,
+      {{
+        method: "PUT",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ completed: toggle.checked }})
+      }}
+    ).catch(() => loadTodoTasks(selectedTodoDevice()));
+  }});
+
+  const title = document.createElement("span");
+  title.className = "todo-row-title";
+  title.textContent = task.title;
+
+  const actions = document.createElement("div");
+  actions.className = "todo-row-actions";
+  const action = (label, titleText, callback) => {{
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "todo-mini-action";
+    button.textContent = label;
+    button.title = titleText;
+    button.setAttribute("aria-label", titleText);
+    button.addEventListener("click", callback);
+    return button;
+  }};
+  actions.append(
+    action("↑", "Move task up", () => moveTodoTask(task, -1)),
+    action("↓", "Move task down", () => moveTodoTask(task, 1)),
+    action("Edit", "Edit task", () => {{
+      const nextTitle = window.prompt("Edit task", task.title);
+      if (nextTitle === null || nextTitle.trim() === task.title) return;
+      todoMutation(
+        `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/${{task.id}}`,
+        {{
+          method: "PUT",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ title: nextTitle }})
+        }}
+      ).catch(() => loadTodoTasks(selectedTodoDevice()));
+    }}),
+    action("Delete", "Delete task", () => {{
+      if (!window.confirm(`Delete “${{task.title}}”?`)) return;
+      todoMutation(
+        `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/${{task.id}}`,
+        {{ method: "DELETE" }}
+      ).catch(() => loadTodoTasks(selectedTodoDevice()));
+    }})
+  );
+
+  row.addEventListener("dragstart", event => {{
+    draggedTodoId = task.id;
+    row.classList.add("dragging");
+    event.dataTransfer.effectAllowed = "move";
+  }});
+  row.addEventListener("dragend", () => {{
+    draggedTodoId = null;
+    row.classList.remove("dragging");
+  }});
+  row.addEventListener("dragover", event => {{
+    const dragged = todoTasks.find(item => item.id === draggedTodoId);
+    if (!dragged || dragged.completed !== task.completed) return;
+    event.preventDefault();
+  }});
+  row.addEventListener("drop", event => {{
+    event.preventDefault();
+    const dragged = todoTasks.find(item => item.id === draggedTodoId);
+    if (!dragged || dragged.completed !== task.completed || dragged.id === task.id) return;
+    const group = todoTasks.filter(item => item.completed === task.completed && item.id !== dragged.id);
+    group.splice(group.findIndex(item => item.id === task.id), 0, dragged);
+    const other = todoTasks.filter(item => item.completed !== task.completed);
+    todoTasks = task.completed ? other.concat(group) : group.concat(other);
+    renderTodoTasks();
+    saveTodoOrder(task.completed).catch(() => loadTodoTasks(selectedTodoDevice()));
+  }});
+
+  row.append(drag, toggle, title, actions);
+  return row;
+}}
+
+function renderTodoTasks() {{
+  if (!todoIncompleteList || !todoCompletedList) return;
+  todoIncompleteList.replaceChildren();
+  todoCompletedList.replaceChildren();
+  const groups = [
+    [todoIncompleteList, todoTasks.filter(task => !task.completed)],
+    [todoCompletedList, todoTasks.filter(task => task.completed)]
+  ];
+  groups.forEach(([list, tasks]) => {{
+    if (!tasks.length) {{
+      const empty = document.createElement("div");
+      empty.className = "todo-empty";
+      empty.textContent = "No tasks";
+      list.append(empty);
+      return;
+    }}
+    tasks.forEach(task => list.append(createTodoRow(task)));
+  }});
+}}
+
+if (todoAddButton && todoTitleInput) {{
+  const addTodo = () => {{
+    const title = todoTitleInput.value.trim();
+    if (!title) return;
+    todoMutation(
+      `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks`,
+      {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ title }})
+      }}
+    ).then(() => {{ todoTitleInput.value = ""; }}).catch(() => {{}});
+  }};
+  todoAddButton.addEventListener("click", addTodo);
+  todoTitleInput.addEventListener("keydown", event => {{
+    if (event.key === "Enter") {{ event.preventDefault(); addTodo(); }}
+  }});
+}}
+document.querySelectorAll('input[name="theme"]').forEach(input => {{
+  input.addEventListener("change", updateTodoManagerVisibility);
+}});
+updateTodoManagerVisibility();
 
 function applySelectedDevice(deviceId) {{
   if (!selectedDeviceControl) return;
@@ -4675,10 +4980,13 @@ def make_handler(
     geocode,
     registry,
     image_server_port=8765,
+    task_provider=None,
 ):
     config_path = Path(config_path)
     csrf_token = secrets.token_urlsafe(32)
     update_lock = threading.Lock()
+    if task_provider is None:
+        task_provider = LocalTaskProvider(registry.project_root)
 
     class SettingsHandler(BaseHTTPRequestHandler):
         server_version = "KindleSettings"
@@ -4749,6 +5057,10 @@ def make_handler(
                     )
                     return
                 self.send_json(200, {"devices": public_api_devices})
+                return
+            device_tasks_match = DEVICE_TASKS_RE.fullmatch(parsed.path)
+            if device_tasks_match is not None:
+                self.handle_tasks_get(device_tasks_match.group(1))
                 return
             device_config_match = DEVICE_CONFIG_RE.fullmatch(parsed.path)
             if device_config_match is not None:
@@ -4896,6 +5208,10 @@ def make_handler(
             if parsed.path == "/api/special-events":
                 self.handle_special_events_create()
                 return
+            device_tasks_match = DEVICE_TASKS_RE.fullmatch(parsed.path)
+            if device_tasks_match is not None:
+                self.handle_task_create(device_tasks_match.group(1))
+                return
             if parsed.path == "/settings":
                 self.handle_form_post()
                 return
@@ -4962,6 +5278,16 @@ def make_handler(
 
         def do_PUT(self):
             parsed = urlsplit(self.path)
+            task_reorder_match = DEVICE_TASK_REORDER_RE.fullmatch(parsed.path)
+            if task_reorder_match is not None:
+                self.handle_task_reorder(task_reorder_match.group(1))
+                return
+            task_item_match = DEVICE_TASK_ITEM_RE.fullmatch(parsed.path)
+            if task_item_match is not None:
+                self.handle_task_update(
+                    task_item_match.group(1), task_item_match.group(2)
+                )
+                return
             special_match = SPECIAL_EVENT_RE.fullmatch(parsed.path)
             if special_match is None:
                 self.send_bytes(404, b"", "text/plain")
@@ -4970,11 +5296,146 @@ def make_handler(
 
         def do_DELETE(self):
             parsed = urlsplit(self.path)
+            task_item_match = DEVICE_TASK_ITEM_RE.fullmatch(parsed.path)
+            if task_item_match is not None:
+                self.handle_task_delete(
+                    task_item_match.group(1), task_item_match.group(2)
+                )
+                return
             special_match = SPECIAL_EVENT_RE.fullmatch(parsed.path)
             if special_match is None:
                 self.send_bytes(404, b"", "text/plain")
                 return
             self.handle_special_event_delete(special_match.group(1))
+
+        @staticmethod
+        def task_dicts(tasks):
+            return [task.to_dict() for task in tasks]
+
+        def require_task_device(self, device_id):
+            return registry.get(device_id, require_enabled=True)
+
+        def render_todo_if_selected(self, selected):
+            config = load_effective_device_config(selected, registry)
+            if config.get("theme") != "todo":
+                return False
+            render_selected(selected.id)
+            return True
+
+        def handle_tasks_get(self, device_id):
+            try:
+                self.require_task_device(device_id)
+                tasks = task_provider.list_tasks(device_id)
+                self.send_json(
+                    200,
+                    {"ok": True, "device_id": device_id, "tasks": self.task_dicts(tasks)},
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except ValueError as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_task_create(self, device_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                candidate = self.read_json()
+                if set(candidate) != {"title"}:
+                    raise ValueError("task create requires only title")
+                task = task_provider.create_task(device_id, candidate["title"])
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    201,
+                    {
+                        "ok": True,
+                        "task": task.to_dict(),
+                        "tasks": self.task_dicts(task_provider.list_tasks(device_id)),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_task_update(self, device_id, task_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                candidate = self.read_json()
+                if not candidate or not set(candidate).issubset({"title", "completed"}):
+                    raise ValueError("task update supports title and completed")
+                task = task_provider.update_task(device_id, task_id, **candidate)
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "task": task.to_dict(),
+                        "tasks": self.task_dicts(task_provider.list_tasks(device_id)),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except TaskNotFoundError:
+                self.send_json(404, {"ok": False, "error": "task not found"})
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_task_reorder(self, device_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                candidate = self.read_json()
+                if set(candidate) != {"completed", "task_ids"}:
+                    raise ValueError("reorder requires completed and task_ids")
+                tasks = task_provider.reorder_tasks(
+                    device_id, candidate["completed"], candidate["task_ids"]
+                )
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "tasks": self.task_dicts(tasks),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_task_delete(self, device_id, task_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                deleted = task_provider.delete_task(device_id, task_id)
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "deleted_task_id": deleted.id,
+                        "tasks": self.task_dicts(task_provider.list_tasks(device_id)),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except TaskNotFoundError:
+                self.send_json(404, {"ok": False, "error": "task not found"})
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
 
         def handle_status_get(self, device_id):
             try:
@@ -5999,7 +6460,8 @@ def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
                 regenerate=regenerate_dashboard, device=None,
                 restart_settings=schedule_settings_restart,
                 geocode=geocode_locations, registry=None,
-                render_selected=None, image_server_port=8765):
+                render_selected=None, image_server_port=8765,
+                task_provider=None):
     if device is None:
         device = KindleDevice()
     if registry is None:
@@ -6020,6 +6482,7 @@ def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
             geocode,
             registry,
             image_server_port=image_server_port,
+            task_provider=task_provider,
         ),
     )
 

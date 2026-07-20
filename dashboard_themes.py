@@ -48,6 +48,11 @@ THEMES = {
         "description": "Compact weather with daily family reminders",
         "implemented": True,
     },
+    "todo": {
+        "label": "Todo",
+        "description": "Per-device task list",
+        "implemented": True,
+    },
 }
 
 WEATHER_ONLY = {
@@ -92,4 +97,6 @@ def effective_visibility(theme, config):
         return dict(WEATHER_ONLY)
     if theme == "server_monitor":
         return dict(SERVER_ONLY)
+    if theme == "todo":
+        return {key: False for key in VISIBILITY_FIELDS}
     raise ValueError("unsupported theme")

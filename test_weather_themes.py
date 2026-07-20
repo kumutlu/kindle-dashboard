@@ -15,7 +15,7 @@ ALL_VISIBLE = {
 
 
 class ThemeRegistryTests(unittest.TestCase):
-    def test_registry_contains_seven_implemented_themes(self):
+    def test_registry_contains_existing_weather_themes_and_todo(self):
         self.assertEqual(
             list(dashboard_themes.THEMES),
             [
@@ -26,6 +26,7 @@ class ThemeRegistryTests(unittest.TestCase):
                 "maarif_calendar",
                 "compact_dashboard",
                 "family_dashboard",
+                "todo",
             ],
         )
         self.assertTrue(
@@ -85,6 +86,7 @@ class ThemeRegistryTests(unittest.TestCase):
             "maarif_calendar",
             "compact_dashboard",
             "family_dashboard",
+            "todo",
         ):
             with self.subTest(theme=theme):
                 config = dict(weather_image.DEFAULT_CONFIG)
@@ -94,9 +96,9 @@ class ThemeRegistryTests(unittest.TestCase):
                     theme,
                 )
 
-    def test_every_implemented_theme_has_a_renderer(self):
+    def test_every_implemented_theme_has_a_registered_renderer(self):
         self.assertEqual(
-            set(weather_image.THEME_RENDERERS),
+            set(weather_image.build_theme_registry().theme_ids()),
             {
                 "home_dashboard",
                 "minimal_weather",
@@ -105,6 +107,7 @@ class ThemeRegistryTests(unittest.TestCase):
                 "maarif_calendar",
                 "compact_dashboard",
                 "family_dashboard",
+                "todo",
             },
         )
 

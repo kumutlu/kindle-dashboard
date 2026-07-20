@@ -2836,6 +2836,7 @@ def build_theme_registry(project_root=PROJECT_DIR, task_provider=None):
 
 
 def _save_rendered_theme_image(image, output_path):
+    image = image.convert("L")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(

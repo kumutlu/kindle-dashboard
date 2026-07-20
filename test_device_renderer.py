@@ -486,6 +486,18 @@ class DeviceRendererTests(unittest.TestCase):
             self.assertEqual(generated.size, (600, 800))
 
     def test_todo_theme_renders_device_tasks_without_weather_fetches(self):
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"home_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+        with Image.open(self.default_device.image_path) as home_image:
+            home_properties = (home_image.mode, home_image.size)
+
         kitchen = self.registry.add({
             "id": "kitchen-kindle",
             "name": "Kitchen Kindle",
@@ -508,8 +520,8 @@ class DeviceRendererTests(unittest.TestCase):
         weather.assert_not_called()
         self.assertEqual(result["theme"], "todo")
         with Image.open(kitchen.image_path) as generated:
-            self.assertEqual(generated.size, (758, 1024))
-            self.assertEqual(generated.mode, "1")
+            self.assertEqual((generated.mode, generated.size), home_properties)
+            self.assertEqual(generated.mode, "L")
 
     def test_todo_theme_renders_600x800_without_weather_theme_restriction(self):
         kt4 = self.registry.add({
@@ -530,7 +542,7 @@ class DeviceRendererTests(unittest.TestCase):
         self.assertEqual(result["resolution"], [600, 800])
         with Image.open(kt4.image_path) as generated:
             self.assertEqual(generated.size, (600, 800))
-            self.assertEqual(generated.mode, "1")
+            self.assertEqual(generated.mode, "L")
 
 
 if __name__ == "__main__":

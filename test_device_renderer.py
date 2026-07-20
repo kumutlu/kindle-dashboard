@@ -173,7 +173,7 @@ class DeviceRendererTests(unittest.TestCase):
         self.assertEqual(rendered_themes, ["maarif_calendar"])
         self.assertEqual(result["theme"], "maarif_calendar")
 
-    def test_default_device_explicit_theme_overrides_global_theme(self):
+    def test_deprecated_device_theme_is_normalized_for_rendering(self):
         self.legacy_config["theme"] = "maarif_calendar"
         (self.root / "dashboard_config.json").write_text(
             json.dumps(self.legacy_config),
@@ -189,13 +189,13 @@ class DeviceRendererTests(unittest.TestCase):
 
         rendered_themes = []
 
-        def fake_compact_renderer(config):
+        def fake_home_renderer(config):
             rendered_themes.append(config["theme"])
             self.fake_renderer(config)
 
         with mock.patch.dict(
             weather_image.THEME_RENDERERS,
-            {"compact_dashboard": fake_compact_renderer},
+            {"home_dashboard": fake_home_renderer},
             clear=True,
         ):
             result = weather_image.render_device(
@@ -203,8 +203,32 @@ class DeviceRendererTests(unittest.TestCase):
                 registry=self.registry,
             )
 
-        self.assertEqual(rendered_themes, ["compact_dashboard"])
-        self.assertEqual(result["theme"], "compact_dashboard")
+        self.assertEqual(rendered_themes, ["home_dashboard"])
+        self.assertEqual(result["theme"], "home_dashboard")
+
+    def test_unknown_persisted_device_theme_falls_back_to_base_theme(self):
+        self.legacy_config["theme"] = "family_dashboard"
+        (self.root / "dashboard_config.json").write_text(
+            json.dumps(self.legacy_config),
+            encoding="utf-8",
+        )
+        device_config = dict(self.legacy_config)
+        device_config.update({
+            "title": "DEVICE TITLE",
+            "theme": "unknown-theme",
+        })
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        loaded = weather_image.load_effective_device_config(
+            self.default_device,
+            self.registry,
+        )
+
+        self.assertEqual(loaded["theme"], "family_dashboard")
+        self.assertEqual(loaded["title"], "DEVICE TITLE")
 
     def test_legacy_theme_alias_is_normalized_for_device_rendering(self):
         device_config = dict(self.legacy_config)
@@ -484,6 +508,43 @@ class DeviceRendererTests(unittest.TestCase):
         self.assertEqual(result["theme"], "family_dashboard")
         with Image.open(kt4.image_path) as generated:
             self.assertEqual(generated.size, (600, 800))
+
+    def test_all_canonical_weather_themes_render_600x800_kindle_device(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+        })
+        weather_themes = {
+            "home_dashboard",
+            "server_monitor",
+            "maarif_calendar",
+        }
+
+        for theme in weather_themes:
+            with self.subTest(theme=theme):
+                config = dict(weather_image.DEFAULT_CONFIG, theme=theme)
+                kt4.config_path.write_text(
+                    json.dumps(config),
+                    encoding="utf-8",
+                )
+                with mock.patch.dict(
+                    weather_image.THEME_RENDERERS,
+                    {theme: self.fake_renderer},
+                    clear=True,
+                ):
+                    result = weather_image.render_device(
+                        kt4.id,
+                        registry=self.registry,
+                    )
+
+                self.assertEqual(result["theme"], theme)
+                with Image.open(kt4.image_path) as generated:
+                    self.assertEqual(generated.size, (600, 800))
 
     def test_todo_theme_renders_device_tasks_without_weather_fetches(self):
         with mock.patch.dict(

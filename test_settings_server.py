@@ -43,6 +43,16 @@ class ConfigTests(unittest.TestCase):
             config = weather_image.load_config(path)
         self.assertEqual(config, weather_image.DEFAULT_CONFIG)
 
+    def test_unknown_persisted_theme_falls_back_to_safe_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dashboard_config.json"
+            config = dict(weather_image.DEFAULT_CONFIG, theme="unknown-theme")
+            path.write_text(json.dumps(config), encoding="utf-8")
+
+            loaded = weather_image.load_config(path)
+
+        self.assertEqual(loaded["theme"], weather_image.DEFAULT_CONFIG["theme"])
+
     def test_weather_query_is_url_encoded(self):
         self.assertEqual(
             weather_image.weather_url("Istanbul Türkiye"),
@@ -416,13 +426,16 @@ class SettingsServerTests(unittest.TestCase):
     def test_theme_selector_lists_all_implemented_themes(self):
         _, _, body = self.request("GET", "/settings")
         text = body.decode("utf-8")
+        rendered_values = set(re.findall(
+            r'type="radio" name="theme" value="([^"]+)"',
+            text,
+        ))
+        self.assertEqual(rendered_values, set(settings_server.THEMES))
         for value in (
             "home_dashboard",
             "minimal_weather",
             "server_monitor",
-            "travel_weather",
             "maarif_calendar",
-            "compact_dashboard",
         ):
             self.assertIn(
                 f'type="radio" name="theme" value="{value}"',
@@ -432,6 +445,8 @@ class SettingsServerTests(unittest.TestCase):
                 f'type="radio" name="theme" value="{value}" disabled',
                 text,
             )
+        self.assertNotIn('name="theme" value="travel_weather"', text)
+        self.assertNotIn('name="theme" value="compact_dashboard"', text)
 
     def test_todo_theme_ui_has_selected_device_task_management(self):
         status, _, body = self.request("GET", "/settings")
@@ -694,7 +709,7 @@ class SettingsServerTests(unittest.TestCase):
     def test_settings_form_saves_registered_themes_and_regenerates(self):
         for theme in (
             "family_dashboard",
-            "compact_dashboard",
+            "home_dashboard",
             "maarif_calendar",
         ):
             with self.subTest(theme=theme):
@@ -819,7 +834,7 @@ class SettingsServerTests(unittest.TestCase):
             "location_label": "London, UK",
             "weather_query": "London",
             "timezone": "Europe/London",
-            "theme": "compact_dashboard",
+            "theme": "home_dashboard",
             "show_weather": "on",
             "show_forecast": "on",
             "refresh_interval_minutes": "30",
@@ -839,7 +854,7 @@ class SettingsServerTests(unittest.TestCase):
         saved = json.loads(
             kitchen.config_path.read_text(encoding="utf-8")
         )
-        self.assertEqual(saved["theme"], "compact_dashboard")
+        self.assertEqual(saved["theme"], "home_dashboard")
         self.assertEqual(saved["weather_query"], "London")
         self.assertEqual(saved["refresh_interval_minutes"], 30)
         self.assertEqual(
@@ -848,7 +863,7 @@ class SettingsServerTests(unittest.TestCase):
         )
         self.assertEqual(
             self.rendered_device_themes[-1],
-            "compact_dashboard",
+            "home_dashboard",
         )
         self.assertEqual(self.config_path.read_bytes(), legacy_before)
 
@@ -2371,7 +2386,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "location_label": "Istanbul, Türkiye",
             "weather_query": "Istanbul",
             "timezone": "Europe/Istanbul",
-            "theme": "travel_weather",
+            "theme": "minimal_weather",
             "refresh_interval_minutes": 30,
             "wifi_power_save": False,
             "update_only_if_changed": True,
@@ -2441,7 +2456,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "location_label": "Istanbul, Türkiye",
             "weather_query": "Istanbul",
             "timezone": "Europe/Istanbul",
-            "theme": "travel_weather",
+            "theme": "minimal_weather",
             "show_weather": "on",
             "show_forecast": "on",
             "refresh_interval_minutes": "30",
@@ -2455,7 +2470,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 303)
         saved = json.loads(kitchen.config_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["theme"], "travel_weather")
+        self.assertEqual(saved["theme"], "minimal_weather")
         self.assertEqual(saved["weather_query"], "Istanbul")
         self.assertEqual(saved["timezone"], "Europe/Istanbul")
         self.assertFalse(saved["wifi_power_save"])
@@ -2467,7 +2482,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         )
         self.assertEqual(default_after, default_before)
 
-    def test_kindle_kt4_can_switch_between_supported_themes(self):
+    def test_kindle_kt4_saves_and_reloads_every_canonical_theme(self):
         kt4 = self.registry.add({
             "id": "kindle-131",
             "name": "Kindle 131",
@@ -2504,17 +2519,105 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             "refresh_interval_minutes": "60",
         }
 
-        form = dict(base_form, theme="family_dashboard")
-        status, _, _ = self.post_form("/settings", form)
-        self.assertEqual(status, 303)
-        saved = json.loads(kt4.config_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["theme"], "family_dashboard")
+        other_before = self.registry.get(
+            "default-kindle"
+        ).config_path.read_bytes()
+        legacy_before = self.config_path.read_bytes()
 
-        form = dict(base_form, theme="minimal_weather")
-        status, _, _ = self.post_form("/settings", form)
-        self.assertEqual(status, 303)
-        saved = json.loads(kt4.config_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["theme"], "minimal_weather")
+        for theme in settings_server.THEMES:
+            with self.subTest(theme=theme):
+                form = dict(base_form, theme=theme)
+                status, headers, _ = self.post_form("/settings", form)
+                self.assertEqual(status, 303)
+                self.assertEqual(headers["Location"], "/settings?status=saved")
+                saved = json.loads(
+                    kt4.config_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(saved["theme"], theme)
+
+                status, body = self.request(
+                    "/api/device/kindle-131/config"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["theme"], theme)
+                self.assertEqual(self.rendered_device_ids[-1], kt4.id)
+
+        self.assertEqual(
+            self.registry.get("default-kindle").config_path.read_bytes(),
+            other_before,
+        )
+        self.assertEqual(self.config_path.read_bytes(), legacy_before)
+
+    def test_kindle_kt4_deprecated_themes_persist_as_canonical_values(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+        })
+        base = dict(weather_image.DEFAULT_CONFIG)
+        aliases = {
+            "travel_weather": "minimal_weather",
+            "compact_dashboard": "home_dashboard",
+        }
+
+        for deprecated, canonical in aliases.items():
+            with self.subTest(theme=deprecated):
+                candidate = dict(base, theme=deprecated)
+                status, _, body = self.post_json(
+                    "/api/config",
+                    {
+                        "selected_device_id": kt4.id,
+                        "config": candidate,
+                    },
+                )
+                self.assertEqual(status, 200)
+                payload = json.loads(body)
+                self.assertEqual(payload["config"]["theme"], canonical)
+                self.assertEqual(
+                    json.loads(
+                        kt4.config_path.read_text(encoding="utf-8")
+                    )["theme"],
+                    canonical,
+                )
+                status, body = self.request(
+                    "/api/device/kindle-131/config"
+                )
+                self.assertEqual(json.loads(body)["theme"], canonical)
+
+    def test_kindle_kt4_unknown_theme_keeps_persisted_theme(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+        })
+        original = dict(
+            weather_image.DEFAULT_CONFIG,
+            theme="maarif_calendar",
+        )
+        settings_server.atomic_write_config(kt4.config_path, original)
+
+        status, _, body = self.post_json(
+            "/api/config",
+            {
+                "selected_device_id": kt4.id,
+                "config": dict(original, theme="unknown-theme"),
+            },
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("unsupported theme", json.loads(body)["error"])
+        self.assertEqual(
+            json.loads(kt4.config_path.read_text(encoding="utf-8"))["theme"],
+            "maarif_calendar",
+        )
 
     def test_devices_api_includes_status_summary_without_token(self):
         self.post_json(

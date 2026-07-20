@@ -22,9 +22,7 @@ class ThemeRegistryTests(unittest.TestCase):
                 "home_dashboard",
                 "minimal_weather",
                 "server_monitor",
-                "travel_weather",
                 "maarif_calendar",
-                "compact_dashboard",
                 "family_dashboard",
                 "todo",
             ],
@@ -41,7 +39,7 @@ class ThemeRegistryTests(unittest.TestCase):
             flags,
         )
 
-    def test_minimal_travel_and_maarif_force_weather_only(self):
+    def test_minimal_and_maarif_force_weather_only(self):
         expected = {
             "show_weather": True,
             "show_forecast": True,
@@ -49,7 +47,7 @@ class ThemeRegistryTests(unittest.TestCase):
             "show_pihole": False,
             "show_tailscale": False,
         }
-        for theme in ("minimal_weather", "travel_weather", "maarif_calendar"):
+        for theme in ("minimal_weather", "maarif_calendar"):
             with self.subTest(theme=theme):
                 self.assertEqual(
                     dashboard_themes.effective_visibility(theme, ALL_VISIBLE),
@@ -77,14 +75,12 @@ class ThemeRegistryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     dashboard_themes.validate_theme(theme)
 
-    def test_dashboard_config_accepts_only_implemented_themes(self):
+    def test_dashboard_config_accepts_only_current_themes(self):
         for theme in (
             "home_dashboard",
             "minimal_weather",
             "server_monitor",
-            "travel_weather",
             "maarif_calendar",
-            "compact_dashboard",
             "family_dashboard",
             "todo",
         ):
@@ -96,6 +92,28 @@ class ThemeRegistryTests(unittest.TestCase):
                     theme,
                 )
 
+    def test_deprecated_theme_configs_are_migrated(self):
+        aliases = {
+            "travel_weather": "minimal_weather",
+            "compact_dashboard": "home_dashboard",
+        }
+        for deprecated, replacement in aliases.items():
+            with self.subTest(theme=deprecated):
+                config = dict(weather_image.DEFAULT_CONFIG, theme=deprecated)
+                self.assertEqual(
+                    weather_image.validate_config(config)["theme"],
+                    replacement,
+                )
+
+    def test_only_deprecated_theme_names_are_aliased(self):
+        self.assertEqual(
+            dashboard_themes.THEME_ALIASES,
+            {
+                "travel_weather": "minimal_weather",
+                "compact_dashboard": "home_dashboard",
+            },
+        )
+
     def test_every_implemented_theme_has_a_registered_renderer(self):
         self.assertEqual(
             set(weather_image.build_theme_registry().theme_ids()),
@@ -103,13 +121,15 @@ class ThemeRegistryTests(unittest.TestCase):
                 "home_dashboard",
                 "minimal_weather",
                 "server_monitor",
-                "travel_weather",
                 "maarif_calendar",
-                "compact_dashboard",
                 "family_dashboard",
                 "todo",
             },
         )
+
+    def test_deprecated_renderer_functions_are_removed(self):
+        self.assertFalse(hasattr(weather_image, "render_travel_weather"))
+        self.assertFalse(hasattr(weather_image, "render_compact_dashboard"))
 
     def test_theme_layout_policies_override_stored_flags(self):
         minimal = dict(weather_image.DEFAULT_CONFIG, theme="minimal_weather")

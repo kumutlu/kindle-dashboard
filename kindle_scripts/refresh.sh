@@ -25,29 +25,175 @@ CONFIG_URL="http://$SERVER_HOST:8767/api/device/$DEVICE_ID/config"
 TOKEN_FILE="$DASHBOARD_DIR/public-token"
 IMG="$DASHBOARD_DIR/weather.png"
 TMP="$DASHBOARD_DIR/weather.tmp"
-LOCK_FILE="/tmp/kindle-refresh.lock"
+LOCK_FILE="${LOCK_FILE:-/tmp/kindle-refresh.lock}"
 STATUS_SENDER="${STATUS_SENDER:-$(dirname "$0")/send-status.sh}"
 EIPS_BIN="${EIPS_BIN:-/usr/sbin/eips}"
 
-# Note: On Kindle BusyBox ash, using custom background watchdogs, command evaluations,
-# or even the shell built-in 'sleep' command forces the shell to fork duplicate child
-# processes named 'refresh.sh' that pollute the process table.
-# To keep exactly one 'refresh.sh' daemon process active:
-#   1. We do not use any custom timeout wrapper or subshell.
-#   2. We run all utilities (lipc, eips, wget, curl) directly in the foreground.
-#   3. For curl, we rely on its native --connect-timeout and --max-time flags.
-#   4. We execute the external '/bin/sleep' binary instead of the built-in 'sleep'
-#      so that wait intervals run as a separate 'sleep' process name.
+PROC_DIR="${PROC_DIR:-/proc}"
+RTC_SYS_DIR="${RTC_SYS_DIR:-/sys/class/rtc/rtc1}"
+LOG_FILE="${DASHBOARD_DIR:-/mnt/us/dashboard}/dashboard.log"
+SLEEP_BIN="${SLEEP_BIN:-/bin/sleep}"
+KILL_CMD="${KILL_CMD:-kill}"
+
+log_msg() {
+	MSG="$(date '+%Y-%m-%d %H:%M:%S') $1"
+	echo "$MSG"
+	echo "$MSG" >> "$LOG_FILE"
+	if [ -f "$LOG_FILE" ]; then
+		SIZE=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+		if [ "$SIZE" -gt 100000 ]; then
+			tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null && mv -f "${LOG_FILE}.tmp" "$LOG_FILE"
+		fi
+	fi
+}
 
 cleanup() {
-	rm -f "$LOCK_FILE"
+	if [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$$" ]; then
+		rm -f "$LOCK_FILE"
+	fi
+	LOOP_PID_FILE="${DASHBOARD_DIR:-/mnt/us/dashboard}/dashboard_loop.pid"
+	if [ -f "$LOOP_PID_FILE" ] && [ "$(cat "$LOOP_PID_FILE" 2>/dev/null)" = "$$" ]; then
+		rm -f "$LOOP_PID_FILE"
+	fi
 }
 trap cleanup EXIT HUP INT TERM
+
+# Single-instance protection with stale PID command verification
+if [ -f "$LOCK_FILE" ]; then
+	OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null)
+	if [ -n "$OLD_PID" ]; then
+		if "$KILL_CMD" -0 "$OLD_PID" 2>/dev/null; then
+			OLD_CMDLINE=$(cat "$PROC_DIR/$OLD_PID/cmdline" 2>/dev/null | tr '\0\n\r' '   ')
+			PAD_CMDLINE=" $OLD_CMDLINE "
+			case "$PAD_CMDLINE" in
+				*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)
+					echo "$(date '+%Y-%m-%d %H:%M:%S') another active refresh process ($OLD_PID) is running, exiting"
+					exit 0
+					;;
+				*)
+					echo "$(date '+%Y-%m-%d %H:%M:%S') removing stale lock file for PID $OLD_PID"
+					rm -f "$LOCK_FILE"
+					;;
+			esac
+		else
+			# Stale PID, safe to ignore and overwrite
+			echo "$(date '+%Y-%m-%d %H:%M:%S') removing stale lock file for PID $OLD_PID"
+			rm -f "$LOCK_FILE"
+		fi
+	fi
+fi
+echo $$ > "$LOCK_FILE"
 
 INTERVAL=600
 
 while true
 do
+	# Source env
+	if [ -f "$DASHBOARD_DIR/device.env" ]; then
+		. "$DASHBOARD_DIR/device.env"
+	fi
+
+	if [ "${LOW_POWER_MODE:-0}" -eq 1 ]; then
+		log_msg "[low-power] refresh started"
+		ONCE_SCRIPT="$(dirname "$0")/refresh-once.sh"
+		if [ -x "$ONCE_SCRIPT" ]; then
+			sh "$ONCE_SCRIPT"
+		else
+			log_msg "[low-power] fallback reason: refresh-once.sh not found/executable at $ONCE_SCRIPT"
+		fi
+		log_msg "[low-power] refresh completed"
+
+		# Determine refresh interval
+		CONFIG_JSON=$(wget -q -O- "$CONFIG_URL" 2>/dev/null)
+		if [ -z "$CONFIG_JSON" ]; then
+			CONFIG_JSON=$(wget -q -O- "$LEGACY_CONFIG_URL" 2>/dev/null)
+		fi
+		REFRESH_MINS=$(echo "$CONFIG_JSON" | grep -o '"refresh_interval_minutes":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
+		if [ -n "$REFRESH_MINS" ] && { [ "$REFRESH_MINS" -eq 5 ] || [ "$REFRESH_MINS" -eq 10 ] || [ "$REFRESH_MINS" -eq 15 ] || [ "$REFRESH_MINS" -eq 30 ] || [ "$REFRESH_MINS" -eq 60 ]; }; then
+			INTERVAL=$((REFRESH_MINS * 60))
+		elif [ -n "${REFRESH_INTERVAL_MINUTES:-}" ]; then
+			INTERVAL=$((REFRESH_INTERVAL_MINUTES * 60))
+		else
+			INTERVAL=600
+		fi
+		log_msg "[low-power] selected interval: ${INTERVAL}s"
+
+		# RTC wakealarm validation and setup
+		RTC_DIR="${RTC_SYS_DIR:-/sys/class/rtc/rtc1}"
+		if [ ! -d "$RTC_DIR" ] || [ ! -r "$RTC_DIR/since_epoch" ] || [ ! -w "$RTC_DIR/wakealarm" ]; then
+			log_msg "[low-power] fallback reason: rtc1 missing or permissions invalid"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		if ! echo 0 > "$RTC_DIR/wakealarm" 2>/dev/null; then
+			log_msg "[low-power] fallback reason: failed to clear existing wakealarm"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		NOW=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\r\n')
+		case "$NOW" in
+			""|*[!0-9]*)
+				log_msg "[low-power] fallback reason: invalid current epoch time: $NOW"
+				"$SLEEP_BIN" "$INTERVAL"
+				continue
+				;;
+		esac
+		log_msg "[low-power] RTC current time: $NOW"
+
+		TARGET=$((NOW + INTERVAL))
+		log_msg "[low-power] requested alarm: $TARGET"
+
+		if [ "$TARGET" -le "$NOW" ]; then
+			log_msg "[low-power] fallback reason: alarm not in the future (requested $TARGET <= current $NOW)"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		if ! echo "$TARGET" > "$RTC_DIR/wakealarm" 2>/dev/null; then
+			log_msg "[low-power] fallback reason: wakealarm write failure"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		ACTUAL=$(cat "$RTC_DIR/wakealarm" 2>/dev/null | tr -d '\r\n')
+		if [ "$ACTUAL" != "$TARGET" ]; then
+			log_msg "[low-power] fallback reason: wakealarm verification mismatch (expected $TARGET, got $ACTUAL)"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+		log_msg "[low-power] verified alarm: $ACTUAL"
+
+		sync
+
+		log_msg "[low-power] suspend attempt"
+		BEFORE=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\r\n')
+		POWER_STATE_FILE="${POWER_STATE_FILE:-/sys/power/state}"
+		if echo mem > "$POWER_STATE_FILE" 2>/dev/null; then
+			AFTER=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\r\n')
+			case "$AFTER" in
+				""|*[!0-9]*)
+					log_msg "[low-power] warning: invalid post-resume RTC time: $AFTER"
+					"$SLEEP_BIN" 10
+					;;
+				*)
+					SLEPT=$((AFTER - BEFORE))
+					if [ "$SLEPT" -lt 0 ] 2>/dev/null || [ "$SLEPT" -lt 10 ] 2>/dev/null; then
+						log_msg "[low-power] warning: unexpectedly short sleep duration: ${SLEPT}s"
+						"$SLEEP_BIN" 10
+					else
+						log_msg "[low-power] resume detected (slept ${SLEPT}s)"
+					fi
+					;;
+			esac
+		else
+			log_msg "[low-power] fallback reason: suspend command failed"
+			"$SLEEP_BIN" "$INTERVAL"
+		fi
+		continue
+	fi
+
 	HOUR=$(date +%H)
 	HR=${HOUR#0}
 	HR=${HR:-0}
@@ -57,16 +203,6 @@ do
 		FALLBACK_LIGHT=8
 	fi
 
-	# Acquire lock for active refresh
-	if [ -f "$LOCK_FILE" ]; then
-		OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null)
-		if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-			echo "$(date '+%Y-%m-%d %H:%M:%S') another active refresh process ($OLD_PID) is running, skipping cycle"
-			/bin/sleep "$INTERVAL"
-			continue
-		fi
-	fi
-	echo $$ > "$LOCK_FILE"
 
 	# Get config json directly (local LAN request is fast)
 	CONFIG_JSON=$(wget -q -O- "$CONFIG_URL" 2>/dev/null)
@@ -139,8 +275,6 @@ do
 		SERVER_HOST="$SERVER_HOST" DEVICE_ID="$DEVICE_ID" DASHBOARD_DIR="$DASHBOARD_DIR" sh "$STATUS_SENDER" >/dev/null 2>&1 || true
 	fi
 
-	# Release lock
-	rm -f "$LOCK_FILE"
 
 	REFRESH_MINS=$(echo "$CONFIG_JSON" | grep -o '"refresh_interval_minutes":\s*[0-9][0-9]*' | grep -o '[0-9][0-9]*')
 	if [ -n "$REFRESH_MINS" ] && { [ "$REFRESH_MINS" -eq 5 ] || [ "$REFRESH_MINS" -eq 10 ] || [ "$REFRESH_MINS" -eq 15 ] || [ "$REFRESH_MINS" -eq 30 ] || [ "$REFRESH_MINS" -eq 60 ]; }; then
@@ -152,5 +286,5 @@ do
 	fi
 
 	# Call the external /bin/sleep binary to avoid shell built-in process forking
-	/bin/sleep "$INTERVAL"
+	"$SLEEP_BIN" "$INTERVAL"
 done

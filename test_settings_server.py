@@ -1129,7 +1129,7 @@ class SettingsServerTests(unittest.TestCase):
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         self.assertEqual(status, 303) # redirect
-        
+
         # Verify it was saved to config
         config = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(config.get("refresh_interval_minutes"), 60)
@@ -1180,7 +1180,7 @@ class SettingsServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         res = json.loads(body.decode("utf-8"))
         self.assertTrue(res["ok"])
-        
+
         # Verify file written
         notes = json.loads(test_notes_path.read_text(encoding="utf-8"))
         self.assertEqual(len(notes["items"]), 1)
@@ -1326,7 +1326,7 @@ class SettingsServerTests(unittest.TestCase):
         test_notes_path = Path(self.tempdir.name) / "daily_notes.json"
         settings_server.DAILY_NOTES_PATH = test_notes_path
         test_notes_path.write_text("{malformed json", encoding="utf-8")
-        
+
         # Should not crash and return empty notes object
         notes = settings_server.load_daily_notes()
         self.assertEqual(notes, {"items": []})
@@ -1358,7 +1358,7 @@ class SettingsServerTests(unittest.TestCase):
                 "ssh_profile": "kindle_dashboard",
             }
         })
-        
+
         csrf = self.csrf_token()
         status, _, body = self.request(
             "POST",
@@ -1380,7 +1380,7 @@ class SettingsServerTests(unittest.TestCase):
             "config_path": "devices/living-panel/config.json",
             "image_path": "devices/living-panel/image.png",
         })
-        
+
         csrf = self.csrf_token()
         status, _, body = self.request(
             "POST",
@@ -1737,6 +1737,14 @@ class DeviceConfigEndpointTests(unittest.TestCase):
             geocode=lambda query: [],
             registry=self.registry,
         )
+        import subprocess
+        self.original_run = subprocess.run
+        self.subprocess_patcher = mock.patch("subprocess.run")
+        self.mock_run = self.subprocess_patcher.start()
+        mock_result = mock.MagicMock()
+        mock_result.returncode = 0
+        self.mock_run.return_value = mock_result
+
         self.thread = threading.Thread(
             target=self.server.serve_forever,
             daemon=True,
@@ -1744,6 +1752,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self):
+        self.subprocess_patcher.stop()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -2295,6 +2304,18 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertIn("Authorization: Bearer", script)
         # Verify REFRESH_INTERVAL_MINUTES is written to device.env
         self.assertIn('REFRESH_INTERVAL_MINUTES="30"', script)
+        # Verify LOW_POWER_MODE check and preservation in device.env
+        self.assertIn('LOW_POWER_MODE="$LOW_POWER_MODE"', script)
+        self.assertIn('RAW_LPM=$(grep "^LOW_POWER_MODE="', script)
+        # Verify PROC_DIR and RTC_SYS_DIR are present for mocking/configuration
+        self.assertIn('PROC_DIR="${PROC_DIR:-/proc}"', script)
+        self.assertIn('RTC_SYS_DIR="${RTC_SYS_DIR:-/sys/class/rtc/rtc1}"', script)
+        self.assertIn('cat "$PROC_DIR/$OLD_WPID/cmdline"', script)
+        self.assertIn('case "$PAD_WCMD" in', script)
+        self.assertIn('*" $DASHBOARD_DIR/watchdog.sh "*|*" /mnt/us/dashboard/watchdog.sh "*)', script)
+        self.assertIn('cat "$PROC_DIR/$PID/cmdline"', script)
+        self.assertIn('case "$PAD_CMDLINE" in', script)
+        self.assertIn('*" $DASHBOARD_DIR/dashboard_loop.sh "*|*" /mnt/us/dashboard/dashboard_loop.sh "*|*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)', script)
         # Verify BusyBox-compatible syntax and chmod executions
         self.assertIn('chmod +x "$DASHBOARD_DIR/status.sh"', script)
         self.assertIn('"$DASHBOARD_DIR/status.sh" >/dev/null 2>&1', script)
@@ -2518,7 +2539,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         config = read_raw_device_config(device)
         self.assertIn("pairing_token", config)
         config.pop("pairing_token")
-        
+
         # Write it back without pairing_token
         atomic_write_bytes(
             device.config_path,
@@ -2575,7 +2596,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         from settings_server import atomic_write_config
         config["theme"] = "family_dashboard"
         atomic_write_config(device.config_path, config)
-        
+
         # Reload and check
         config_after = read_raw_device_config(device)
         self.assertEqual(config_after.get("pairing_token"), new_token)
@@ -2603,7 +2624,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         config = read_raw_device_config(device)
         self.assertIn("status_token", config)
         config.pop("status_token")
-        
+
         # Write it back without status_token
         atomic_write_bytes(
             device.config_path,
@@ -2614,12 +2635,12 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         status, body = self.request(f"/install/kindle/{device_id}?token={pairing_token}")
         self.assertEqual(status, 200)
         script = body.decode("utf-8")
-        
+
         # Verify installer script contains status.sh, refresh.sh, start.sh
         self.assertIn("status.sh", script)
         self.assertIn("refresh.sh", script)
         self.assertIn("start.sh", script)
-        
+
         # Verify STATUS_TOKEN in script is non-empty
         self.assertIn('STATUS_TOKEN="', script)
         self.assertNotIn('STATUS_TOKEN=""', script)
@@ -2680,7 +2701,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         res_k = json.loads(body_k)
         dev_k = res_k["device"]
         id_k = dev_k["id"]
-        
+
         # 2. Create bedroom device
         status_b, _, body_b = self.post_json(
             "/api/devices",
@@ -2699,7 +2720,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(id_k, "kitchen-kindle")
         self.assertEqual(id_b, "bedroom-kindle")
         self.assertNotEqual(id_k, id_b)
-        
+
         # 4. Verify tokens are unique
         self.assertNotEqual(res_k["pairing_token"], res_b["pairing_token"])
         self.assertNotEqual(res_k["status_token"], res_b["status_token"])
@@ -2736,11 +2757,11 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         status, body = self.request("/settings")
         self.assertEqual(status, 200)
         text = body.decode("utf-8")
-        
+
         # Verify both device names are listed
         self.assertIn("Kitchen Kindle", text)
         self.assertIn("Bedroom Kindle", text)
-        
+
         # Verify both installer commands are printed on their respective cards
         self.assertIn(html.escape(res_k["install_command"]), text)
         self.assertIn(html.escape(res_b["install_command"]), text)
@@ -2771,7 +2792,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         path_b = Path(res_render_b["output_path"])
         self.assertTrue(path_k.exists())
         self.assertTrue(path_b.exists())
-        
+
         content_k = path_k.read_bytes()
         content_b = path_b.read_bytes()
         self.assertNotEqual(content_k, content_b)
@@ -2878,6 +2899,53 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         mock_run.assert_not_called()
         self.mock_device.push.assert_called_once()
+
+    def test_installer_low_power_mode_preservation(self):
+        cases = [
+            (None, "0"),
+            ("LOW_POWER_MODE=0\n", "0"),
+            ("LOW_POWER_MODE=1\n", "1"),
+            ("LOW_POWER_MODE=\"0\"\n", "0"),
+            ("LOW_POWER_MODE=\"1\"\n", "1"),
+            ("LOW_POWER_MODE='0'\n", "0"),
+            ("LOW_POWER_MODE='1'\n", "1"),
+            ("LOW_POWER_MODE=0\nLOW_POWER_MODE=1\n", "1"),
+            ("LOW_POWER_MODE=1\nLOW_POWER_MODE=0\n", "0"),
+            ("LOW_POWER_MODE=malformed\n", "0"),
+            ("LOW_POWER_MODE=\"invalid\"\n", "0"),
+        ]
+
+        for content, expected in cases:
+            with self.subTest(content=content, expected=expected):
+                with tempfile.TemporaryDirectory() as td:
+                    tdp = Path(td)
+                    dev_env = tdp / "device.env"
+                    if content is not None:
+                        dev_env.write_text(content, encoding="utf-8")
+
+                    class FakeDevice:
+                        type = "kindle_pw1"
+                        id = "kitchen-kindle"
+                    device = FakeDevice()
+                    config = {"status_token": "fake-token"}
+                    installer = settings_server.kindle_installer_script(
+                        device, config, "127.0.0.1", 8765, 8767
+                    )
+
+                    res = self.original_run(
+                        ["/bin/sh", "-c", installer],
+                        cwd=td,
+                        env={"DASHBOARD_DIR": td},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(res.returncode, 0)
+
+                    self.assertTrue(dev_env.exists())
+                    lines = dev_env.read_text(encoding="utf-8").splitlines()
+                    lpm_lines = [l for l in lines if l.startswith("LOW_POWER_MODE=")]
+                    self.assertEqual(len(lpm_lines), 1)
+                    self.assertEqual(lpm_lines[0], f'LOW_POWER_MODE="{expected}"')
 
 
 if __name__ == "__main__":

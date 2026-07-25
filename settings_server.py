@@ -104,7 +104,7 @@ def public_device_config(device, config):
             payload[key] = config[key]
     if "deep_sleep_minutes" in config:
         payload["deep_sleep_minutes"] = config["deep_sleep_minutes"]
-    
+
     payload["image_url"] = f"/device/{device.id}/image.png"
     if device.type == "esp32_epaper":
         payload["bmp_url"] = f"/device/{device.id}/image.bmp"
@@ -695,19 +695,54 @@ fi
 exit 0
 EOF"""
 
-    # dashboard_loop.sh heredoc
     dashboard_loop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/dashboard_loop.sh"
 #!/bin/sh
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-if [ -f "$DASHBOARD_DIR/device.env" ]; then
-    . "$DASHBOARD_DIR/device.env"
+LOOP_PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
+PROC_DIR="${PROC_DIR:-/proc}"
+RTC_SYS_DIR="${RTC_SYS_DIR:-/sys/class/rtc/rtc1}"
+LOG_FILE="${DASHBOARD_DIR}/dashboard.log"
+SLEEP_BIN="${SLEEP_BIN:-/bin/sleep}"
+
+log_msg() {
+	MSG="$(date '+%Y-%m-%d %H:%M:%S') $1"
+	echo "$MSG"
+	echo "$MSG" >> "$LOG_FILE"
+	if [ -f "$LOG_FILE" ]; then
+		SIZE=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+		if [ "$SIZE" -gt 100000 ]; then
+			tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null && mv -f "${LOG_FILE}.tmp" "$LOG_FILE"
+		fi
+	fi
+}
+
+# Single-instance protection with stale PID command verification
+if [ -f "$LOOP_PID_FILE" ]; then
+	OLD_LPID=$(cat "$LOOP_PID_FILE" 2>/dev/null)
+	if [ -n "$OLD_LPID" ] && kill -0 "$OLD_LPID" 2>/dev/null; then
+		OLD_CMDLINE=$(cat "$PROC_DIR/$OLD_LPID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+		PAD_CMDLINE=" $OLD_CMDLINE "
+		case "$PAD_CMDLINE" in
+			*" $DASHBOARD_DIR/dashboard_loop.sh "*|*" /mnt/us/dashboard/dashboard_loop.sh "*|*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)
+				exit 0
+				;;
+		esac
+	fi
 fi
+echo $$ > "$LOOP_PID_FILE"
+
+cleanup() {
+	if [ -f "$LOOP_PID_FILE" ] && [ "$(cat "$LOOP_PID_FILE" 2>/dev/null)" = "$$" ]; then
+		rm -f "$LOOP_PID_FILE"
+	fi
+}
+trap cleanup EXIT HUP INT TERM
 
 wait_for_ip() {
     for i in $(seq 1 60); do
-        IP=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p')
+        IP=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\\([0-9.][0-9.]*\\).*/\\1/p')
         if [ -z "$IP" ]; then
-            IP=$(ifconfig 2>/dev/null | grep "inet addr:" | grep -v "127.0.0.1" | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' | head -n 1)
+            IP=$(ifconfig 2>/dev/null | grep "inet addr:" | grep -v "127.0.0.1" | sed -n 's/.*inet addr:\\([0-9.][0-9.]*\\).*/\\1/p' | head -n 1)
         fi
         if [ -n "$IP" ]; then
             return 0
@@ -717,17 +752,115 @@ wait_for_ip() {
     return 1
 }
 
+INTERVAL=3600
+
 while true; do
-    wait_for_ip || true
-    if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
-        "$DASHBOARD_DIR/refresh.sh" || true
-    fi
-    SLEEP_MINUTES="${REFRESH_INTERVAL_MINUTES:-60}"
-    SLEEP_SECONDS=$((SLEEP_MINUTES * 60))
-    if [ "$SLEEP_SECONDS" -le 0 ]; then
-        SLEEP_SECONDS=3600
-    fi
-    sleep "$SLEEP_SECONDS"
+	# Source env
+	if [ -f "$DASHBOARD_DIR/device.env" ]; then
+		. "$DASHBOARD_DIR/device.env"
+	fi
+
+	if [ "${LOW_POWER_MODE:-0}" -eq 1 ]; then
+		log_msg "[low-power] refresh started"
+		if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
+			"$DASHBOARD_DIR/refresh.sh" || true
+		fi
+		log_msg "[low-power] refresh completed"
+
+		SLEEP_MINUTES="${REFRESH_INTERVAL_MINUTES:-60}"
+		INTERVAL=$((SLEEP_MINUTES * 60))
+		if [ "$INTERVAL" -le 0 ]; then
+			INTERVAL=3600
+		fi
+		log_msg "[low-power] selected interval: ${INTERVAL}s"
+
+		# RTC wakealarm validation and setup
+		RTC_DIR="${RTC_SYS_DIR:-/sys/class/rtc/rtc1}"
+		if [ ! -d "$RTC_DIR" ] || [ ! -r "$RTC_DIR/since_epoch" ] || [ ! -w "$RTC_DIR/wakealarm" ]; then
+			log_msg "[low-power] fallback reason: rtc1 missing or permissions invalid"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		if ! echo 0 > "$RTC_DIR/wakealarm" 2>/dev/null; then
+			log_msg "[low-power] fallback reason: failed to clear existing wakealarm"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		NOW=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\\r\\n')
+		case "$NOW" in
+			""|*[!0-9]*)
+				log_msg "[low-power] fallback reason: invalid current epoch time: $NOW"
+				"$SLEEP_BIN" "$INTERVAL"
+				continue
+				;;
+		esac
+		log_msg "[low-power] RTC current time: $NOW"
+
+		TARGET=$((NOW + INTERVAL))
+		log_msg "[low-power] requested alarm: $TARGET"
+
+		if [ "$TARGET" -le "$NOW" ]; then
+			log_msg "[low-power] fallback reason: alarm not in the future (requested $TARGET <= current $NOW)"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		if ! echo "$TARGET" > "$RTC_DIR/wakealarm" 2>/dev/null; then
+			log_msg "[low-power] fallback reason: wakealarm write failure"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+
+		ACTUAL=$(cat "$RTC_DIR/wakealarm" 2>/dev/null | tr -d '\\r\\n')
+		if [ "$ACTUAL" != "$TARGET" ]; then
+			log_msg "[low-power] fallback reason: wakealarm verification mismatch (expected $TARGET, got $ACTUAL)"
+			"$SLEEP_BIN" "$INTERVAL"
+			continue
+		fi
+		log_msg "[low-power] verified alarm: $ACTUAL"
+
+		sync
+
+		log_msg "[low-power] suspend attempt"
+		BEFORE=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\\r\\n')
+		POWER_STATE_FILE="${POWER_STATE_FILE:-/sys/power/state}"
+		if echo mem > "$POWER_STATE_FILE" 2>/dev/null; then
+			AFTER=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\\r\\n')
+			case "$AFTER" in
+				""|*[!0-9]*)
+					log_msg "[low-power] warning: invalid post-resume RTC time: $AFTER"
+					"$SLEEP_BIN" 10
+					;;
+				*)
+					SLEPT=$((AFTER - BEFORE))
+					if [ "$SLEPT" -lt 0 ] 2>/dev/null || [ "$SLEPT" -lt 10 ] 2>/dev/null; then
+						log_msg "[low-power] warning: unexpectedly short sleep duration: \${SLEPT}s"
+						"$SLEEP_BIN" 10
+					else
+						log_msg "[low-power] resume detected (slept \${SLEPT}s)"
+					fi
+					;;
+			esac
+		else
+			log_msg "[low-power] fallback reason: suspend command failed"
+			"$SLEEP_BIN" "$INTERVAL"
+		fi
+		continue
+	fi
+
+	# Normal Mode Flow
+	wait_for_ip || true
+	if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
+		"$DASHBOARD_DIR/refresh.sh" || true
+	fi
+	SLEEP_MINUTES="${REFRESH_INTERVAL_MINUTES:-60}"
+	INTERVAL=$((SLEEP_MINUTES * 60))
+	if [ "$INTERVAL" -le 0 ]; then
+		INTERVAL=3600
+	fi
+	"$SLEEP_BIN" "$INTERVAL"
 done
 EOF"""
 
@@ -736,19 +869,49 @@ EOF"""
 #!/bin/sh
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
 PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
+WATCHDOG_PID_FILE="$DASHBOARD_DIR/watchdog.pid"
+PROC_DIR="${PROC_DIR:-/proc}"
+
+# Ensure only one watchdog runs
+if [ -f "$WATCHDOG_PID_FILE" ]; then
+    OLD_WPID=$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)
+    if [ -n "$OLD_WPID" ] && kill -0 "$OLD_WPID" 2>/dev/null; then
+        OLD_WCMD=$(cat "$PROC_DIR/$OLD_WPID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+        PAD_WCMD=" $OLD_WCMD "
+        case "$PAD_WCMD" in
+            *" $DASHBOARD_DIR/watchdog.sh "*|*" /mnt/us/dashboard/watchdog.sh "*)
+                exit 0
+                ;;
+        esac
+    fi
+fi
+echo $$ > "$WATCHDOG_PID_FILE"
+
+cleanup() {
+    if [ -f "$WATCHDOG_PID_FILE" ] && [ "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$WATCHDOG_PID_FILE"
+    fi
+}
+trap cleanup EXIT INT TERM
 
 while true; do
     RUNNING=0
     if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE")
+        PID=$(cat "$PID_FILE" 2>/dev/null)
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            RUNNING=1
+            CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+            PAD_CMDLINE=" $CMDLINE "
+            case "$PAD_CMDLINE" in
+                *" $DASHBOARD_DIR/dashboard_loop.sh "*|*" /mnt/us/dashboard/dashboard_loop.sh "*|*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)
+                    RUNNING=1
+                    ;;
+            esac
         fi
     fi
     if [ "$RUNNING" -eq 0 ]; then
         if [ -x "$DASHBOARD_DIR/dashboard_loop.sh" ]; then
             "$DASHBOARD_DIR/dashboard_loop.sh" >/dev/null 2>&1 &
-            echo $! > "$PID_FILE"
+            sleep 2
         fi
     fi
     sleep 10
@@ -764,7 +927,6 @@ if [ -x "$DASHBOARD_DIR/stop.sh" ]; then
 fi
 if [ -x "$DASHBOARD_DIR/watchdog.sh" ]; then
     "$DASHBOARD_DIR/watchdog.sh" >/dev/null 2>&1 &
-    echo $! > "$DASHBOARD_DIR/watchdog.pid"
 fi
 exit 0
 EOF"""
@@ -773,23 +935,161 @@ EOF"""
     stop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/stop.sh"
 #!/bin/sh
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-WATCHDOG_PID_FILE="$DASHBOARD_DIR/watchdog.pid"
-if [ -f "$WATCHDOG_PID_FILE" ]; then
-    PID=$(cat "$WATCHDOG_PID_FILE")
-    if [ -n "$PID" ]; then
-        kill "$PID" 2>/dev/null || true
+PROC_DIR="${PROC_DIR:-/proc}"
+
+# get_start_time PID
+get_start_time() {
+    _PID="$1"
+    _SF="$PROC_DIR/$_PID/stat"
+    if [ ! -f "$_SF" ]; then
+        echo ""
+        return 1
+    fi
+    _SL=$(cat "$_SF" 2>/dev/null)
+    if [ -z "$_SL" ]; then
+        echo ""
+        return 1
+    fi
+    _REM="${_SL##*) }"
+    if [ -z "$_REM" ]; then
+        echo ""
+        return 1
+    fi
+    set -- $_REM
+    _ST="${20}"
+    case "$_ST" in
+        ""|*[!0-9]*)
+            echo ""
+            return 1
+            ;;
+        *)
+            echo "$_ST"
+            return 0
+            ;;
+    esac
+}
+
+# Helper to stop a process validated by cmdline
+stop_validated() {
+    PID_FILE="$1"
+    EXPECTED_CMD1="$2"
+    EXPECTED_CMD2="$3"
+
+    if [ ! -f "$PID_FILE" ]; then
+        return 0
+    fi
+
+    PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' ')
+    if [ -z "$PID" ]; then
+        echo "Removing empty PID file: $PID_FILE"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    case "$PID" in
+        ""|*[!0-9]*)
+            echo "Removing malformed PID file: $PID_FILE (value: '$PID')"
+            rm -f "$PID_FILE"
+            return 0
+            ;;
+    esac
+
+    if [ ! -d "$PROC_DIR/$PID" ]; then
+        echo "Removing stale PID file: $PID_FILE (PID $PID is not running)"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    START_TIME=$(get_start_time "$PID")
+    if [ -z "$START_TIME" ]; then
+        echo "ERROR: Failed to read process start time for PID $PID" >&2
+        return 1
+    fi
+    INITIAL_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+    PAD_CMDLINE=" $INITIAL_CMDLINE "
+
+    MATCHED_CMD=""
+    case "$PAD_CMDLINE" in
+        *" $EXPECTED_CMD1 "*|*" /mnt/us/dashboard/${EXPECTED_CMD1##*/} "*)
+            MATCHED_CMD="$EXPECTED_CMD1"
+            ;;
+    esac
+    if [ -n "$EXPECTED_CMD2" ]; then
+        case "$PAD_CMDLINE" in
+            *" $EXPECTED_CMD2 "*|*" /mnt/us/dashboard/${EXPECTED_CMD2##*/} "*)
+                MATCHED_CMD="$EXPECTED_CMD2"
+                ;;
+        esac
+    fi
+
+    if [ -z "$MATCHED_CMD" ]; then
+        echo "WARNING: PID file $PID_FILE contains PID $PID, but cmdline ($INITIAL_CMDLINE) does not match expected targets. Leaving untouched." >&2
+        return 0
+    fi
+
+    # Process is validated. Send SIGTERM first.
+    echo "Stopping PID $PID ($INITIAL_CMDLINE)..."
+    kill -s TERM "$PID" 2>/dev/null || true
+
+    # Wait up to 3 seconds for exit
+    for i in 1 2 3; do
+        if [ -d "$PROC_DIR/$PID" ]; then
+            CUR_START_TIME=$(get_start_time "$PID")
+            CUR_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+            PAD_CUR_CMDLINE=" $CUR_CMDLINE "
+            CUR_MATCHED=""
+            case "$PAD_CUR_CMDLINE" in
+                *" $MATCHED_CMD "*|*" /mnt/us/dashboard/${MATCHED_CMD##*/} "*)
+                    CUR_MATCHED="1"
+                    ;;
+            esac
+            if [ "$CUR_START_TIME" != "$START_TIME" ] || [ -z "$CUR_MATCHED" ]; then
+                echo "WARNING: PID reuse detected for PID $PID during shutdown! Aborting stop for this PID." >&2
+                return 1
+            fi
+            sleep 1
+        fi
+    done
+
+    # Send SIGKILL if still running and identity matches
+    if [ -d "$PROC_DIR/$PID" ]; then
+        CUR_START_TIME=$(get_start_time "$PID")
+        CUR_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+        PAD_CUR_CMDLINE=" $CUR_CMDLINE "
+        CUR_MATCHED=""
+        case "$PAD_CUR_CMDLINE" in
+            *" $MATCHED_CMD "*|*" /mnt/us/dashboard/${MATCHED_CMD##*/} "*)
+                CUR_MATCHED="1"
+                ;;
+        esac
+        if [ "$CUR_START_TIME" != "$START_TIME" ] || [ -z "$CUR_MATCHED" ]; then
+            echo "WARNING: PID reuse detected for PID $PID before KILL! Aborting." >&2
+            return 1
+        fi
+        echo "PID $PID did not terminate, sending SIGKILL..."
+        kill -s KILL "$PID" 2>/dev/null || true
         sleep 1
     fi
-    rm -f "$WATCHDOG_PID_FILE"
-fi
-LOOP_PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
-if [ -f "$LOOP_PID_FILE" ]; then
-    PID=$(cat "$LOOP_PID_FILE")
-    if [ -n "$PID" ]; then
-        kill "$PID" 2>/dev/null || true
+
+    # Clean up PID file if successfully stopped or died
+    if [ ! -d "$PROC_DIR/$PID" ]; then
+        rm -f "$PID_FILE"
+    else
+        CUR_START_TIME=$(get_start_time "$PID")
+        if [ "$CUR_START_TIME" = "$START_TIME" ]; then
+            echo "ERROR: Failed to stop PID $PID" >&2
+            return 1
+        fi
     fi
-    rm -f "$LOOP_PID_FILE"
-fi
+    return 0
+}
+
+# Stop watchdog.pid (requires watchdog.sh under DASHBOARD_DIR)
+stop_validated "$DASHBOARD_DIR/watchdog.pid" "$DASHBOARD_DIR/watchdog.sh" ""
+
+# Stop dashboard_loop.pid (allows dashboard_loop.sh or refresh.sh under DASHBOARD_DIR)
+stop_validated "$DASHBOARD_DIR/dashboard_loop.pid" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/refresh.sh"
+
 exit 0
 EOF"""
 
@@ -806,6 +1106,15 @@ EOF"""
         'printf "%s\\n" "$DEVICE_ID" > "$DASHBOARD_DIR/device-id"',
         'printf "%s\\n" "$STATUS_TOKEN" > "$DASHBOARD_DIR/status-token"',
         'chmod 600 "$DASHBOARD_DIR/status-token" 2>/dev/null || true',
+        'EXISTING_LPM="0"',
+        'if [ -f "$DASHBOARD_DIR/device.env" ]; then',
+        '    RAW_LPM=$(grep "^LOW_POWER_MODE=" "$DASHBOARD_DIR/device.env" | tail -n 1 | cut -d= -f2- | tr -d "\\\\042\\\\047" | tr -d " " || echo "0")',
+        '    case "$RAW_LPM" in',
+        '        1) EXISTING_LPM="1" ;;',
+        '        *) EXISTING_LPM="0" ;;',
+        '    esac',
+        'fi',
+        'LOW_POWER_MODE="$EXISTING_LPM"',
         'cat > "$DASHBOARD_DIR/device.env" <<EOF',
         'SERVER_HOST="$SERVER_HOST"',
         'DEVICE_ID="$DEVICE_ID"',
@@ -813,6 +1122,7 @@ EOF"""
         'IMAGE_URL="$IMAGE_URL"',
         'STATUS_URL="$STATUS_URL"',
         f'REFRESH_INTERVAL_MINUTES="{int(config.get("refresh_interval_minutes", 60))}"',
+        'LOW_POWER_MODE="$LOW_POWER_MODE"',
         "EOF",
         'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',
         status_sh_content,
@@ -997,13 +1307,13 @@ def render_settings(
         enabled_label = (
             "Enabled" if listed_device["enabled"] else "Disabled"
         )
-        
+
         links = []
         links.append(
             f'<a href="{html.escape(listed_device["image_url"], quote=True)}" '
             'target="_blank" rel="noopener">Open PNG preview</a>'
         )
-        
+
         esp_warning = ""
         if listed_device["type"] == "esp32_epaper":
             bmp_url = f'/device/{listed_device["id"]}/image.bmp'
@@ -1016,14 +1326,14 @@ def render_settings(
                 '<span style="font-size: 1.1rem; line-height: 1;">⚠️</span> Push is unsupported for this device type'
                 '</div>'
             )
-            
+
         links.append(
             f'<a href="{html.escape(listed_device["config_url"], quote=True)}" '
             'target="_blank" rel="noopener">Open config endpoint</a>'
         )
-        
+
         links_html = '<div class="device-links">' + "".join(links) + '</div>'
-        
+
         regenerate_installer_html = ""
         if listed_device["type"] == "kindle_pw1":
             regenerate_installer_html = (
@@ -2344,7 +2654,7 @@ button:disabled {{
         <span class="brand-version">v2.3.0</span>
       </div>
     </div>
-    
+
     <nav class="sidebar-nav" aria-label="Dashboard sections">
       <div class="nav-section-title">MAIN</div>
       <button type="button" class="tab-btn active" data-tab="overview">
@@ -2374,13 +2684,13 @@ button:disabled {{
       <button type="button" class="tab-btn" data-tab="maintenance">
         <span class="tab-icon">🔧</span> Advanced
       </button>
-      
+
       <div class="nav-section-title">QUICK ACTIONS</div>
       <button type="button" class="sidebar-action-btn" id="sidebar-push-all-btn">
         <span class="tab-icon">⚡</span> Push to All Kindles <span class="badge-secret">SECRET</span>
       </button>
     </nav>
-    
+
     <div class="sidebar-footer">
       <div class="status-indicator">
         <span class="status-dot"></span>
@@ -2406,11 +2716,11 @@ button:disabled {{
           </div>
         </div>
       </div>
-      
+
       <div class="top-bar-right">
         <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" id="top-bar-preview-btn" class="btn btn-outline" data-preview-action="open">Preview</a>
         <button type="button" id="top-bar-push-btn" class="btn btn-primary" data-settings-action="push">Push to Kindle</button>
-        
+
         <!-- More Actions Dropdown -->
         <div class="more-dropdown">
           <button type="button" class="btn btn-icon" id="more-menu-trigger">•••</button>
@@ -2422,7 +2732,7 @@ button:disabled {{
             <button type="button" class="more-menu-item" id="menu-view-logs">📋 View Logs</button>
           </div>
         </div>
-        
+
         <!-- Segmented Theme Switcher -->
         <div class="theme-toggle-group" role="group" aria-label="Theme selector">
           <button type="button" class="theme-toggle-btn" data-theme-val="light" title="Light theme">☀️</button>
@@ -2445,7 +2755,7 @@ button:disabled {{
 <section class="tab-content active" id="overview">
   <h2>Overview</h2>
   <p class="section-note">Quick status and actions for your dashboard.</p>
-  
+
   <!-- Status Cards Row -->
   <div class="status-cards-row">
     <div class="status-card">
@@ -2456,7 +2766,7 @@ button:disabled {{
       <div class="status-card-value">All systems normal</div>
       <div class="status-card-desc">Updated just now</div>
     </div>
-    
+
     <div class="status-card">
       <div class="status-card-header">
         <span class="status-card-icon">📅</span>
@@ -2465,7 +2775,7 @@ button:disabled {{
       <div class="status-card-value" id="status-last-generated" style="font-size:0.95rem; overflow-wrap:anywhere;">{html.escape(status_message or 'No result in this session')}</div>
       <div class="status-card-desc">Updated recently</div>
     </div>
-    
+
     <div class="status-card">
       <div class="status-card-header">
         <span class="status-card-icon">📤</span>
@@ -2474,7 +2784,7 @@ button:disabled {{
       <div class="status-card-value" id="status-last-pushed">Today, 20:15</div>
       <div class="status-card-desc">4 minutes ago</div>
     </div>
-    
+
     <div class="status-card">
       <div class="status-card-header">
         <span class="status-card-icon">⏰</span>
@@ -2484,7 +2794,7 @@ button:disabled {{
       <div class="status-card-desc">Every {config.get('refresh_interval_minutes', 10)} minutes</div>
     </div>
   </div>
-  
+
   <!-- Overview Grid -->
   <div class="overview-grid">
     <!-- Column 1: Dashboard Preview -->
@@ -2499,7 +2809,7 @@ button:disabled {{
         <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" class="btn btn-block" id="btn-open-preview" data-preview-action="open">Open Full Preview</a>
       </div>
     </div>
-    
+
     <!-- Column 2: Quick Actions -->
     <div class="grid-column actions-col">
       <div class="card" style="padding: 18px;">
@@ -2515,7 +2825,7 @@ button:disabled {{
             </div>
             <span class="action-chevron">›</span>
           </button>
-          
+
           <button type="button" class="action-item" id="overview-push-kindle-btn" style="border:1px solid var(--line); min-height:auto;" data-settings-action="push">
             <span class="action-icon">📤</span>
             <div class="action-body">
@@ -2524,7 +2834,7 @@ button:disabled {{
             </div>
             <span class="action-chevron">›</span>
           </button>
-          
+
           <button type="button" class="action-item" id="action-push-all" style="border:1px solid var(--line); min-height:auto; display:flex;">
             <span class="action-icon">⚡</span>
             <div class="action-body">
@@ -2534,7 +2844,7 @@ button:disabled {{
             <span class="badge-secret-sm">SECRET</span>
             <span class="action-chevron">›</span>
           </button>
-          
+
           <a href="/api/device/default-kindle/config" target="_blank" class="action-item" id="action-view-config">
             <span class="action-icon">📋</span>
             <div class="action-body">
@@ -2543,7 +2853,7 @@ button:disabled {{
             </div>
             <span class="action-chevron">›</span>
           </a>
-          
+
           <button type="button" class="action-item" id="action-restart-services" style="border:1px solid var(--line); min-height:auto;">
             <span class="action-icon">🔄</span>
             <div class="action-body">
@@ -2555,7 +2865,7 @@ button:disabled {{
         </div>
       </div>
     </div>
-    
+
     <!-- Column 3: Device Info & Special Events -->
     <div class="grid-column info-col">
       <div class="card" style="padding: 18px; margin-bottom: 20px;">
@@ -2589,12 +2899,12 @@ button:disabled {{
             <input type="file" id="celebration-image-input" accept="image/png, image/jpeg" style="display:none">
             <button type="button" class="btn btn-sm btn-outline" id="btn-choose-celebration-image" style="margin-top: 10px; min-height:28px; font-size:0.75rem; padding:0 12px;">Choose Image</button>
           </div>
-          
+
           <div class="celebration-preview-container" id="celebration-preview-box" style="display:none; margin-top: 15px; position:relative;">
             <img id="celebration-preview-img" src="" alt="Celebration upload preview" style="width:100%; border-radius:8px; border:1.5px solid var(--line);">
             <button type="button" class="btn-remove-preview" id="btn-remove-celebration" style="position:absolute; top:8px; right:8px; background:rgba(0,0,0,0.6); color:white; border:none; border-radius:50%; width:24px; height:24px; cursor:pointer; font-weight:bold; display:flex; align-items:center; justify-content:center; font-size:0.9rem;">×</button>
           </div>
-          
+
           <div style="margin-top:15px; display:none;" id="celebration-meta-info">
             <div class="celebration-title" id="celebration-title-display" style="font-weight:700; font-size:0.95rem; margin-bottom:2px;">Happy New Year! 🎉</div>
             <div class="celebration-schedule" style="font-size:0.8rem; color:var(--muted); margin-bottom:12px;">01 Jan 2026 · <span class="badge badge-success-sm" style="font-size:0.65rem; padding:1px 4px;">Scheduled</span></div>
@@ -2605,7 +2915,7 @@ button:disabled {{
       </div>
     </div>
   </div>
-  
+
   <!-- Recent Activity -->
   <div class="card" style="margin-top: 24px;">
     <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 16px;">
@@ -2773,7 +3083,7 @@ button:disabled {{
 <section class="card tab-content" id="daily_notes">
   <h2>Daily Notes &amp; Reminders</h2>
   <p class="section-note">Add and manage household notifications, chores, and events.</p>
-  
+
   <!-- Today's Preview -->
   <div class="future-box" style="margin-bottom: 24px; padding: 18px;">
     <h3 style="margin: 0 0 10px; font-size: 1.05rem; font-weight: 700;">Active Today Preview</h3>
@@ -2797,7 +3107,7 @@ button:disabled {{
   <div id="notes-form-view" style="display: none; border-top: 1px solid var(--line); padding-top: 20px; margin-top: 20px;">
     <h3 id="notes-form-title" style="margin: 0 0 16px; font-size: 1.1rem; font-weight: 700;">Add Reminder</h3>
     <input type="hidden" id="note-id">
-    
+
     <label class="field">
       <span>Category</span>
       <select id="note-category">
@@ -2809,7 +3119,7 @@ button:disabled {{
         <option value="TODO">TODO (Tasks)</option>
       </select>
     </label>
-    
+
     <label class="field">
       <span>Priority</span>
       <select id="note-priority">
@@ -2818,12 +3128,12 @@ button:disabled {{
         <option value="high">High (! Urgent)</option>
       </select>
     </label>
-    
+
     <label class="field">
       <span>Title</span>
       <input type="text" id="note-title" placeholder="Osman PE kit, Bin collection, Dentist...">
     </label>
-    
+
     <label class="field">
       <span>Detail (Optional)</span>
       <input type="text" id="note-detail" placeholder="16:30, Put out tonight, Take library books...">
@@ -2924,7 +3234,7 @@ button:disabled {{
 <section class="card tab-content" id="special_events">
   <h2>Special Events &amp; Celebrations</h2>
   <p class="section-note">Override the default dashboard layout on special days (Birthdays, Holidays, Anniversaries) with custom full-screen images.</p>
-  
+
   <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px;">
     <div>
       <h3 style="margin-top:0; font-size:1.1rem; font-weight:700;">Add Special Event Image</h3>
@@ -2932,13 +3242,13 @@ button:disabled {{
         <span>Event Title</span>
         <input type="text" id="event-title" placeholder="e.g. Happy New Year, Osman's Birthday...">
       </label>
-      
+
       <label class="field">
         <span>Trigger Date</span>
         <input type="date" id="event-date" style="width:100%; min-height:46px; padding:10px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); font-size:0.95rem;">
         <span style="display:block; font-size:0.75rem; color:var(--muted); margin-top:4px;">The celebration image will automatically display on all active e-ink dashboards on this day.</span>
       </label>
-      
+
       <label class="field">
         <span>Select Celebration Image</span>
         <div class="upload-area" id="tab-celebration-upload-box" style="border: 2px dashed var(--line); padding: 24px; text-align: center; border-radius: 12px; background: var(--soft);">
@@ -2949,13 +3259,13 @@ button:disabled {{
           <button type="button" class="btn btn-sm btn-outline" id="btn-tab-choose-image" style="margin-top:12px;">Select File</button>
         </div>
       </label>
-      
+
       <div class="button-grid" style="margin-top:24px;">
         <button type="button" id="btn-save-event" style="background:var(--ink); color:var(--card); border-color:var(--ink);">Save Event</button>
         <button type="button" id="btn-cancel-event">Clear</button>
       </div>
     </div>
-    
+
     <div>
       <h3 style="margin-top:0; font-size:1.1rem; font-weight:700;">Scheduled Celebrations</h3>
       <div id="scheduled-events-list" style="display:grid; gap:12px; margin-top:14px;">
@@ -3093,7 +3403,7 @@ let remindersPreviewReady = false;
 
 async function loadDeviceState() {{
   const selected = localStorage.getItem(selectedDeviceKey) || "default-kindle";
-  
+
   // Fetch config dynamically to get the relative image_url
   let imageUrl = `/device/${{selected}}/image.png`;
   let configData = null;
@@ -3109,20 +3419,20 @@ async function loadDeviceState() {{
   }} catch (e) {{
     console.error("Failed to load device config:", e);
   }}
-  
+
   // Relative image paths belong to the image server, never the settings port.
   const resolvedImageUrl = resolveDeviceImageUrl(imageUrl, selected);
-  
+
   // Update UI previews / config links / info values
   const previewImg = document.getElementById("live-dashboard-preview");
   const actionViewConfig = document.getElementById("action-view-config");
-  
+
   if (previewImg) previewImg.src = resolvedImageUrl + `?t=${{new Date().getTime()}}`;
   document.querySelectorAll('[data-preview-action="open"]').forEach(link => {{
     link.href = resolvedImageUrl;
   }});
   if (actionViewConfig) actionViewConfig.href = `/api/device/${{selected}}/config`;
-  
+
   // Find registered card for selected device to copy details to Info list
   const selectedCard = document.querySelector(`.registered-device[data-device-id="${{selected}}"]`);
   if (selectedCard) {{
@@ -3131,7 +3441,7 @@ async function loadDeviceState() {{
     const id = details[0].textContent;
     const type = details[1].textContent;
     const resolution = details[2].textContent;
-    
+
     // Connection info (if available)
     const connSpans = selectedCard.querySelectorAll(".device-connection span");
     let host = "—", user = "—", sshProfile = "—", port = "—", method = "—";
@@ -3143,7 +3453,7 @@ async function loadDeviceState() {{
       if (text.startsWith("port:")) port = text.replace("port:", "").trim();
       if (text.startsWith("method:")) method = text.replace("method:", "").trim();
     }});
-    
+
     document.getElementById("info-device-name").textContent = name;
     document.getElementById("info-device-model").textContent = type;
     document.getElementById("info-device-ip").textContent = host;
@@ -3152,30 +3462,30 @@ async function loadDeviceState() {{
     document.getElementById("info-device-config-path").textContent = `/api/device/${{selected}}/config`;
     document.getElementById("info-device-resolution").textContent = resolution;
   }}
-  
+
   try {{
     const [status, log] = await Promise.all([
       deviceApi(`/api/device/${{selected}}/status`),
       deviceApi(`/api/device/${{selected}}/log`),
     ]);
-    
+
     const connectedStr = status.connected ? "Online" : "Offline";
     connectionValue.textContent = connectedStr;
-    
+
     const overviewKindleConn = document.getElementById("overview-kindle-connection");
     if (overviewKindleConn) {{
       overviewKindleConn.textContent = connectedStr;
       overviewKindleConn.style.color = status.connected ? "var(--success)" : "var(--danger)";
     }}
-    
+
     brightnessValue.textContent = status.brightness !== undefined ? status.brightness : "—";
-    
+
     let autostartStr = "—";
     if (status.autostart !== undefined) {{
       autostartStr = status.autostart ? "Enabled" : "Disabled";
     }}
     autostartValue.textContent = autostartStr;
-    
+
     if (deviceLog) deviceLog.textContent = log.log || "No log available";
   }} catch (error) {{
     connectionValue.textContent = "Offline";
@@ -3242,32 +3552,32 @@ function applySelectedDevice(deviceId) {{
     ? deviceId
     : (available.includes("default-kindle") ? "default-kindle" : available[0]);
   if (!selected) return;
-  
+
   selectedDeviceControl.value = selected;
   if (selectedDeviceField) selectedDeviceField.value = selected;
-  
+
   // Update top bar device select if it exists
   const topSelect = document.getElementById("top-selected-device");
   if (topSelect) topSelect.value = selected;
-  
+
   const selectedOption = selectedDeviceControl.options[selectedDeviceControl.selectedIndex];
   if (editingDeviceName && selectedOption) {{
     editingDeviceName.textContent = selectedOption.textContent.replace(` (${{selected}})`, "");
   }}
-  
+
   registeredDeviceCards.forEach(card => {{
     const active = card.dataset.deviceId === selected;
     card.classList.toggle("selected", active);
     if (active) card.setAttribute("aria-current", "true");
     else card.removeAttribute("aria-current");
   }});
-  
+
   localStorage.setItem(selectedDeviceKey, selected);
-  
+
   if (remindersPreviewReady) {{
     renderRemindersPreview();
   }}
-  
+
   // Load selected device state asynchronously
   loadDeviceState();
 }}
@@ -3366,11 +3676,11 @@ document.addEventListener("click", async (e) => {{
   const card = btn.closest(".registered-device");
   const container = card.querySelector(".installer-command-wrap");
   const textarea = card.querySelector(".regenerated-installer-command");
-  
+
   btn.disabled = true;
   const originalText = btn.textContent;
   btn.textContent = "Regenerating...";
-  
+
   try {{
     const result = await deviceApi(`/api/device/${{encodeURIComponent(deviceId)}}/installer-token/reset`, {{
       method: "POST"
@@ -3702,13 +4012,13 @@ function renderNoteDeviceCheckboxes() {{
     allDevicesList.forEach(dev => {{
       const lbl = document.createElement("label");
       lbl.style.cssText = "display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 600;";
-      
+
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.name = "note_device";
       cb.value = dev.id;
       cb.style.cssText = "width: 18px; height: 18px; accent-color: var(--ink); margin: 0;";
-      
+
       lbl.append(cb);
       lbl.append(document.createTextNode(" " + dev.name + " (" + dev.id + ")"));
       noteIndividualDevicesBox.append(lbl);
@@ -3748,65 +4058,65 @@ function renderRemindersList() {{
     notesList.innerHTML = `<span style="color: var(--muted); font-size: 0.9rem;">No reminders configured. Click '+ Add Reminder' to start.</span>`;
     return;
   }}
-  
+
   remindersCache.forEach(item => {{
     const card = document.createElement("div");
     card.style.cssText = "display: flex; flex-direction: column; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); margin-bottom: 8px;";
-    
+
     const row1 = document.createElement("div");
     row1.style.cssText = "display: flex; align-items: center; justify-content: space-between; gap: 10px;";
-    
+
     const left = document.createElement("div");
     left.style.cssText = "display: flex; align-items: center; gap: 10px;";
-    
+
     const toggle = document.createElement("input");
     toggle.type = "checkbox";
     toggle.checked = item.enabled !== false;
     toggle.style.cssText = "width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; margin: 0;";
     toggle.addEventListener("change", () => toggleReminder(item.id, toggle.checked));
-    
+
     const badge = document.createElement("span");
     badge.textContent = item.category || "NOTE";
     badge.style.cssText = "font-size: 0.75rem; font-weight: 700; padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--soft);";
-    
+
     const title = document.createElement("strong");
     title.textContent = item.title;
     title.style.cssText = "font-size: 0.95rem; font-weight: 700;";
     if (item.priority === "high") {{
       title.innerHTML += ' <span style="color: var(--danger); font-weight: 800;">[!]</span>';
     }}
-    
+
     left.append(toggle, badge, title);
-    
+
     const right = document.createElement("div");
     right.style.cssText = "display: flex; gap: 6px;";
-    
+
     const btnEdit = document.createElement("button");
     btnEdit.type = "button";
     btnEdit.textContent = "Edit";
     btnEdit.style.cssText = "min-height: 28px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; border-radius: 6px; margin: 0;";
     btnEdit.addEventListener("click", () => editReminderForm(item));
-    
+
     const btnDelete = document.createElement("button");
     btnDelete.type = "button";
     btnDelete.textContent = "Delete";
     btnDelete.style.cssText = "min-height: 28px; padding: 2px 10px; font-size: 0.78rem; font-weight: 600; border-radius: 6px; border-color: var(--danger); color: var(--danger); background: var(--danger-soft); margin: 0;";
     btnDelete.addEventListener("click", () => deleteReminder(item.id));
-    
+
     right.append(btnEdit, btnDelete);
-    
+
     row1.append(left, right);
     card.append(row1);
-    
+
     const row2 = document.createElement("div");
     row2.style.cssText = "font-size: 0.82rem; color: var(--muted); margin-left: 28px; display: flex; flex-direction: column; gap: 2px;";
-    
+
     if (item.detail) {{
       const detail = document.createElement("span");
       detail.textContent = `Detail: ${{item.detail}}`;
       row2.append(detail);
     }}
-    
+
     let schedStr = "Always Active";
     if (item.date) {{
       schedStr = `One-off: ${{item.date}}`;
@@ -3819,18 +4129,18 @@ function renderRemindersList() {{
         schedStr = `Monthly: Day ${{item.recurrence.day_of_month}}`;
       }}
     }}
-    
+
     if (item.start_date) {{
       schedStr = `(Starts: ${{item.start_date}}) ` + schedStr;
     }}
     if (item.expires_after_date) {{
       schedStr += ` (Expires: ${{item.expires_after_date}})`;
     }}
-    
+
     const sched = document.createElement("span");
     sched.textContent = `Schedule: ${{schedStr}}`;
     row2.append(sched);
-    
+
     card.append(row2);
     notesList.append(card);
   }});
@@ -3838,7 +4148,7 @@ function renderRemindersList() {{
 
 function renderRemindersPreview() {{
   notesPreviewList.replaceChildren();
-  
+
   const daysOfWeek = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
   const now = new Date();
   const currentWeekday = daysOfWeek[now.getDay()];
@@ -3846,7 +4156,7 @@ function renderRemindersPreview() {{
   const currentMonth = String(now.getMonth() + 1).padStart(2, '0');
   const currentDate = String(now.getDate()).padStart(2, '0');
   const currentDateStr = `${{currentYear}}-${{currentMonth}}-${{currentDate}}`;
-  
+
   const selectedDevice = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
   const activeItems = remindersCache.filter(item => {{
     if (item.enabled === false) return false;
@@ -3856,19 +4166,19 @@ function renderRemindersPreview() {{
         return false;
       }}
     }}
-    
+
     if (item.start_date && currentDateStr < item.start_date) {{
       return false;
     }}
-    
+
     if (item.expires_after_date && currentDateStr > item.expires_after_date) {{
       return false;
     }}
-    
+
     if (item.date) {{
       return item.date === currentDateStr;
     }}
-    
+
     if (item.recurrence) {{
       const recType = item.recurrence.type;
       if (recType === "weekly") {{
@@ -3902,10 +4212,10 @@ function renderRemindersPreview() {{
       }}
       return false;
     }}
-    
+
     return true;
   }});
-  
+
   activeItems.sort((a, b) => {{
     const aPriority = a.priority === "high" ? 0 : a.priority === "normal" ? 1 : 2;
     const bPriority = b.priority === "high" ? 0 : b.priority === "normal" ? 1 : 2;
@@ -3915,16 +4225,16 @@ function renderRemindersPreview() {{
     if (aCat !== bCat) return aCat.localeCompare(bCat);
     return (a.title || "").localeCompare(b.title || "");
   }});
-  
+
   if (activeItems.length === 0) {{
     notesPreviewList.innerHTML = `<span style="color: var(--muted); font-size: 0.88rem; font-style: italic;">No active reminders for today.</span>`;
     return;
   }}
-  
+
   activeItems.forEach(item => {{
     const row = document.createElement("div");
     row.style.cssText = "display: flex; align-items: center; gap: 8px; font-size: 0.88rem;";
-    
+
     const bullet = document.createElement("span");
     bullet.textContent = "•";
     bullet.style.cssText = "color: var(--ink); font-weight: 800;";
@@ -3932,13 +4242,13 @@ function renderRemindersPreview() {{
       bullet.textContent = "!";
       bullet.style.cssText = "color: var(--danger); font-weight: 800;";
     }}
-    
+
     const cat = document.createElement("strong");
     cat.textContent = `[${{item.category || "NOTE"}}]`;
-    
+
     const title = document.createElement("span");
     title.textContent = item.title;
-    
+
     row.append(bullet, cat, title);
     if (item.detail) {{
       const detail = document.createElement("span");
@@ -3946,7 +4256,7 @@ function renderRemindersPreview() {{
       detail.style.cssText = "color: var(--muted); font-size: 0.82rem; margin-left: 4px;";
       row.append(detail);
     }}
-    
+
     notesPreviewList.append(row);
   }});
 }}
@@ -3997,7 +4307,7 @@ function resetNoteForm() {{
     noteIndividualDevicesBox.style.display = "none";
   }}
   document.querySelectorAll('input[name="note_device"]').forEach(cb => cb.checked = false);
-  
+
   document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
   document.querySelectorAll('input[name="weekly_days"]').forEach(cb => cb.checked = false);
   updateScheduleVisibility();
@@ -4030,7 +4340,7 @@ function editReminderForm(item) {{
   noteDetailInput.value = item.detail || "";
   noteStartDateInput.value = item.start_date || "";
   noteExpiresInput.value = item.expires_after_date || "";
-  
+
   if (item.date) {{
     document.querySelector('input[name="schedule_type"][value="oneoff"]').checked = true;
     noteDateInput.value = item.date;
@@ -4056,7 +4366,7 @@ function editReminderForm(item) {{
   }} else {{
     document.querySelector('input[name="schedule_type"][value="always"]').checked = true;
   }}
-  
+
   if (item.devices && item.devices.length > 0) {{
     if (noteDeviceAllCb) noteDeviceAllCb.checked = false;
     if (noteIndividualDevicesBox) noteIndividualDevicesBox.style.display = "grid";
@@ -4070,7 +4380,7 @@ function editReminderForm(item) {{
       cb.checked = false;
     }});
   }}
-  
+
   updateScheduleVisibility();
   showForm("Edit Reminder");
 }}
@@ -4081,11 +4391,11 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
     alert("Title is required!");
     return;
   }}
-  
+
   const scheduleType = document.querySelector('input[name="schedule_type"]:checked').value;
   let date = null;
   let recurrence = null;
-  
+
   if (scheduleType === "oneoff") {{
     date = noteDateInput.value;
     if (!date) {{
@@ -4135,7 +4445,7 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
       day_of_month: dayVal
     }};
   }}
-  
+
   let devices = null;
   if (noteDeviceAllCb && !noteDeviceAllCb.checked) {{
     const selectedDevices = [];
@@ -4160,7 +4470,7 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
     expires_after_date: noteExpiresInput.value || null,
     devices: devices
   }};
-  
+
   try {{
     await deviceApi("/api/notes/save", {{
       method: "POST",
@@ -4200,7 +4510,7 @@ function handleImageSelect(file) {{
   const reader = new FileReader();
   reader.onload = (e) => {{
     uploadedImageBase64 = e.target.result;
-    
+
     // Update main overview preview
     if (celebrationPreviewImg) celebrationPreviewImg.src = uploadedImageBase64;
     if (celebrationPreviewBox) celebrationPreviewBox.style.display = "block";
@@ -4260,32 +4570,32 @@ function renderSpecialEvents() {{
       events.forEach((evt, idx) => {{
         const row = document.createElement("div");
         row.style.cssText = "display:flex; gap:14px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--soft);";
-        
+
         const thumb = document.createElement("div");
         thumb.style.cssText = "width:60px; height:80px; border-radius:6px; overflow:hidden; border:1px solid var(--line); flex-shrink:0;";
         const img = document.createElement("img");
         img.src = evt.image || "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='80' viewBox='0 0 60 80'><rect width='100%25' height='100%25' fill='%23e2e8f0'/><circle cx='30' cy='40' r='12' fill='%23cbd5e1'/></svg>";
         img.style.cssText = "width:100%; height:100%; object-fit:cover;";
         thumb.append(img);
-        
+
         const body = document.createElement("div");
         body.style.cssText = "flex-grow:1; display:flex; flex-direction:column; justify-content:center;";
-        
+
         const title = document.createElement("strong");
         title.textContent = evt.title;
         title.style.fontSize = "0.95rem";
-        
+
         const dateSpan = document.createElement("span");
         dateSpan.textContent = evt.date;
         dateSpan.style.cssText = "font-size:0.8rem; color:var(--muted); margin-top:2px;";
-        
+
         const actionRow = document.createElement("div");
         actionRow.style.cssText = "display:flex; gap:10px; margin-top:8px;";
-        
+
         const badge = document.createElement("span");
         badge.className = "badge badge-success-sm";
         badge.textContent = "Scheduled";
-        
+
         const deleteBtn = document.createElement("button");
         deleteBtn.type = "button";
         deleteBtn.style.cssText = "background:none; border:none; padding:0; color:var(--danger); font-size:0.75rem; font-weight:600; cursor:pointer;";
@@ -4295,7 +4605,7 @@ function renderSpecialEvents() {{
           list.splice(idx, 1);
           saveSpecialEvents(list);
         }});
-        
+
         actionRow.append(badge, deleteBtn);
         body.append(title, dateSpan, actionRow);
         row.append(thumb, body);
@@ -4320,7 +4630,7 @@ if (btnSaveEvent) {{
       image: uploadedImageBase64
     }});
     saveSpecialEvents(list);
-    
+
     // Reset form
     eventTitle.value = "";
     eventDate.value = "";
@@ -4557,7 +4867,7 @@ def make_handler(
                 hostname = parts[0]
                 proto = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
                 image_server_url = f"{proto}://{hostname}:{image_server_port}"
-                
+
                 # Check for explicit IMAGE_SERVER_URL environment override
                 import os
                 env_url = os.environ.get("IMAGE_SERVER_URL")
@@ -4733,7 +5043,7 @@ def make_handler(
                 config["pairing_token"] = new_token
                 if "status_token" not in config or not config["status_token"]:
                     config["status_token"] = generate_device_token()
-                
+
                 data = (
                     json.dumps(config, indent=2, ensure_ascii=False) + "\n"
                 ).encode("utf-8")
@@ -4864,16 +5174,16 @@ def make_handler(
                 category = candidate.get("category", "NOTE").upper()
                 if category not in ("BIN", "SCHOOL", "APPT", "HOME", "TODO", "NOTE"):
                     category = "NOTE"
-                
+
                 priority = candidate.get("priority", "normal").lower()
                 if priority not in ("low", "normal", "high"):
                     priority = "normal"
-                    
+
                 title = candidate.get("title", "").strip()
                 if not title:
                     self.send_json(400, {"ok": False, "error": "Title is required"})
                     return
-                    
+
                 from datetime import datetime
                 # Validate date fields
                 start_date = candidate.get("start_date") or None
@@ -4884,7 +5194,7 @@ def make_handler(
                     except Exception:
                         self.send_json(400, {"ok": False, "error": "Start Date must be in YYYY-MM-DD format"})
                         return
-                        
+
                 expires = candidate.get("expires_after_date") or None
                 if expires:
                     expires = expires.strip()
@@ -4913,7 +5223,7 @@ def make_handler(
                     if rec_type not in ("weekly", "fortnightly", "monthly"):
                         self.send_json(400, {"ok": False, "error": f"Invalid recurrence type: {rec_type}"})
                         return
-                        
+
                     if rec_type in ("weekly", "fortnightly"):
                         days = recurrence.get("days")
                         if not days or not isinstance(days, list):
@@ -4923,7 +5233,7 @@ def make_handler(
                         if any(d not in valid_days for d in days):
                             self.send_json(400, {"ok": False, "error": "Invalid weekday selected"})
                             return
-                            
+
                         if rec_type == "fortnightly":
                             anchor_date = recurrence.get("anchor_date")
                             if not anchor_date:
@@ -4934,7 +5244,7 @@ def make_handler(
                             except Exception:
                                 self.send_json(400, {"ok": False, "error": "Anchor Date must be in YYYY-MM-DD format"})
                                 return
-                                
+
                     elif rec_type == "monthly":
                         day_of_month = recurrence.get("day_of_month")
                         if day_of_month is None:
@@ -4947,7 +5257,7 @@ def make_handler(
                         except Exception:
                             self.send_json(400, {"ok": False, "error": "Monthly day of month must be between 1 and 31"})
                             return
-                    
+
                 devices = candidate.get("devices")
                 if devices is not None:
                     if not isinstance(devices, list):
@@ -4972,7 +5282,7 @@ def make_handler(
 
                 notes = load_daily_notes()
                 items = notes.setdefault("items", [])
-                
+
                 item_id = candidate.get("id")
                 if item_id:
                     found = False
@@ -5019,7 +5329,7 @@ def make_handler(
                     if devs:
                         new_item["devices"] = devs
                     items.append(new_item)
-                    
+
                 save_daily_notes(notes)
                 try:
                     regenerate()

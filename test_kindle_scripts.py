@@ -18,6 +18,10 @@ class KindleScriptsTests(unittest.TestCase):
         self.sandbox = Path(self.tempdir.name)
         self.bin_dir = self.sandbox / "bin"
         self.bin_dir.mkdir(parents=True)
+        shutil.copy2(REFRESH_ONCE_SH, self.sandbox / "refresh-once.sh")
+        (self.sandbox / "refresh-once.sh").chmod(0o755)
+        shutil.copy2(SEND_STATUS_SH, self.sandbox / "send-status.sh")
+        (self.sandbox / "send-status.sh").chmod(0o755)
         
         self.create_mock_bin("wget", (
             "#!/bin/sh\n"
@@ -65,12 +69,21 @@ class KindleScriptsTests(unittest.TestCase):
         ))
         self.create_mock_bin("lipc-set-prop", "#!/bin/sh\necho \"lipc-set-prop $@\" >> \"$DASHBOARD_DIR/calls.log\"")
         self.create_mock_bin("eips", "#!/bin/sh\necho \"eips $@\" >> \"$DASHBOARD_DIR/calls.log\"")
-        self.create_mock_bin("sleep", "#!/bin/sh\necho \"sleep $@\" >> \"$DASHBOARD_DIR/calls.log\"")
+        self.create_mock_bin("sleep", (
+            "#!/bin/sh\n"
+            "echo \"sleep $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
+            "GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null)\n"
+            "if [ -n \"$GPID\" ]; then\n"
+            "  kill -s TERM $GPID\n"
+            "fi\n"
+            "exit 0\n"
+        ))
 
         self.env = dict(os.environ)
         self.env["PATH"] = f"{self.bin_dir}:{self.env.get('PATH', '')}"
         self.env["DASHBOARD_DIR"] = str(self.sandbox)
         self.env["EIPS_BIN"] = str(self.bin_dir / "eips")
+        self.env["SLEEP_BIN"] = "sleep"
         self.env["MOCK_CURL_MODE"] = "ok"
 
     def tearDown(self):
@@ -173,7 +186,7 @@ class KindleScriptsTests(unittest.TestCase):
             encoding="utf-8",
         )
         code, _, _ = self.run_script(REFRESH_SH, timeout=3)
-        self.assertEqual(code, -1)
+        self.assertEqual(code, 0)
         calls_log = self.sandbox / "calls.log"
         self.assertTrue(calls_log.exists())
         calls = calls_log.read_text(encoding="utf-8")
@@ -250,6 +263,584 @@ class KindleScriptsTests(unittest.TestCase):
         self.assertIn("com.lab126.wifid enable 1", once_content)
         self.assertIn("com.lab126.wifid enable 0", once_content)
         self.assertIn("send-status.sh", once_content)
+
+    def test_low_power_mode_disabled_falls_back_to_sleep(self):
+        # LOW_POWER_MODE=0 or unset
+        (self.sandbox / "device.env").write_text("LOW_POWER_MODE=0\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
+        # Run with a short timeout to let the loop execute a cycle and then kill it
+        # Since LOW_POWER_MODE=0, it will not attempt RTC setup but call sleep
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+
+        # Verify the logs do NOT contain low-power suspend logs
+        log_file = self.sandbox / "dashboard.log"
+        self.assertFalse(log_file.exists())
+
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 300", calls)
+
+    def test_low_power_mode_rtc1_missing_falls_back(self):
+        (self.sandbox / "device.env").write_text("LOW_POWER_MODE=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
+        # Ensure sys class rtc directory does NOT exist (rtc1 missing)
+        self.env["RTC_SYS_DIR"] = str(self.sandbox / "nonexistent_rtc")
+
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+
+        log_file = self.sandbox / "dashboard.log"
+        self.assertTrue(log_file.exists())
+        logs = log_file.read_text(encoding="utf-8")
+
+        self.assertIn("[low-power] refresh started", logs)
+        self.assertIn("fallback reason: rtc1 missing or permissions invalid", logs)
+        self.assertIn("[low-power] selected interval: 300s", logs)
+        # Verify that it falls back to normal sleep
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 300", calls)
+
+    def test_low_power_mode_wakealarm_write_failure(self):
+        (self.sandbox / "device.env").write_text("LOW_POWER_MODE=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
+
+        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
+        rtc_dir.mkdir(parents=True)
+        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
+
+        # Make wakealarm a directory to force write failure
+        (rtc_dir / "wakealarm").mkdir()
+
+        self.env["RTC_SYS_DIR"] = str(rtc_dir)
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+
+        log_file = self.sandbox / "dashboard.log"
+        logs = log_file.read_text(encoding="utf-8")
+        self.assertTrue("failed to clear existing wakealarm" in logs or "wakealarm write failure" in logs)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 300", calls)
+
+    def test_low_power_mode_wakealarm_verification_mismatch(self):
+        (self.sandbox / "device.env").write_text("LOW_POWER_MODE=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
+
+        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
+        rtc_dir.mkdir(parents=True)
+        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
+        (rtc_dir / "wakealarm").write_text("1720001800\n", encoding="utf-8")
+
+        # Mock 'cat' script inside self.bin_dir to return mismatch when reading wakealarm
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"wakealarm\"; then\n"
+            "  echo '9999999999'\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+
+        self.env["RTC_SYS_DIR"] = str(rtc_dir)
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+
+        log_file = self.sandbox / "dashboard.log"
+        logs = log_file.read_text(encoding="utf-8")
+        self.assertIn("fallback reason: wakealarm verification mismatch", logs)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 300", calls)
+
+    def test_low_power_mode_successful_rtc_setup_and_suspend(self):
+        (self.sandbox / "device.env").write_text("LOW_POWER_MODE=1\nREFRESH_INTERVAL_MINUTES=30\n", encoding="utf-8")
+
+        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
+        rtc_dir.mkdir(parents=True)
+        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
+        (rtc_dir / "wakealarm").write_text("0\n", encoding="utf-8")
+
+        power_state = self.sandbox / "sys/power/state"
+        power_state.parent.mkdir(parents=True, exist_ok=True)
+        power_state.write_text("", encoding="utf-8")
+
+        # Mock cat to update since_epoch when we read it AFTER suspend to simulate elapsed time
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  if [ -f \"$DASHBOARD_DIR/sys/power/state\" ] && grep -q mem \"$DASHBOARD_DIR/sys/power/state\" 2>/dev/null; then\n"
+            "    echo '1720001800'\n"
+            "  else\n"
+            "    echo '1720000000'\n"
+            "  fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+
+        # Mock 'sync' command to sleep briefly so it doesn't spin infinitely fast
+        self.create_mock_bin("sync", "#!/bin/sh\necho \"sync called\" >> \"$DASHBOARD_DIR/calls.log\"\n/bin/sleep 0.1")
+
+        # Override mock wget to terminate parent on the second iteration (config URL request after resume)
+        self.create_mock_bin("wget", (
+            "#!/bin/sh\n"
+            "echo \"wget $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
+            "if echo \"$@\" | grep -q \"config\"; then\n"
+            "  CALLS=0\n"
+            "  if [ -f \"$DASHBOARD_DIR/wget_calls\" ]; then\n"
+            "    CALLS=$(cat \"$DASHBOARD_DIR/wget_calls\")\n"
+            "  fi\n"
+            "  CALLS=$((CALLS + 1))\n"
+            "  echo \"$CALLS\" > \"$DASHBOARD_DIR/wget_calls\"\n"
+            "  if [ \"$CALLS\" -ge 3 ]; then\n"
+            "    GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null || cat /tmp/dashboard_loop.pid 2>/dev/null)\n"
+            "    if [ -n \"$GPID\" ]; then\n"
+            "      kill -s TERM $GPID\n"
+            "    fi\n"
+            "    exit 0\n"
+            "  else\n"
+            "    echo '{\"refresh_interval_minutes\":30,\"kindle_frontlight\":12}'\n"
+            "    exit 0\n"
+            "  fi\n"
+            "fi\n"
+            "OUT=''\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  if [ \"$1\" = \"-O\" ]; then shift; OUT=\"$1\"; fi\n"
+            "  shift\n"
+            "done\n"
+            "if [ -n \"$OUT\" ] && [ \"$OUT\" != \"-\" ]; then echo image > \"$OUT\"; fi\n"
+        ))
+
+        self.env["RTC_SYS_DIR"] = str(rtc_dir)
+        self.env["POWER_STATE_FILE"] = str(power_state)
+        pid_file = self.sandbox / "dashboard_loop.pid"
+        self.env["PID_FILE"] = str(pid_file)
+
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+
+        log_file = self.sandbox / "dashboard.log"
+        logs = log_file.read_text(encoding="utf-8")
+        self.assertIn("[low-power] verified alarm: 1720001800", logs)
+        self.assertIn("[low-power] suspend attempt", logs)
+        self.assertIn("[low-power] resume detected (slept 1800s)", logs)
+
+        # Verify sync was called
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sync called", calls)
+
+        # Verify mem was written
+        self.assertEqual(power_state.read_text(encoding="utf-8").strip(), "mem")
+
+    def test_stale_pid_recovery_and_duplicate_process_prevention(self):
+        # 1. Duplicate process prevention (running PID matches script name)
+        pid_file = self.sandbox / "dashboard_loop.pid"
+        pid_file.write_text("12345\n", encoding="utf-8")
+
+        proc_dir = self.sandbox / "proc"
+        (proc_dir / "12345").mkdir(parents=True)
+        (proc_dir / "12345/cmdline").write_text("sh\n/mnt/us/dashboard/refresh.sh\n", encoding="utf-8")
+
+        # Mock 'mock-kill' command to return 0 for PID 12345
+        self.create_mock_bin("mock-kill", (
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"-0\" ] && [ \"$2\" = \"12345\" ]; then\n"
+            "  exit 0\n"
+            "else\n"
+            "  /bin/kill \"$@\"\n"
+            "fi\n"
+        ))
+
+        self.env["PROC_DIR"] = str(proc_dir)
+        self.env["PID_FILE"] = str(pid_file)
+        self.env["KILL_CMD"] = "mock-kill"
+
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+
+        # Script should exit immediately with status 0 without sleeping
+        self.assertEqual(code, 0)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8") if (self.sandbox / "calls.log").exists() else ""
+        self.assertNotIn("sleep", calls)
+
+        # 2. Stale PID recovery (running PID does NOT match script name)
+        (proc_dir / "12345/cmdline").write_text("some_other_process\n", encoding="utf-8")
+        calls_log = self.sandbox / "calls.log"
+        calls_log.unlink(missing_ok=True)
+
+        self.create_mock_bin("wget", (
+            "#!/bin/sh\n"
+            "GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null)\n"
+            "if [ -n \"$GPID\" ]; then\n"
+            "  kill -s TERM $GPID\n"
+            "fi\n"
+            "exit 0\n"
+        ))
+
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+
+        # Should overwrite lock and start refresh, then clean it up on exit
+        # Wait, the output might say duplicate check handled
+        self.assertEqual(code, 0)
+
+    def test_lock_ownership_cleanup(self):
+        pid_file = self.sandbox / "dashboard_loop.pid"
+        pid_file.write_text("12345\n", encoding="utf-8")
+
+        proc_dir = self.sandbox / "proc"
+        (proc_dir / "12345").mkdir(parents=True)
+        (proc_dir / "12345/cmdline").write_text("sh\n/mnt/us/dashboard/refresh.sh\n", encoding="utf-8")
+
+        self.create_mock_bin("mock-kill", (
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"-0\" ] && [ \"$2\" = \"12345\" ]; then\n"
+            "  exit 0\n"
+            "else\n"
+            "  /bin/kill \"$@\"\n"
+            "fi\n"
+        ))
+        self.env["PROC_DIR"] = str(proc_dir)
+        self.env["PID_FILE"] = str(pid_file)
+        self.env["KILL_CMD"] = "mock-kill"
+
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+        self.assertEqual(code, 0)
+        # PID file should still exist and still belong to 12345
+        self.assertTrue(pid_file.exists())
+        self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), "12345")
+
+    def test_low_power_mode_suspend_cases(self):
+        (self.sandbox / "device.env").write_text("LOW_POWER_MODE=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
+
+        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
+        rtc_dir.mkdir(parents=True)
+        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
+        (rtc_dir / "wakealarm").write_text("0\n", encoding="utf-8")
+
+        power_state = self.sandbox / "sys/power/state"
+        power_state.parent.mkdir(parents=True, exist_ok=True)
+
+        # 1. Power-state write failure
+        power_state.mkdir() # Force directory to fail write
+        self.env["RTC_SYS_DIR"] = str(rtc_dir)
+        self.env["POWER_STATE_FILE"] = str(power_state)
+        pid_file = self.sandbox / "dashboard_loop.pid"
+        self.env["PID_FILE"] = str(pid_file)
+
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+        log_file = self.sandbox / "dashboard.log"
+        logs = log_file.read_text(encoding="utf-8")
+        self.assertIn("fallback reason: suspend command failed", logs)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 300", calls)
+
+        power_state.rmdir()
+        power_state.write_text("", encoding="utf-8")
+
+        # 2. Successful write with invalid AFTER value
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  if [ -f \"$DASHBOARD_DIR/sys/power/state\" ] && grep -q mem \"$DASHBOARD_DIR/sys/power/state\" 2>/dev/null; then\n"
+            "    echo ''\n"
+            "  else\n"
+            "    echo '1720000000'\n"
+            "  fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+        log_file.unlink(missing_ok=True)
+        calls_log = self.sandbox / "calls.log"
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+        logs = log_file.read_text(encoding="utf-8")
+        self.assertIn("warning: invalid post-resume RTC time", logs)
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn("sleep 10", calls)
+
+        # 3. Successful write with zero elapsed time
+        power_state.write_text("", encoding="utf-8")
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  echo '1720000000'\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+        log_file.unlink(missing_ok=True)
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+        logs = log_file.read_text(encoding="utf-8")
+        self.assertIn("warning: unexpectedly short sleep duration: 0s", logs)
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn("sleep 10", calls)
+
+        # 4. Unexpectedly short elapsed time (e.g. 5 seconds)
+        power_state.write_text("", encoding="utf-8")
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  if [ -f \"$DASHBOARD_DIR/sys/power/state\" ] && grep -q mem \"$DASHBOARD_DIR/sys/power/state\" 2>/dev/null; then\n"
+            "    echo '1720000005'\n"
+            "  else\n"
+            "    echo '1720000000'\n"
+            "  fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+        log_file.unlink(missing_ok=True)
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
+        logs = log_file.read_text(encoding="utf-8")
+        self.assertIn("warning: unexpectedly short sleep duration: 5s", logs)
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn("sleep 10", calls)
+
+    def test_process_manager_scenarios(self):
+        import settings_server
+
+        class FakeDevice:
+            id = "kindle-131"
+            type = "kindle_pw1"
+            name = "Test Kindle"
+            resolution = (758, 1024)
+            enabled = True
+
+        device = FakeDevice()
+        config = {"status_token": "fake-token"}
+        installer_script = settings_server.kindle_installer_script(device, config, "192.168.68.167", 8767, 8767)
+
+        def extract_script(name):
+            import re
+            match = re.search(f'cat <<\'EOF\' > "\\$DASHBOARD_DIR/{name}"\\n(.*?)\\nEOF', installer_script, re.DOTALL)
+            if not match:
+                raise ValueError(f"Marker for {name} not found")
+            return match.group(1)
+
+        watchdog_src = extract_script("watchdog.sh")
+        loop_src = extract_script("dashboard_loop.sh")
+        stop_src = extract_script("stop.sh")
+        start_src = extract_script("start.sh")
+
+        # Setup mock /proc directory
+        proc_dir = self.sandbox / "proc"
+        proc_dir.mkdir(parents=True, exist_ok=True)
+        self.env["PROC_DIR"] = str(proc_dir)
+
+        kill_func = (
+            "kill() {\n"
+            "  echo \"kill $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
+            "  if [ \"$1\" = \"-0\" ]; then\n"
+            "    PID=\"$2\"\n"
+            "    if [ -d \"$PROC_DIR/$PID\" ]; then return 0; else return 1; fi\n"
+            "  fi\n"
+            "  if [ \"$1\" = \"-s\" ]; then\n"
+            "    SIG=\"$2\"; PID=\"$3\"\n"
+            "    echo \"signal $SIG sent to $PID\" >> \"$DASHBOARD_DIR/calls.log\"\n"
+            "    if [ \"$SIG\" = \"TERM\" ]; then\n"
+            "      if [ -f \"$DASHBOARD_DIR/proc_remove_on_term\" ]; then\n"
+            "        rm -rf \"$PROC_DIR/$PID\"\n"
+            "      fi\n"
+            "      if [ -f \"$DASHBOARD_DIR/proc_change_on_term\" ]; then\n"
+            "        echo \"0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99999\" > \"$PROC_DIR/$PID/stat\"\n"
+            "      fi\n"
+            "    fi\n"
+            "    return 0\n"
+            "  fi\n"
+            "  return 0\n"
+            "}\n"
+        )
+
+        (self.sandbox / "watchdog.sh").write_text(kill_func + watchdog_src, encoding="utf-8")
+        (self.sandbox / "watchdog.sh").chmod(0o755)
+        (self.sandbox / "dashboard_loop.sh").write_text(kill_func + loop_src, encoding="utf-8")
+        (self.sandbox / "dashboard_loop.sh").chmod(0o755)
+
+        sleep_func = "sleep() { echo \"sleep $@\" >> \"$DASHBOARD_DIR/calls.log\"; }\n"
+        (self.sandbox / "stop.sh").write_text(kill_func + sleep_func + stop_src, encoding="utf-8")
+        (self.sandbox / "stop.sh").chmod(0o755)
+        (self.sandbox / "start.sh").write_text(kill_func + start_src, encoding="utf-8")
+        (self.sandbox / "start.sh").chmod(0o755)
+
+        # Write dummy refresh.sh
+        (self.sandbox / "refresh.sh").write_text("#!/bin/sh\necho refresh run\n", encoding="utf-8")
+        (self.sandbox / "refresh.sh").chmod(0o755)
+
+        # Helper to setup mock process in /proc
+        def setup_proc(pid, cmdline, start_time="12345", comm="watchdog.sh"):
+            pdir = proc_dir / str(pid)
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / "cmdline").write_text(cmdline, encoding="utf-8")
+            remaining_fields = ["0"] * 19 + [start_time]
+            stat_content = f"{pid} ({comm}) " + " ".join(remaining_fields) + "\n"
+            (pdir / "stat").write_text(stat_content, encoding="utf-8")
+
+        def clean_proc(pid):
+            shutil.rmtree(proc_dir / str(pid), ignore_errors=True)
+
+        calls_log = self.sandbox / "calls.log"
+
+        # ----------------------------------------------------
+        # Scenario 1: dashboard_loop.pid before exec (cmdline has dashboard_loop.sh)
+        # ----------------------------------------------------
+        setup_proc(100, f"/bin/sh {self.sandbox}/dashboard_loop.sh")
+        (self.sandbox / "dashboard_loop.pid").write_text("100\n", encoding="utf-8")
+
+        # Running dashboard_loop.sh again should exit immediately (status 0)
+        code, stdout, stderr = self.run_script(self.sandbox / "dashboard_loop.sh")
+        self.assertEqual(code, 0)
+        self.assertTrue((self.sandbox / "dashboard_loop.pid").exists())
+        self.assertEqual((self.sandbox / "dashboard_loop.pid").read_text(encoding="utf-8").strip(), "100")
+
+        # ----------------------------------------------------
+        # Scenario 2: dashboard_loop.pid after exec (cmdline has refresh.sh)
+        # ----------------------------------------------------
+        setup_proc(100, f"/bin/sh {self.sandbox}/refresh.sh")
+        code, stdout, stderr = self.run_script(self.sandbox / "dashboard_loop.sh")
+        self.assertEqual(code, 0)
+        self.assertEqual((self.sandbox / "dashboard_loop.pid").read_text(encoding="utf-8").strip(), "100")
+
+        # ----------------------------------------------------
+        # Scenario 3: Unrelated process with word "refresh" outside DASHBOARD_DIR
+        # ----------------------------------------------------
+        setup_proc(100, "/bin/sh /some/other/path/refresh.sh")
+        # Run stop.sh, should NOT kill PID 100 because it is outside self.sandbox
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        self.assertEqual(code, 0)
+        calls = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
+        self.assertNotIn("signal TERM sent to 100", calls)
+        self.assertTrue((self.sandbox / "dashboard_loop.pid").exists()) # Untouched since it is unrelated
+
+        # ----------------------------------------------------
+        # Scenario 4: Stale PID
+        # ----------------------------------------------------
+        clean_proc(100)
+        # Run stop.sh, should clean up dashboard_loop.pid
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        self.assertEqual(code, 0)
+        self.assertFalse((self.sandbox / "dashboard_loop.pid").exists())
+
+        # ----------------------------------------------------
+        # Scenario 5: Malformed PID
+        # ----------------------------------------------------
+        (self.sandbox / "dashboard_loop.pid").write_text("abc\n", encoding="utf-8")
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        self.assertEqual(code, 0)
+        self.assertFalse((self.sandbox / "dashboard_loop.pid").exists())
+
+        # ----------------------------------------------------
+        # Scenario 6: Valid watchdog PID
+        # ----------------------------------------------------
+        setup_proc(200, f"/bin/sh {self.sandbox}/watchdog.sh")
+        (self.sandbox / "watchdog.pid").write_text("200\n", encoding="utf-8")
+        # Run watchdog.sh again, should exit immediately
+        code, stdout, stderr = self.run_script(self.sandbox / "watchdog.sh")
+        self.assertEqual(code, 0)
+
+        # ----------------------------------------------------
+        # Scenario 7: Unrelated reused watchdog PID
+        # ----------------------------------------------------
+        setup_proc(200, "/bin/sh /some/other/watchdog.sh")
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        self.assertEqual(code, 0)
+        calls = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
+        self.assertNotIn("signal TERM sent to 200", calls)
+        self.assertTrue((self.sandbox / "watchdog.pid").exists())
+
+        # ----------------------------------------------------
+        # Scenario 8: TERM success
+        # ----------------------------------------------------
+        setup_proc(200, f"/bin/sh {self.sandbox}/watchdog.sh")
+        (self.sandbox / "proc_remove_on_term").write_text("", encoding="utf-8")
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        self.assertEqual(code, 0)
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn("signal TERM sent to 200", calls)
+        self.assertNotIn("kill -s KILL 200", calls)
+        self.assertFalse((self.sandbox / "watchdog.pid").exists())
+
+        # ----------------------------------------------------
+        # Scenario 9: TERM timeout followed by KILL
+        # ----------------------------------------------------
+        shutil.rmtree(proc_dir, ignore_errors=True)
+        proc_dir.mkdir(parents=True)
+        setup_proc(300, f"/bin/sh {self.sandbox}/watchdog.sh")
+        (self.sandbox / "watchdog.pid").write_text("300\n", encoding="utf-8")
+        (self.sandbox / "proc_remove_on_term").unlink(missing_ok=True)
+        (self.sandbox / "proc_change_on_term").unlink(missing_ok=True)
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn("signal TERM sent to 300", calls)
+        self.assertIn("kill -s KILL 300", calls)
+
+        # ----------------------------------------------------
+        # Scenario 10: PID reuse after TERM (process start time changes)
+        # ----------------------------------------------------
+        shutil.rmtree(proc_dir, ignore_errors=True)
+        proc_dir.mkdir(parents=True)
+        setup_proc(400, f"/bin/sh {self.sandbox}/watchdog.sh", start_time="12345")
+        (self.sandbox / "watchdog.pid").write_text("400\n", encoding="utf-8")
+        (self.sandbox / "proc_change_on_term").write_text("", encoding="utf-8")
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        calls = calls_log.read_text(encoding="utf-8")
+        # TERM was sent
+        self.assertIn("signal TERM sent to 400", calls)
+        # KILL must NOT be sent to 400 because its start time changed
+        self.assertNotIn("kill -s KILL 400", calls)
+        # The PID file watchdog.pid must NOT be deleted because it is unsafe
+        self.assertTrue((self.sandbox / "watchdog.pid").exists())
+        (self.sandbox / "proc_change_on_term").unlink(missing_ok=True)
+
+        # ----------------------------------------------------
+        # Scenario 11: Single-writer ownership verification
+        # ----------------------------------------------------
+        # Verify statically that start.sh doesn't write watchdog.pid
+        self.assertNotIn("watchdog.pid", start_src)
+        # Verify statically that watchdog.sh doesn't write dashboard_loop.pid
+        self.assertNotIn('echo $! > "$PID_FILE"', watchdog_src)
+        self.assertNotIn('echo $$ > "$PID_FILE"', watchdog_src)
+
+        # ----------------------------------------------------
+        # Scenario 12: process comm containing spaces in /proc/<pid>/stat
+        # ----------------------------------------------------
+        shutil.rmtree(proc_dir, ignore_errors=True)
+        proc_dir.mkdir(parents=True)
+        setup_proc(500, f"/bin/sh {self.sandbox}/watchdog.sh", start_time="98765", comm="watchdog.sh with spaces inside parentheses")
+        (self.sandbox / "watchdog.pid").write_text("500\n", encoding="utf-8")
+        (self.sandbox / "proc_remove_on_term").write_text("", encoding="utf-8")
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn("signal TERM sent to 500", calls)
+        self.assertFalse((self.sandbox / "watchdog.pid").exists())
+        (self.sandbox / "proc_remove_on_term").unlink(missing_ok=True)
+
+        # ----------------------------------------------------
+        # Scenario 13: regex-like path false positive
+        # ----------------------------------------------------
+        shutil.rmtree(proc_dir, ignore_errors=True)
+        proc_dir.mkdir(parents=True)
+        # Setup process with /mnt/us/dashboard/refresh.sh-fake
+        setup_proc(600, f"/bin/sh {self.sandbox}/refresh.sh-fake")
+        (self.sandbox / "dashboard_loop.pid").write_text("600\n", encoding="utf-8")
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        # Since it is a false positive path, stop.sh must NOT send TERM
+        calls = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
+        self.assertNotIn("signal TERM sent to 600", calls)
+        # The PID file must remain untouched
+        self.assertTrue((self.sandbox / "dashboard_loop.pid").exists())
+
+        # ----------------------------------------------------
+        # Scenario 14: literal path match only
+        # ----------------------------------------------------
+        shutil.rmtree(proc_dir, ignore_errors=True)
+        proc_dir.mkdir(parents=True)
+        setup_proc(700, f"/bin/sh {self.sandbox}/refresh.sh")
+        (self.sandbox / "dashboard_loop.pid").write_text("700\n", encoding="utf-8")
+        (self.sandbox / "proc_remove_on_term").write_text("", encoding="utf-8")
+        calls_log.unlink(missing_ok=True)
+        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
+        calls = calls_log.read_text(encoding="utf-8")
+        self.assertIn("signal TERM sent to 700", calls)
+        self.assertFalse((self.sandbox / "dashboard_loop.pid").exists())
+        (self.sandbox / "proc_remove_on_term").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

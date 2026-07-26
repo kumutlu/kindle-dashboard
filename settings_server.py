@@ -878,11 +878,34 @@ EOF"""
     dashboard_loop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/dashboard_loop.sh"
 #!/bin/sh
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-if [ -f "$DASHBOARD_DIR/device.env" ]; then
-    . "$DASHBOARD_DIR/device.env"
-fi
+LOOP_PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
+PROC_DIR="${PROC_DIR:-/proc}"
 
-exec "$DASHBOARD_DIR/refresh.sh"
+# Single-instance protection with stale PID command verification.
+# dashboard_loop.sh writes dashboard_loop.pid, then execs refresh.sh.
+# The PID remains unchanged, but the process command line changes from
+# dashboard_loop.sh to refresh.sh. Thus, refresh.sh becomes the active process
+# represented by dashboard_loop.pid.
+if [ -f "$LOOP_PID_FILE" ]; then
+    OLD_LPID=$(cat "$LOOP_PID_FILE" 2>/dev/null)
+    if [ -n "$OLD_LPID" ] && kill -0 "$OLD_LPID" 2>/dev/null; then
+        OLD_CMDLINE=$(cat "$PROC_DIR/$OLD_LPID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+        PAD_CMDLINE=" $OLD_CMDLINE "
+        case "$PAD_CMDLINE" in
+            *" $DASHBOARD_DIR/dashboard_loop.sh "*|*" /mnt/us/dashboard/dashboard_loop.sh "*|*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)
+                exit 0
+                ;;
+        esac
+    fi
+fi
+echo $$ > "$LOOP_PID_FILE"
+
+if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
+    exec "$DASHBOARD_DIR/refresh.sh"
+else
+    echo "ERROR: refresh.sh not found or not executable at $DASHBOARD_DIR/refresh.sh" >&2
+    exit 1
+fi
 EOF"""
 
     # watchdog.sh heredoc
@@ -890,19 +913,49 @@ EOF"""
 #!/bin/sh
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
 PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
+WATCHDOG_PID_FILE="$DASHBOARD_DIR/watchdog.pid"
+PROC_DIR="${PROC_DIR:-/proc}"
+
+# Ensure only one watchdog runs
+if [ -f "$WATCHDOG_PID_FILE" ]; then
+    OLD_WPID=$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)
+    if [ -n "$OLD_WPID" ] && kill -0 "$OLD_WPID" 2>/dev/null; then
+        OLD_WCMD=$(cat "$PROC_DIR/$OLD_WPID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+        PAD_WCMD=" $OLD_WCMD "
+        case "$PAD_WCMD" in
+            *" $DASHBOARD_DIR/watchdog.sh "*|*" /mnt/us/dashboard/watchdog.sh "*)
+                exit 0
+                ;;
+        esac
+    fi
+fi
+echo $$ > "$WATCHDOG_PID_FILE"
+
+cleanup() {
+    if [ -f "$WATCHDOG_PID_FILE" ] && [ "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$WATCHDOG_PID_FILE"
+    fi
+}
+trap cleanup EXIT INT TERM
 
 while true; do
     RUNNING=0
     if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE")
+        PID=$(cat "$PID_FILE" 2>/dev/null)
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            RUNNING=1
+            CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+            PAD_CMDLINE=" $CMDLINE "
+            case "$PAD_CMDLINE" in
+                *" $DASHBOARD_DIR/dashboard_loop.sh "*|*" /mnt/us/dashboard/dashboard_loop.sh "*|*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)
+                    RUNNING=1
+                    ;;
+            esac
         fi
     fi
     if [ "$RUNNING" -eq 0 ]; then
         if [ -x "$DASHBOARD_DIR/dashboard_loop.sh" ]; then
             "$DASHBOARD_DIR/dashboard_loop.sh" >/dev/null 2>&1 &
-            echo $! > "$PID_FILE"
+            sleep 2
         fi
     fi
     sleep 10
@@ -918,7 +971,6 @@ if [ -x "$DASHBOARD_DIR/stop.sh" ]; then
 fi
 if [ -x "$DASHBOARD_DIR/watchdog.sh" ]; then
     "$DASHBOARD_DIR/watchdog.sh" >/dev/null 2>&1 &
-    echo $! > "$DASHBOARD_DIR/watchdog.pid"
 fi
 exit 0
 EOF"""
@@ -927,23 +979,161 @@ EOF"""
     stop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/stop.sh"
 #!/bin/sh
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-WATCHDOG_PID_FILE="$DASHBOARD_DIR/watchdog.pid"
-if [ -f "$WATCHDOG_PID_FILE" ]; then
-    PID=$(cat "$WATCHDOG_PID_FILE")
-    if [ -n "$PID" ]; then
-        kill "$PID" 2>/dev/null || true
+PROC_DIR="${PROC_DIR:-/proc}"
+
+# get_start_time PID
+get_start_time() {
+    _PID="$1"
+    _SF="$PROC_DIR/$_PID/stat"
+    if [ ! -f "$_SF" ]; then
+        echo ""
+        return 1
+    fi
+    _SL=$(cat "$_SF" 2>/dev/null)
+    if [ -z "$_SL" ]; then
+        echo ""
+        return 1
+    fi
+    _REM="${_SL##*) }"
+    if [ -z "$_REM" ]; then
+        echo ""
+        return 1
+    fi
+    set -- $_REM
+    _ST="${20}"
+    case "$_ST" in
+        ""|*[!0-9]*)
+            echo ""
+            return 1
+            ;;
+        *)
+            echo "$_ST"
+            return 0
+            ;;
+    esac
+}
+
+# Helper to stop a process validated by cmdline
+stop_validated() {
+    PID_FILE="$1"
+    EXPECTED_CMD1="$2"
+    EXPECTED_CMD2="$3"
+
+    if [ ! -f "$PID_FILE" ]; then
+        return 0
+    fi
+
+    PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' ')
+    if [ -z "$PID" ]; then
+        echo "Removing empty PID file: $PID_FILE"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    case "$PID" in
+        ""|*[!0-9]*)
+            echo "Removing malformed PID file: $PID_FILE (value: '$PID')"
+            rm -f "$PID_FILE"
+            return 0
+            ;;
+    esac
+
+    if [ ! -d "$PROC_DIR/$PID" ]; then
+        echo "Removing stale PID file: $PID_FILE (PID $PID is not running)"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    START_TIME=$(get_start_time "$PID")
+    if [ -z "$START_TIME" ]; then
+        echo "ERROR: Failed to read process start time for PID $PID" >&2
+        return 1
+    fi
+    INITIAL_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+    PAD_CMDLINE=" $INITIAL_CMDLINE "
+
+    MATCHED_CMD=""
+    case "$PAD_CMDLINE" in
+        *" $EXPECTED_CMD1 "*|*" /mnt/us/dashboard/${EXPECTED_CMD1##*/} "*)
+            MATCHED_CMD="$EXPECTED_CMD1"
+            ;;
+    esac
+    if [ -n "$EXPECTED_CMD2" ]; then
+        case "$PAD_CMDLINE" in
+            *" $EXPECTED_CMD2 "*|*" /mnt/us/dashboard/${EXPECTED_CMD2##*/} "*)
+                MATCHED_CMD="$EXPECTED_CMD2"
+                ;;
+        esac
+    fi
+
+    if [ -z "$MATCHED_CMD" ]; then
+        echo "WARNING: PID file $PID_FILE contains PID $PID, but cmdline ($INITIAL_CMDLINE) does not match expected targets. Leaving untouched." >&2
+        return 0
+    fi
+
+    # Process is validated. Send SIGTERM first.
+    echo "Stopping PID $PID ($INITIAL_CMDLINE)..."
+    kill -s TERM "$PID" 2>/dev/null || true
+
+    # Wait up to 3 seconds for exit
+    for i in 1 2 3; do
+        if [ -d "$PROC_DIR/$PID" ]; then
+            CUR_START_TIME=$(get_start_time "$PID")
+            CUR_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+            PAD_CUR_CMDLINE=" $CUR_CMDLINE "
+            CUR_MATCHED=""
+            case "$PAD_CUR_CMDLINE" in
+                *" $MATCHED_CMD "*|*" /mnt/us/dashboard/${MATCHED_CMD##*/} "*)
+                    CUR_MATCHED="1"
+                    ;;
+            esac
+            if [ "$CUR_START_TIME" != "$START_TIME" ] || [ -z "$CUR_MATCHED" ]; then
+                echo "WARNING: PID reuse detected for PID $PID during shutdown! Aborting stop for this PID." >&2
+                return 1
+            fi
+            sleep 1
+        fi
+    done
+
+    # Send SIGKILL if still running and identity matches
+    if [ -d "$PROC_DIR/$PID" ]; then
+        CUR_START_TIME=$(get_start_time "$PID")
+        CUR_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+        PAD_CUR_CMDLINE=" $CUR_CMDLINE "
+        CUR_MATCHED=""
+        case "$PAD_CUR_CMDLINE" in
+            *" $MATCHED_CMD "*|*" /mnt/us/dashboard/${MATCHED_CMD##*/} "*)
+                CUR_MATCHED="1"
+                ;;
+        esac
+        if [ "$CUR_START_TIME" != "$START_TIME" ] || [ -z "$CUR_MATCHED" ]; then
+            echo "WARNING: PID reuse detected for PID $PID before KILL! Aborting." >&2
+            return 1
+        fi
+        echo "PID $PID did not terminate, sending SIGKILL..."
+        kill -s KILL "$PID" 2>/dev/null || true
         sleep 1
     fi
-    rm -f "$WATCHDOG_PID_FILE"
-fi
-LOOP_PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
-if [ -f "$LOOP_PID_FILE" ]; then
-    PID=$(cat "$LOOP_PID_FILE")
-    if [ -n "$PID" ]; then
-        kill "$PID" 2>/dev/null || true
+
+    # Clean up PID file if successfully stopped or died
+    if [ ! -d "$PROC_DIR/$PID" ]; then
+        rm -f "$PID_FILE"
+    else
+        CUR_START_TIME=$(get_start_time "$PID")
+        if [ "$CUR_START_TIME" = "$START_TIME" ]; then
+            echo "ERROR: Failed to stop PID $PID" >&2
+            return 1
+        fi
     fi
-    rm -f "$LOOP_PID_FILE"
-fi
+    return 0
+}
+
+# Stop watchdog.pid (requires watchdog.sh under DASHBOARD_DIR)
+stop_validated "$DASHBOARD_DIR/watchdog.pid" "$DASHBOARD_DIR/watchdog.sh" ""
+
+# Stop dashboard_loop.pid (allows dashboard_loop.sh or refresh.sh under DASHBOARD_DIR)
+stop_validated "$DASHBOARD_DIR/dashboard_loop.pid" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/refresh.sh"
+
 exit 0
 EOF"""
 
@@ -961,6 +1151,15 @@ EOF"""
         'printf "%s\\n" "$DEVICE_ID" > "$DASHBOARD_DIR/device-id"',
         'printf "%s\\n" "$STATUS_TOKEN" > "$DASHBOARD_DIR/status-token"',
         'chmod 600 "$DASHBOARD_DIR/status-token" 2>/dev/null || true',
+        'EXISTING_LPM="0"',
+        'if [ -f "$DASHBOARD_DIR/device.env" ]; then',
+        '    RAW_LPM=$(grep "^LOW_POWER_MODE=" "$DASHBOARD_DIR/device.env" | tail -n 1 | cut -d= -f2- | tr -d "\\\\042\\\\047" | tr -d " " || echo "0")',
+        '    case "$RAW_LPM" in',
+        '        1) EXISTING_LPM="1" ;;',
+        '        *) EXISTING_LPM="0" ;;',
+        '    esac',
+        'fi',
+        'LOW_POWER_MODE="$EXISTING_LPM"',
         'cat > "$DASHBOARD_DIR/device.env" <<EOF',
         'SERVER_HOST="$SERVER_HOST"',
         'DEVICE_ID="$DEVICE_ID"',
@@ -971,6 +1170,7 @@ EOF"""
         f'REFRESH_INTERVAL_MINUTES="{int(config.get("refresh_interval_minutes", 60))}"',
         f'WIFI_POWER_SAVE="{"1" if config.get("wifi_power_save", True) else "0"}"',
         f'UPDATE_ONLY_IF_CHANGED="{"1" if config.get("update_only_if_changed", True) else "0"}"',
+        'LOW_POWER_MODE="$LOW_POWER_MODE"',
         "EOF",
         'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',
         status_sh_content,

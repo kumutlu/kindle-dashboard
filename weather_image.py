@@ -2679,7 +2679,9 @@ def render_device(device_id, force=False, registry=None):
         registry = DeviceRegistry(PROJECT_DIR)
     device = registry.get(device_id, require_enabled=True)
     resolution = tuple(device.resolution or (W, H))
-    safe_area = getattr(device, "status_bar_safe_area_px", 32 if resolution == (600, 800) else 0)
+    configured_safe_area = getattr(device, "status_bar_safe_area_px", 32 if resolution == (600, 800) else 0)
+    use_screensaver_overlay = getattr(device, "use_screensaver_overlay", False)
+    effective_safe_area = 0 if use_screensaver_overlay else configured_safe_area
     config = load_effective_device_config(device, registry)
     config["device_id"] = device.id
     lock_path = device.image_path.with_name(".render.lock")
@@ -2700,7 +2702,7 @@ def render_device(device_id, force=False, registry=None):
                 device.image_path,
                 resolution,
                 kt4_safe=(resolution == (600, 800)),
-                status_bar_safe_area_px=safe_area,
+                status_bar_safe_area_px=effective_safe_area,
             )
             output_path = Path(device.image_path)
             _write_render_state(
@@ -2719,7 +2721,7 @@ def render_device(device_id, force=False, registry=None):
                 state_file=state_path,
                 device_id=device.id,
                 project_root=registry.project_root,
-                status_bar_safe_area_px=safe_area,
+                status_bar_safe_area_px=effective_safe_area,
             )
         if device.id == "default-kindle":
             _atomic_copy(

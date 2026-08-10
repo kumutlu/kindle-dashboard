@@ -1841,74 +1841,79 @@ def render_minimal_weather(config):
     save_dashboard(img, data)
 
 
-def render_minimal_weather_600x800(config):
+def render_minimal_weather_600x800(config, status_bar_safe_area_px=32):
     data = collect_dashboard_data(config)
     fonts = dashboard_fonts()
     current = data["current"]
     img = Image.new("L", (600, 800), 255)
     d = ImageDraw.Draw(img)
-    box(d, (8, 8, 592, 792), 8, 2)
+
+    top_offset = status_bar_safe_area_px
+    box(d, (8, top_offset, 592, 792), 8, 2)
 
     title = config["title"][:24]
     location = config["location_label"][:34]
-    txt(d, 24, 24, title, fonts["FB24"])
-    txt(d, 24, 58, location, fonts["FR16"])
-    txt(d, 576, 24, data["now"].strftime("%A").upper(), fonts["FB18"], anchor="ra")
-    txt(d, 576, 55, data["now"].strftime("%d %B %Y"), fonts["FR16"], anchor="ra")
-    d.line((20, 92, 580, 92), fill=0, width=2)
+    txt(d, 24, top_offset + 16, title, fonts["FB24"])
+    txt(d, 24, top_offset + 44, location, fonts["FR16"])
+    txt(d, 576, top_offset + 16, data["now"].strftime("%A").upper(), fonts["FB18"], anchor="ra")
+    txt(d, 576, top_offset + 44, data["now"].strftime("%d %B %Y"), fonts["FR16"], anchor="ra")
+    d.line((20, top_offset + 70, 580, top_offset + 70), fill=0, width=2)
 
-    box(d, (20, 115, 580, 405), 8, 2)
-    txt(d, 40, 142, "CURRENT WEATHER", fonts["FB18"])
+    cur_top = top_offset + 82
+    box(d, (20, cur_top, 580, cur_top + 260), 8, 2)
+    txt(d, 40, cur_top + 18, "CURRENT WEATHER", fonts["FB18"])
     draw_weather_icon(
-        d, weather_kind(current.get("weatherCode")), 122, 255, 120
+        d, weather_kind(current.get("weatherCode")), 122, cur_top + 120, 110
     )
-    txt(d, 360, 218, f"{data['temp']}°C", fonts["FB72"], anchor="mm")
-    txt(d, 360, 288, data["desc"].upper()[:18], fonts["FB24"], anchor="mm")
+    txt(d, 360, cur_top + 88, f"{data['temp']}°C", fonts["FB68"], anchor="mm")
+    txt(d, 360, cur_top + 151, data["desc"].upper()[:18], fonts["FB24"], anchor="mm")
     txt(
-        d, 360, 330, f"Feels like {data['feels']}°C",
+        d, 360, cur_top + 186, f"Feels like {data['feels']}°C",
         fonts["FR18"], anchor="mm",
     )
-    d.line((40, 358, 560, 358), fill=0, width=1)
-    txt(d, 45, 380, f"H/L {data['hi']}°/{data['lo']}°", fonts["FR14"])
-    txt(d, 235, 380, f"Humidity {data['humidity']}%", fonts["FR14"])
-    txt(d, 415, 380, f"Wind {data['wind']} mph", fonts["FR14"])
+    d.line((40, cur_top + 210, 560, cur_top + 210), fill=0, width=1)
+    txt(d, 45, cur_top + 232, f"H/L {data['hi']}°/{data['lo']}°", fonts["FR14"])
+    txt(d, 235, cur_top + 232, f"Humidity {data['humidity']}%", fonts["FR14"])
+    txt(d, 415, cur_top + 232, f"Wind {data['wind']} mph", fonts["FR14"])
 
-    txt(d, 24, 445, "FORECAST", fonts["FB20"])
+    forecast_top = cur_top + 276
+    txt(d, 24, forecast_top, "FORECAST", fonts["FB18"])
     card_w = 176
     gap = 12
-    top = 482
+    cards_top = forecast_top + 26
     for i, day in enumerate(data["days"][:3]):
         x = 24 + i * (card_w + gap)
-        box(d, (x, top, x + card_w, top + 205), 8, 2)
+        box(d, (x, cards_top, x + card_w, cards_top + 185), 8, 2)
         try:
             date_obj = datetime.strptime(day["date"], "%Y-%m-%d")
             label = date_obj.strftime("%a").upper()
         except Exception:
             label = str(day.get("date", ""))[:6].upper()
         noon = day.get("hourly", [{}])[0]
-        txt(d, x + card_w // 2, top + 24, label, fonts["FB18"], anchor="mm")
+        txt(d, x + card_w // 2, cards_top + 20, label, fonts["FB18"], anchor="mm")
         draw_weather_icon(
             d,
             weather_kind(noon.get("weatherCode", day.get("weatherCode"))),
             x + card_w // 2,
-            top + 82,
-            64,
+            cards_top + 72,
+            58,
         )
         txt(
-            d, x + card_w // 2, top + 138,
+            d, x + card_w // 2, cards_top + 124,
             f"{day['maxtempC']}°/{day['mintempC']}°",
             fonts["FB20"], anchor="mm",
         )
         txt(
-            d, x + card_w // 2, top + 174,
+            d, x + card_w // 2, cards_top + 156,
             f"{noon.get('chanceofrain', 0)}% rain",
             fonts["FR14"], anchor="mm",
         )
 
-    d.line((20, 730, 580, 730), fill=0, width=2)
-    txt(d, 24, 760, f"Updated {data['now'].strftime('%H:%M')}", fonts["FR14"])
-    txt(d, 220, 760, f"Pressure {data['pressure']} hPa", fonts["FR14"])
-    txt(d, 430, 760, f"Humidity {data['humidity']}%", fonts["FR14"])
+    footer_line_y = 730
+    d.line((20, footer_line_y, 580, footer_line_y), fill=0, width=2)
+    txt(d, 24, footer_line_y + 30, f"Updated {data['now'].strftime('%H:%M')}", fonts["FR14"])
+    txt(d, 220, footer_line_y + 30, f"Pressure {data['pressure']} hPa", fonts["FR14"])
+    txt(d, 430, footer_line_y + 30, f"Humidity {data['humidity']}%", fonts["FR14"])
     save_dashboard(img, data)
 
 
@@ -2529,6 +2534,7 @@ def _write_render_state(config, state_file):
 def _render_existing_weather_theme(config, context):
     """Run an existing renderer unchanged and return its Pillow image."""
     resolution = tuple(context.resolution)
+    safe_area = getattr(context, "status_bar_safe_area_px", 0)
     with tempfile.TemporaryDirectory(prefix="kindle-weather-theme-") as directory:
         temporary_dir = Path(directory)
         generated_path = temporary_dir / "weather.png"
@@ -2536,7 +2542,7 @@ def _render_existing_weather_theme(config, context):
             if config["theme"] == "minimal_weather":
                 token = ACTIVE_OUTPUT.set(generated_path)
                 try:
-                    render_minimal_weather_600x800(config)
+                    render_minimal_weather_600x800(config, status_bar_safe_area_px=safe_area)
                 finally:
                     ACTIVE_OUTPUT.reset(token)
             else:
@@ -2550,12 +2556,24 @@ def _render_existing_weather_theme(config, context):
                 finally:
                     ACTIVE_OUTPUT.reset(token)
                 with Image.open(legacy_path) as generated:
-                    return ImageOps.fit(
-                        generated.convert("L"),
-                        resolution,
-                        method=Image.Resampling.LANCZOS,
-                        centering=(0.5, 0.5),
-                    )
+                    if safe_area > 0:
+                        target_h = max(1, 800 - safe_area)
+                        fitted = ImageOps.fit(
+                            generated.convert("L"),
+                            (600, target_h),
+                            method=Image.Resampling.LANCZOS,
+                            centering=(0.5, 0.5),
+                        )
+                        canvas = Image.new("L", (600, 800), 255)
+                        canvas.paste(fitted, (0, safe_area))
+                        return canvas
+                    else:
+                        return ImageOps.fit(
+                            generated.convert("L"),
+                            resolution,
+                            method=Image.Resampling.LANCZOS,
+                            centering=(0.5, 0.5),
+                        )
         else:
             if resolution != (W, H):
                 raise ValueError(
@@ -2616,12 +2634,16 @@ def render_dashboard(
     project_root=PROJECT_DIR,
     task_provider=None,
     theme_registry=None,
+    status_bar_safe_area_px=None,
 ):
     resolution = tuple(resolution or (W, H))
+    if status_bar_safe_area_px is None:
+        status_bar_safe_area_px = 32 if resolution == (600, 800) else 0
     context = ThemeRenderContext(
         device_id=device_id,
         resolution=resolution,
         timezone=config["timezone"],
+        status_bar_safe_area_px=status_bar_safe_area_px,
     )
     registry = theme_registry or build_theme_registry(
         project_root=project_root,
@@ -2657,6 +2679,7 @@ def render_device(device_id, force=False, registry=None):
         registry = DeviceRegistry(PROJECT_DIR)
     device = registry.get(device_id, require_enabled=True)
     resolution = tuple(device.resolution or (W, H))
+    safe_area = getattr(device, "status_bar_safe_area_px", 32 if resolution == (600, 800) else 0)
     config = load_effective_device_config(device, registry)
     config["device_id"] = device.id
     lock_path = device.image_path.with_name(".render.lock")
@@ -2677,6 +2700,7 @@ def render_device(device_id, force=False, registry=None):
                 device.image_path,
                 resolution,
                 kt4_safe=(resolution == (600, 800)),
+                status_bar_safe_area_px=safe_area,
             )
             output_path = Path(device.image_path)
             _write_render_state(
@@ -2695,6 +2719,7 @@ def render_device(device_id, force=False, registry=None):
                 state_file=state_path,
                 device_id=device.id,
                 project_root=registry.project_root,
+                status_bar_safe_area_px=safe_area,
             )
         if device.id == "default-kindle":
             _atomic_copy(

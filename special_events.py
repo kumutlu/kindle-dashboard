@@ -303,17 +303,32 @@ def active_event_for_device(project_root, device, timezone_name, valid_device_id
     return active[0]
 
 
-def render_event_image(source_path, output_path, resolution, kt4_safe=False):
+def render_event_image(source_path, output_path, resolution, kt4_safe=False, status_bar_safe_area_px=None):
+    if status_bar_safe_area_px is None:
+        status_bar_safe_area_px = 32 if (kt4_safe or tuple(resolution) == (600, 800)) else 0
     source_path = Path(source_path)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = resolution
     with Image.open(source_path) as opened:
-        fitted = ImageOps.fit(
-            opened.convert("L"),
-            tuple(resolution),
-            method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.5),
-        )
+        if status_bar_safe_area_px > 0:
+            target_h = max(1, height - status_bar_safe_area_px)
+            fitted = ImageOps.fit(
+                opened.convert("L"),
+                (width, target_h),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            canvas = Image.new("L", (width, height), 255)
+            canvas.paste(fitted, (0, status_bar_safe_area_px))
+            fitted = canvas
+        else:
+            fitted = ImageOps.fit(
+                opened.convert("L"),
+                tuple(resolution),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{output_path.name}.",
             suffix=".tmp",
@@ -323,7 +338,7 @@ def render_event_image(source_path, output_path, resolution, kt4_safe=False):
         temporary_path = Path(temporary_name)
         try:
             save_kwargs = {"format": "PNG", "optimize": False}
-            if kt4_safe:
+            if kt4_safe or tuple(resolution) == (600, 800):
                 save_kwargs["compress_level"] = 0
             fitted.save(temporary_path, **save_kwargs)
             os.replace(temporary_path, output_path)

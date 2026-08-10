@@ -9,6 +9,7 @@ class ThemeRenderContext:
     device_id: str
     resolution: tuple
     timezone: str
+    status_bar_safe_area_px: int = 0
 
 
 class Theme(ABC):

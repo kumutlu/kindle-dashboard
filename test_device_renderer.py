@@ -605,6 +605,76 @@ class DeviceRendererTests(unittest.TestCase):
             self.assertEqual(generated.size, (600, 800))
             self.assertEqual(generated.mode, "L")
 
+    def test_kindle_131_status_bar_safe_area_top_offset(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131-safe",
+            "name": "Kindle 131 Safe Area",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "status_bar_safe_area_px": 32,
+            "config_path": "devices/kindle-131-safe/config.json",
+            "image_path": "devices/kindle-131-safe/image.png",
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "title": "KINDLE 131",
+            "theme": "minimal_weather",
+        })
+        kt4.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with mock.patch.object(weather_image, "collect_dashboard_data", return_value={
+            "now": mock.Mock(
+                strftime=lambda fmt: {
+                    "%A": "Friday",
+                    "%d %B %Y": "10 July 2026",
+                    "%H:%M": "12:00",
+                }.get(fmt, "Friday"),
+            ),
+            "current": {"weatherCode": "113"},
+            "temp": 20,
+            "desc": "Clear",
+            "weather_desc_localized": "Clear",
+            "feels": 18,
+            "hi": 24,
+            "lo": 12,
+            "humidity": 45,
+            "wind": 9,
+            "wind_dir": "W",
+            "pressure": 1012,
+            "sunrise": "04:52",
+            "sunset": "21:28",
+            "days": [
+                {
+                    "date": "2026-07-10",
+                    "maxtempC": 24,
+                    "mintempC": 12,
+                    "hourly": [{"weatherCode": "113", "chanceofrain": 10}],
+                }
+            ] * 3,
+            "ph": {"queries": 0, "blocked": 0, "clients": 0},
+            "ts": {"online": 0, "total": 0},
+        }):
+            result = weather_image.render_device(kt4.id, registry=self.registry)
+
+        self.assertEqual(kt4.status_bar_safe_area_px, 32)
+        self.assertEqual(self.default_device.status_bar_safe_area_px, 0)
+        self.assertEqual(result["resolution"], [600, 800])
+        with Image.open(kt4.image_path) as img:
+            self.assertEqual(img.size, (600, 800))
+            # 1. Top 32px (Y=0..31) reserved for status bar
+            top_crop = img.crop((0, 0, 600, 32))
+            self.assertEqual(top_crop.getextrema(), (255, 255))
+            # 2. Content exists below Y=32
+            content_crop = img.crop((0, 32, 600, 800))
+            self.assertLess(content_crop.getextrema()[0], 255)
+            # 3. Footer line & text present in original bottom region Y=730..770
+            footer_crop = img.crop((0, 730, 600, 770))
+            self.assertLess(footer_crop.getextrema()[0], 255)
+            # 4. Zero clipping below Y=800 (bottom margin at Y=793..799 is clean)
+            bottom_margin = img.crop((0, 793, 600, 799))
+            self.assertEqual(bottom_margin.getextrema(), (255, 255))
+
 
 if __name__ == "__main__":
     unittest.main()

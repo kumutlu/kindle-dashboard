@@ -89,10 +89,11 @@ class TodoTheme(Theme):
         task_font = _font(FONT_REGULAR, 30 if wide else 24)
         footer_font = _font(FONT_BOLD, 22 if wide else 18)
 
+        top_offset = getattr(context, "status_bar_safe_area_px", 0)
         timezone_name = config.get("timezone") or context.timezone
         now = self.now_factory(timezone_name)
-        draw.text((margin, 46 if wide else 34), "Todo", fill=0, font=heading_font)
-        date_top = 124 if wide else 102
+        draw.text((margin, top_offset + (46 if wide else 34)), "Todo", fill=0, font=heading_font)
+        date_top = top_offset + (124 if wide else 102)
         draw.text((margin, date_top), now.strftime("%A"), fill=0, font=weekday_font)
         draw.text(
             (margin, date_top + (34 if wide else 28)),
@@ -105,7 +106,7 @@ class TodoTheme(Theme):
         visible = tasks[:8]
         remaining, completed = self.counts(tasks)
         footer_top = height - (145 if wide else 116)
-        content_top = 235 if wide else 188
+        content_top = top_offset + (235 if wide else 188)
         available = footer_top - content_top - 12
         row_height = max(44, available // 8)
 

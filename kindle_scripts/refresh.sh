@@ -26,7 +26,7 @@ KILL_CMD="${KILL_CMD:-kill}"
 # Single-instance protection with stale PID command verification
 if [ -f "$PID_FILE" ]; then
 	OLD_LPID=$(cat "$PID_FILE" 2>/dev/null)
-	if [ -n "$OLD_LPID" ] && "$KILL_CMD" -0 "$OLD_LPID" 2>/dev/null; then
+	if [ -n "$OLD_LPID" ] && [ "$OLD_LPID" != "$$" ] && "$KILL_CMD" -0 "$OLD_LPID" 2>/dev/null; then
 		OLD_CMDLINE=$(cat "$PROC_DIR/$OLD_LPID/cmdline" 2>/dev/null | tr '\0\n\r' '   ')
 		PAD_CMDLINE=" $OLD_CMDLINE "
 		case "$PAD_CMDLINE" in

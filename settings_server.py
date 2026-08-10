@@ -888,7 +888,7 @@ PROC_DIR="${PROC_DIR:-/proc}"
 # represented by dashboard_loop.pid.
 if [ -f "$LOOP_PID_FILE" ]; then
     OLD_LPID=$(cat "$LOOP_PID_FILE" 2>/dev/null)
-    if [ -n "$OLD_LPID" ] && kill -0 "$OLD_LPID" 2>/dev/null; then
+    if [ -n "$OLD_LPID" ] && [ "$OLD_LPID" != "$$" ] && kill -0 "$OLD_LPID" 2>/dev/null; then
         OLD_CMDLINE=$(cat "$PROC_DIR/$OLD_LPID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
         PAD_CMDLINE=" $OLD_CMDLINE "
         case "$PAD_CMDLINE" in

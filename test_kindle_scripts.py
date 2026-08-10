@@ -842,6 +842,102 @@ class KindleScriptsTests(unittest.TestCase):
         self.assertFalse((self.sandbox / "dashboard_loop.pid").exists())
         (self.sandbox / "proc_remove_on_term").unlink(missing_ok=True)
 
+    def test_prevent_screensaver_lifecycle_success(self):
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 1", calls)
+        self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls)
+        idx1 = calls.index("lipc-set-prop com.lab126.powerd preventScreenSaver 1")
+        idx0 = calls.index("lipc-set-prop com.lab126.powerd preventScreenSaver 0")
+        self.assertLess(idx1, idx0)
+
+    def test_prevent_screensaver_download_failure(self):
+        self.create_mock_bin("curl", "#!/bin/sh\nexit 1")
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertNotEqual(code, 0)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls)
+
+    def test_prevent_screensaver_invalid_png(self):
+        self.create_mock_bin("curl", (
+            "#!/bin/sh\n"
+            "HDR=''\n"
+            "OUT=''\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  if [ \"$1\" = \"-D\" ]; then shift; HDR=\"$1\"; fi\n"
+            "  if [ \"$1\" = \"-o\" ]; then shift; OUT=\"$1\"; fi\n"
+            "  shift\n"
+            "done\n"
+            "if [ -n \"$HDR\" ]; then printf 'HTTP/1.1 200 OK\\n\\n' > \"$HDR\"; fi\n"
+            "if [ -n \"$OUT\" ]; then printf 'CORRUPTED_NOT_PNG' > \"$OUT\"; fi\n"
+            "exit 0\n"
+        ))
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertNotEqual(code, 0)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls)
+
+    def test_prevent_screensaver_eips_failure(self):
+        self.create_mock_bin("eips", "#!/bin/sh\nexit 1")
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertNotEqual(code, 0)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls)
+
+    def test_prevent_screensaver_signals(self):
+        import signal, time
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=sig):
+                self.create_mock_bin("curl", "#!/bin/sh\nsleep 10\nexit 0\n")
+                proc = subprocess.Popen(
+                    ["/bin/sh", str(REFRESH_ONCE_SH)],
+                    env=self.env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                time.sleep(0.3)
+                proc.send_signal(sig)
+                proc.wait(timeout=5)
+                self.assertNotEqual(proc.returncode, 0)
+
+                calls_file = self.sandbox / "calls.log"
+                calls = calls_file.read_text(encoding="utf-8") if calls_file.exists() else ""
+                self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls)
+                self.assertIn("lipc-set-prop com.lab126.wifid enable 0", calls)
+
+    def test_early_exit_duplicate_lock_cleanup_safety(self):
+        lock_file = Path("/tmp/kindle-refresh.lock")
+        active_pid = str(os.getpid())
+        lock_file.write_text(f"{active_pid}\n", encoding="utf-8")
+        try:
+            code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+            self.assertEqual(code, 0)
+            self.assertTrue(lock_file.exists())
+            self.assertEqual(lock_file.read_text(encoding="utf-8").strip(), active_pid)
+            calls_file = self.sandbox / "calls.log"
+            calls = calls_file.read_text(encoding="utf-8") if calls_file.exists() else ""
+            self.assertNotIn("lipc-set-prop com.lab126.powerd preventScreenSaver 1", calls)
+            self.assertNotIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls)
+            self.assertNotIn("lipc-set-prop com.lab126.wifid enable 0", calls)
+        finally:
+            lock_file.unlink(missing_ok=True)
+
+    def test_ownership_duplicate_process_non_mutation(self):
+        lock_file = Path("/tmp/kindle-refresh.lock")
+        parent_pid = str(os.getppid())
+        lock_file.write_text(f"{parent_pid}\n", encoding="utf-8")
+        try:
+            code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+            self.assertEqual(code, 0)
+            self.assertEqual(lock_file.read_text(encoding="utf-8").strip(), parent_pid)
+            calls_file = self.sandbox / "calls.log"
+            calls = calls_file.read_text(encoding="utf-8") if calls_file.exists() else ""
+            self.assertNotIn("preventScreenSaver", calls)
+            self.assertNotIn("wifid", calls)
+        finally:
+            lock_file.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

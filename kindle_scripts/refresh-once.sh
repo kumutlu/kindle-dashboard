@@ -35,22 +35,45 @@ EIPS_BIN="${EIPS_BIN:-/usr/sbin/eips}"
 WIFI_POWER_SAVE="${WIFI_POWER_SAVE:-1}"
 UPDATE_ONLY_IF_CHANGED="${UPDATE_ONLY_IF_CHANGED:-1}"
 
+REFRESH_ACTIVE=0
+
 cleanup() {
 	rm -f "$TMP" "$HDR_TMP" "$ERR_TMP"
-	rm -f "$LOCK_FILE"
-	unset TOKEN
+	if [ -f "$LOCK_FILE" ]; then
+		if [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$$" ]; then
+			rm -f "$LOCK_FILE"
+		fi
+	fi
+	unset TOKEN 2>/dev/null || true
+	if [ "${REFRESH_ACTIVE:-0}" = "1" ]; then
+		if [ "${WIFI_POWER_SAVE:-1}" = "1" ]; then
+			if command -v lipc-set-prop >/dev/null 2>&1; then
+				lipc-set-prop com.lab126.wifid enable 0 2>/dev/null || true
+			fi
+		fi
+		if command -v lipc-set-prop >/dev/null 2>&1; then
+			lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null || true
+		fi
+	fi
+	return 0
 }
 
-trap cleanup EXIT HUP INT TERM
+on_signal() {
+	exit 1
+}
+
+trap cleanup EXIT
+trap on_signal HUP INT TERM
 
 if [ -f "$LOCK_FILE" ]; then
 	OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null)
-	if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+	if [ -n "$OLD_PID" ] && [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
 		echo "$(date '+%Y-%m-%d %H:%M:%S') another active refresh process ($OLD_PID) is running, exiting"
 		exit 0
 	fi
 fi
 echo $$ > "$LOCK_FILE"
+REFRESH_ACTIVE=1
 
 find_curl_bin() {
 	if command -v curl >/dev/null 2>&1; then

@@ -939,5 +939,175 @@ class KindleScriptsTests(unittest.TestCase):
             lock_file.unlink(missing_ok=True)
 
 
+    def test_successful_changed_image_refresh_synchronizes_overlay(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        self.env["LINKSS_SS"] = str(overlay_target)
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        self.assertTrue((self.sandbox / "image.png").exists())
+        self.assertTrue(overlay_target.exists())
+        self.assertEqual(
+            (self.sandbox / "image.png").read_bytes(),
+            overlay_target.read_bytes(),
+        )
+
+    def test_refresh_once_does_not_invoke_overlay_script(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        self.env["LINKSS_SS"] = str(overlay_target)
+
+        overlay_script = self.sandbox / "apply-screensaver-overlay.sh"
+        overlay_script.write_text(
+            "#!/bin/sh\n"
+            "echo \"SHOULD_NOT_BE_CALLED\" >> \"$DASHBOARD_DIR/calls.log\"\n",
+            encoding="utf-8",
+        )
+        overlay_script.chmod(0o755)
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8") if (self.sandbox / "calls.log").exists() else ""
+        self.assertNotIn("SHOULD_NOT_BE_CALLED", calls)
+        self.assertEqual(
+            (self.sandbox / "image.png").read_bytes(),
+            overlay_target.read_bytes(),
+        )
+
+    def test_refresh_once_contains_no_mount_or_overlay_script_calls(self):
+        script_text = REFRESH_ONCE_SH.read_text(encoding="utf-8")
+        self.assertNotIn("apply-screensaver-overlay", script_text)
+        self.assertNotIn("mount", script_text)
+        self.assertNotIn("umount", script_text)
+
+    def test_invalid_png_download_does_not_update_overlay(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        overlay_target.write_bytes(b"old-valid-overlay-content")
+        self.env["LINKSS_SS"] = str(overlay_target)
+
+        self.create_mock_bin("curl", (
+            "#!/bin/sh\n"
+            "HDR=''\n"
+            "OUT=''\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  if [ \"$1\" = \"-D\" ]; then shift; HDR=\"$1\"; fi\n"
+            "  if [ \"$1\" = \"-o\" ]; then shift; OUT=\"$1\"; fi\n"
+            "  shift\n"
+            "done\n"
+            "if [ -n \"$HDR\" ]; then printf 'HTTP/1.1 200 OK\\n\\n' > \"$HDR\"; fi\n"
+            "if [ -n \"$OUT\" ]; then printf 'CORRUPTED_NOT_PNG' > \"$OUT\"; fi\n"
+            "exit 0\n"
+        ))
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(overlay_target.read_bytes(), b"old-valid-overlay-content")
+
+    def test_failed_download_does_not_update_overlay(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        overlay_target.write_bytes(b"old-valid-overlay-content")
+        self.env["LINKSS_SS"] = str(overlay_target)
+
+        self.create_mock_bin("curl", "#!/bin/sh\nexit 1")
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(overlay_target.read_bytes(), b"old-valid-overlay-content")
+
+    def test_304_not_modified_repairs_stale_overlay(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        old_png = b"\x89PNG\r\n\x1a\nold-stale-overlay-content"
+        new_png = b"\x89PNG\r\n\x1a\nnew-current-dashboard-content"
+        (self.sandbox / "image.png").write_bytes(new_png)
+        overlay_target.write_bytes(old_png)
+        self.env["LINKSS_SS"] = str(overlay_target)
+        (self.sandbox / "image.etag").write_text("test-etag\n", encoding="utf-8")
+        (self.sandbox / "image.last_modified").write_text("Wed, 10 Jul 2026 10:00:00 GMT\n", encoding="utf-8")
+        self.env["MOCK_CURL_MODE"] = "not_modified"
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        self.assertEqual((self.sandbox / "image.png").read_bytes(), new_png)
+        self.assertEqual(overlay_target.read_bytes(), new_png)
+
+    def test_unchanged_download_repairs_stale_overlay(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        old_png = b"\x89PNG\r\n\x1a\nold-stale-overlay-content"
+        new_png = b"\x89PNG\r\n\x1a\ncurrent-dashboard-content"
+        (self.sandbox / "image.png").write_bytes(new_png)
+        overlay_target.write_bytes(old_png)
+        self.env["LINKSS_SS"] = str(overlay_target)
+        self.env["MOCK_IMAGE_CONTENT"] = r"\211PNG\r\n\032\ncurrent-dashboard-content"
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        self.assertEqual((self.sandbox / "image.png").read_bytes(), new_png)
+        self.assertEqual(overlay_target.read_bytes(), new_png)
+
+    def test_already_synchronized_overlay_is_noop(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        current_png = b"\x89PNG\r\n\x1a\nsame-dashboard-content"
+        (self.sandbox / "image.png").write_bytes(current_png)
+        overlay_target.write_bytes(current_png)
+        self.env["LINKSS_SS"] = str(overlay_target)
+        self.env["MOCK_IMAGE_CONTENT"] = r"\211PNG\r\n\032\nsame-dashboard-content"
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        self.assertEqual(overlay_target.read_bytes(), current_png)
+
+    def test_overlay_sync_happens_before_prevent_screensaver_released(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        self.env["LINKSS_SS"] = str(overlay_target)
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        calls = stdout
+        self.assertIn("screensaver overlay synchronized", calls)
+        calls_log = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls_log)
+
+    def test_final_cmp_verification_proves_img_equals_linkss(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        self.env["LINKSS_SS"] = str(overlay_target)
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            (self.sandbox / "image.png").read_bytes(),
+            overlay_target.read_bytes(),
+        )
+
+    def test_atomic_temp_file_cleaned_on_failure(self):
+        linkss_dir = self.sandbox / "linkss" / "screensavers"
+        linkss_dir.mkdir(parents=True)
+        overlay_target = linkss_dir / "bg_ss00.png"
+        self.env["LINKSS_SS"] = str(overlay_target)
+
+        self.create_mock_bin("curl", "#!/bin/sh\nexit 1\n")
+
+        code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
+        self.assertNotEqual(code, 0)
+        temp_files = list(linkss_dir.glob("*.tmp.*"))
+        self.assertEqual(len(temp_files), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

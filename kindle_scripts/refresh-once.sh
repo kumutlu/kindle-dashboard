@@ -34,11 +34,15 @@ STATUS_SENDER="${STATUS_SENDER:-$(dirname "$0")/send-status.sh}"
 EIPS_BIN="${EIPS_BIN:-/usr/sbin/eips}"
 WIFI_POWER_SAVE="${WIFI_POWER_SAVE:-1}"
 UPDATE_ONLY_IF_CHANGED="${UPDATE_ONLY_IF_CHANGED:-1}"
+LINKSS_SS="${LINKSS_SS:-/mnt/us/linkss/screensavers/bg_ss00.png}"
 
 REFRESH_ACTIVE=0
 
 cleanup() {
 	rm -f "$TMP" "$HDR_TMP" "$ERR_TMP"
+	if [ -n "${LINKSS_SS:-}" ]; then
+		rm -f "${LINKSS_SS}.tmp.$$"
+	fi
 	if [ -f "$LOCK_FILE" ]; then
 		if [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$$" ]; then
 			rm -f "$LOCK_FILE"
@@ -192,10 +196,55 @@ save_response_headers() {
 	fi
 }
 
-is_valid_png() {
-	[ -s "$TMP" ] || return 1
-	MAGIC=$(hexdump -n 8 -e '8/1 "%02x"' "$TMP" 2>/dev/null)
+is_valid_png_file() {
+	TARGET_FILE="${1:-$TMP}"
+	[ -s "$TARGET_FILE" ] || return 1
+	MAGIC=$(hexdump -n 8 -e '8/1 "%02x"' "$TARGET_FILE" 2>/dev/null)
 	[ "$MAGIC" = "89504e470d0a1a0a" ]
+}
+
+is_valid_png() {
+	is_valid_png_file "$TMP"
+}
+
+reconcile_screensaver_overlay() {
+	if [ ! -s "$IMG" ] || ! is_valid_png_file "$IMG"; then
+		echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: dashboard image $IMG missing or invalid, skipping overlay reconciliation" >&2
+		return 1
+	fi
+
+	LINKSS_DIR=$(dirname "$LINKSS_SS")
+	if [ -d "$LINKSS_DIR" ]; then
+		if [ -f "$LINKSS_SS" ] && cmp -s "$IMG" "$LINKSS_SS" 2>/dev/null; then
+			echo "$(date '+%Y-%m-%d %H:%M:%S') screensaver overlay already current: $LINKSS_SS"
+			return 0
+		fi
+
+		TMP_SS="${LINKSS_SS}.tmp.$$"
+		rm -f "$TMP_SS"
+		if cp -f "$IMG" "$TMP_SS" 2>/dev/null && [ -s "$TMP_SS" ]; then
+			if is_valid_png_file "$TMP_SS"; then
+				mv -f "$TMP_SS" "$LINKSS_SS"
+				sync 2>/dev/null || true
+				if cmp -s "$IMG" "$LINKSS_SS" 2>/dev/null; then
+					echo "$(date '+%Y-%m-%d %H:%M:%S') screensaver overlay synchronized: $LINKSS_SS"
+					return 0
+				else
+					echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: screensaver overlay reconciliation verification failed: $LINKSS_SS" >&2
+					return 1
+				fi
+			else
+				echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: temporary screensaver file is invalid PNG" >&2
+				rm -f "$TMP_SS"
+				return 1
+			fi
+		else
+			echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: failed to copy $IMG to temporary screensaver file $TMP_SS" >&2
+			rm -f "$TMP_SS"
+			return 1
+		fi
+	fi
+	return 0
 }
 
 request_url() {
@@ -329,6 +378,10 @@ if [ "$CHANGED" -eq 1 ] && [ -s "$IMG" ]; then
 	"$EIPS_BIN" -f; EIPS_STATUS=$?; echo "$(date '+%Y-%m-%d %H:%M:%S') eips_full_exit=$EIPS_STATUS"; [ "$EIPS_STATUS" -eq 0 ] || fail "eips -f failed"
 	"$EIPS_BIN" -g "$IMG"; EIPS_STATUS=$?; echo "$(date '+%Y-%m-%d %H:%M:%S') eips_display_file=$IMG eips_exit=$EIPS_STATUS"; [ "$EIPS_STATUS" -eq 0 ] || fail "eips -g failed"
 	DISPLAY_OK=1
+fi
+
+if [ "$CYCLE_OK" -eq 1 ]; then
+	reconcile_screensaver_overlay || true
 fi
 
 if [ "$CYCLE_OK" -eq 1 ] && [ -f "$STATUS_SENDER" ]; then

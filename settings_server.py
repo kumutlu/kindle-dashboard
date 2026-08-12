@@ -1170,6 +1170,7 @@ EOF"""
         f'REFRESH_INTERVAL_MINUTES="{int(config.get("refresh_interval_minutes", 60))}"',
         f'WIFI_POWER_SAVE="{"1" if config.get("wifi_power_save", True) else "0"}"',
         f'UPDATE_ONLY_IF_CHANGED="{"1" if config.get("update_only_if_changed", True) else "0"}"',
+        f'NATIVE_RTC_SCHEDULER="{"1" if getattr(device, "native_rtc_scheduler", False) else "0"}"',
         'LOW_POWER_MODE="$LOW_POWER_MODE"',
         "EOF",
         'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',

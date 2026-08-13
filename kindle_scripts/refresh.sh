@@ -10,6 +10,7 @@ RTC_SYS_DIR="${RTC_SYS_DIR:-/sys/class/rtc/rtc1}"
 LOG_FILE="${DASHBOARD_DIR}/dashboard.log"
 SLEEP_BIN="${SLEEP_BIN:-/bin/sleep}"
 LIPC_BIN="${LIPC_BIN:-lipc-set-prop}"
+LIPC_GET_BIN="${LIPC_GET_BIN:-lipc-get-prop}"
 KILL_CMD="${KILL_CMD:-kill}"
 
 log_msg() {
@@ -150,14 +151,124 @@ do
 			continue
 		fi
 
-		# Suspend Handoff Guard Sleep:
-		# powerButton enqueues suspend; powerd freezes userspace tasks during this sleep.
-		# When RTC alarm wakes the system, userspace unfreezes, sleep completes,
-		# and AFTER is measured across the full suspend/resume boundary.
-		"$SLEEP_BIN" 5
+		SEEN_SCREENSAVER=0
+		TRANSITION_TIMEOUT="${SUSPEND_ENTRY_TIMEOUT:-120}"
+		POLL_COUNT=0
+		LAST_LOGGED_STATE=""
+		CURR_STATE=""
+
+		while true
+		do
+			if command -v "$LIPC_GET_BIN" >/dev/null 2>&1; then
+				CURR_STATE=$("$LIPC_GET_BIN" com.lab126.powerd state 2>/dev/null | tr -d '\r\n' || true)
+			fi
+
+			if [ -n "$CURR_STATE" ] && [ "$CURR_STATE" != "$LAST_LOGGED_STATE" ]; then
+				log_msg "powerd state: $CURR_STATE"
+				LAST_LOGGED_STATE="$CURR_STATE"
+			fi
+
+			if [ "$CURR_STATE" = "screenSaver" ]; then
+				SEEN_SCREENSAVER=1
+				log_msg "entering passive suspend handoff wait"
+				break
+			fi
+
+			POLL_COUNT=$((POLL_COUNT + 1))
+			if [ "$POLL_COUNT" -ge "$TRANSITION_TIMEOUT" ]; then
+				log_msg "failure: suspend entry timeout (never reached screenSaver state)"
+				break
+			fi
+
+			"$SLEEP_BIN" 1
+		done
+
+		if [ "$SEEN_SCREENSAVER" -ne 1 ]; then
+			log_msg "failure: powerd suspend lifecycle incomplete"
+			"$SLEEP_BIN" "$INTERVAL_SECONDS"
+			continue
+		fi
+
+		# PHASE A — Passive Pre-TARGET Wait (V3.5):
+		# Do not use a long relative sleep (CLOCK_MONOTONIC pauses during suspend).
+		# Use zero-IPC sysfs RTC checks (STEP_SLEEP=10s) until since_epoch >= TARGET.
+		# ZERO LIPC queries occur during Phase A after screenSaver entry to leave powerd undisturbed.
+		# While in deep kernel suspend, userspace is frozen and consumes 0 CPU.
+		STEP_SLEEP="${SUSPEND_STEP_SLEEP:-10}"
+		PHASE_A_RESULT=""
+		PHASE_A_TICKS=0
+
+		while true
+		do
+			CURR_RTC=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\r\n' || echo 0)
+			case "$CURR_RTC" in
+				[0-9]*)
+					if [ "$CURR_RTC" -ge "$TARGET" ]; then
+						PHASE_A_RESULT="target_reached"
+						log_msg "phase A awake ticks: $PHASE_A_TICKS"
+						log_msg "RTC target reached: $CURR_RTC"
+						break
+					fi
+					;;
+				*)
+					PHASE_A_RESULT="rtc_invalid"
+					break
+					;;
+			esac
+
+			PHASE_A_TICKS=$((PHASE_A_TICKS + 1))
+			"$SLEEP_BIN" "$STEP_SLEEP"
+		done
+
+		if [ "$PHASE_A_RESULT" != "target_reached" ]; then
+			log_msg "failure: passive RTC wait aborted (result: ${PHASE_A_RESULT:-failed})"
+			"$SLEEP_BIN" "$INTERVAL_SECONDS"
+			continue
+		fi
+
+		# PHASE B — Post-TARGET Grace Poll (V3.5):
+		# Entered ONLY after Hardware RTC alarm has fired (CURR_RTC >= TARGET).
+		# Allow a bounded grace window (DEADLINE = TARGET + GRACE_SECONDS) for powerd to transition to "active".
+		GRACE_SECONDS="${RESUME_GRACE_SECONDS:-180}"
+		DEADLINE=$((TARGET + GRACE_SECONDS))
+		GOT_ACTIVE=0
+		POLL_INTERVAL="${RESUME_POLL_INTERVAL:-2}"
+		LAST_LOGGED_STATE=""
+
+		while true
+		do
+			CURR_RTC=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\r\n' || echo 0)
+			if command -v "$LIPC_GET_BIN" >/dev/null 2>&1; then
+				CURR_STATE=$("$LIPC_GET_BIN" com.lab126.powerd state 2>/dev/null | tr -d '\r\n' || true)
+				if [ -n "$CURR_STATE" ] && [ "$CURR_STATE" != "$LAST_LOGGED_STATE" ]; then
+					log_msg "powerd state: $CURR_STATE"
+					LAST_LOGGED_STATE="$CURR_STATE"
+				fi
+				if [ "$CURR_STATE" = "active" ]; then
+					GOT_ACTIVE=1
+					break
+				fi
+			fi
+
+			case "$CURR_RTC" in
+				[0-9]*)
+					if [ "$CURR_RTC" -ge "$DEADLINE" ]; then
+						break
+					fi
+					;;
+			esac
+
+			"$SLEEP_BIN" "$POLL_INTERVAL"
+		done
+
+		if [ "$GOT_ACTIVE" -ne 1 ]; then
+			log_msg "failure: resume transition timeout (never reached active state within grace)"
+			log_msg "failure: powerd suspend lifecycle incomplete"
+			"$SLEEP_BIN" "$INTERVAL_SECONDS"
+			continue
+		fi
 
 		AFTER=$(cat "$RTC_DIR/since_epoch" 2>/dev/null | tr -d '\r\n')
-		log_msg "resumed"
 
 		case "$AFTER" in
 			""|*[!0-9]*)
@@ -181,6 +292,8 @@ do
 					fi
 					log_msg "early wake backoff: ${BACKOFF}s"
 					"$SLEEP_BIN" "$BACKOFF"
+				else
+					log_msg "resume confirmed (slept ${ELAPSED}s)"
 				fi
 				;;
 		esac

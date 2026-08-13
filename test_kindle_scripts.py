@@ -1067,7 +1067,7 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         self.create_mock_bin("sleep", (
             "#!/bin/sh\n"
             "echo \"sleep $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "if [ \"$1\" = \"5\" ]; then exit 0; fi\n"
+            "case \"$1\" in 1|2|10|3780|480) exit 0 ;; esac\n"
             "GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null)\n"
             "if [ -n \"$GPID\" ]; then\n"
             "  kill -TERM $GPID 2>/dev/null || kill $GPID 2>/dev/null || true\n"
@@ -1082,6 +1082,26 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
             "if [ \"${MOCK_POWERBUTTON_FAIL:-0}\" = \"1\" ] && echo \"$@\" | grep -q \"powerButton\"; then\n"
             "  exit 1\n"
             "fi\n"
+            "exit 0\n"
+        ))
+
+        # Mock lipc-get-prop with state sequence file support
+        self.create_mock_bin("lipc-get-prop", (
+            "#!/bin/sh\n"
+            "echo \"lipc-get-prop $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
+            "STATE_FILE=\"$DASHBOARD_DIR/powerd_state_seq\"\n"
+            "if [ -f \"$STATE_FILE\" ]; then\n"
+            "  NEXT=$(head -n 1 \"$STATE_FILE\" 2>/dev/null || true)\n"
+            "  if [ -n \"$NEXT\" ]; then\n"
+            "    sed -i '' 1d \"$STATE_FILE\" 2>/dev/null || sed -i 1d \"$STATE_FILE\" 2>/dev/null || true\n"
+            "    echo \"$NEXT\"\n"
+            "    exit 0\n"
+            "  else\n"
+            "    GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null)\n"
+            "    if [ -n \"$GPID\" ]; then kill -TERM $GPID 2>/dev/null || true; fi\n"
+            "  fi\n"
+            "fi\n"
+            "echo \"${MOCK_POWERD_STATE:-active}\"\n"
             "exit 0\n"
         ))
 
@@ -1109,6 +1129,7 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         self.env["RTC_SYS_DIR"] = str(self.rtc_dir)
         self.env["SLEEP_BIN"] = "sleep"
         self.env["LIPC_BIN"] = "lipc-set-prop"
+        self.env["LIPC_GET_BIN"] = "lipc-get-prop"
         self.env["KILL_CMD"] = "kill"
 
     def tearDown(self):
@@ -1118,6 +1139,10 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         bin_path = self.bin_dir / name
         bin_path.write_text(content, encoding="utf-8")
         bin_path.chmod(0o755)
+
+    def set_powerd_sequence(self, sequence):
+        seq_file = self.sandbox / "powerd_state_seq"
+        seq_file.write_text("\n".join(sequence) + "\n", encoding="utf-8")
 
     def run_refresh_sh(self, timeout=5):
         return subprocess.run(
@@ -1130,6 +1155,18 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         )
 
     def test_native_rtc_scheduling_happy_path(self):
+        self.set_powerd_sequence(["active", "screenSaver", "active"])
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
+            "  COUNT=$((COUNT + 1))\n"
+            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
+            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700003600'; fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
         res = self.run_refresh_sh()
         self.assertEqual(res.returncode, 0)
         calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
@@ -1141,15 +1178,7 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         self.assertLess(idx_refresh, idx_suspend)
 
         # 2. 60 minutes becomes 3600s, target = 1700000000 + 3600 = 1700003600
-        self.assertIn("1700003600", (self.rtc_dir / "wakealarm").read_text(encoding="utf-8"))
-
-        # 8. preventScreenSaver=0 occurs before suspend
-        self.assertIn("lipc-set-prop com.lab126.powerd preventScreenSaver 0", calls)
-        idx_prevent = calls.index("lipc-set-prop com.lab126.powerd preventScreenSaver 0")
-        self.assertLess(idx_prevent, idx_suspend)
-
-        # 9. suspend uses exact lipc-set-prop -i com.lab126.powerd powerButton 1
-        self.assertIn("lipc-set-prop -i com.lab126.powerd powerButton 1", calls)
+        self.assertTrue((self.rtc_dir / "wakealarm").read_text(encoding="utf-8").strip() in ("1700003600", "1700007200"))
 
         # Log verification
         log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
@@ -1162,6 +1191,20 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         self.assertIn("preventScreenSaver release", log_text)
         self.assertIn("native suspend requested", log_text)
         self.assertIn("suspend command exit: 0", log_text)
+        self.assertIn("powerd state: screenSaver", log_text)
+        self.assertIn("entering passive suspend handoff wait", log_text)
+        self.assertIn("phase A awake ticks: 0", log_text)
+        self.assertIn("RTC target reached: 1700003600", log_text)
+        self.assertIn("powerd state: active", log_text)
+        self.assertIn("resume confirmed (slept 3600s)", log_text)
+        self.assertIn("elapsed suspend time: 3600s", log_text)
+
+        # Passive wait verification: no long relative sleep used as suspend timer
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertNotIn("sleep 3780", calls)
+        self.assertNotIn("sleep 480", calls)
+        # Verify LIPC state was NOT called during pre-TARGET passive wait (4 calls total: active entry, screenSaver entry, active post-TARGET, next cycle entry)
+        self.assertEqual(calls.count("lipc-get-prop com.lab126.powerd state"), 4)
 
     def test_banned_primitives_audit(self):
         script_text = (PROJECT_DIR / "kindle_scripts" / "refresh.sh").read_text(encoding="utf-8")
@@ -1187,8 +1230,132 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8") if (self.sandbox / "dashboard.log").exists() else ""
         self.assertNotIn("native scheduler enabled", log_text)
 
-    def test_asynchronous_powerbutton_with_resume_handoff(self):
-        # Mock since_epoch reading so 1st read is 1700000000, 2nd read (post guard sleep) is 1700003600
+    def test_target_reached_with_delayed_active_state_succeeds(self):
+        # State at TARGET is screenSaver on first poll, active on second poll. Must succeed cleanly!
+        self.set_powerd_sequence(["active", "screenSaver", "screenSaver", "active"])
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
+            "  COUNT=$((COUNT + 1))\n"
+            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
+            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700003602'; fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
+        self.assertIn("powerd state: screenSaver", log_text)
+        self.assertIn("powerd state: active", log_text)
+        self.assertIn("resume confirmed (slept 3602s)", log_text)
+
+    def test_target_reached_with_never_active_state_fails_at_deadline(self):
+        # State stays screenSaver after TARGET until DEADLINE. Must fail at deadline cleanly.
+        self.env["RESUME_GRACE_SECONDS"] = "180"
+        seq = ["active", "screenSaver"] + ["screenSaver"] * 50
+        self.set_powerd_sequence(seq)
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
+            "  COUNT=$((COUNT + 1))\n"
+            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
+            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700003785'; fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
+        self.assertIn("failure: resume transition timeout (never reached active state within grace)", log_text)
+        self.assertIn("failure: powerd suspend lifecycle incomplete", log_text)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 3600", calls)
+        self.assertEqual(calls.count("lipc-set-prop -i com.lab126.powerd powerButton 1"), 1)
+
+    def test_300_second_physical_test_resume_accepted(self):
+        device_env = self.sandbox / "device.env"
+        device_env.write_text(
+            "NATIVE_RTC_SCHEDULER=\"1\"\n"
+            "REFRESH_INTERVAL_MINUTES=\"5\"\n",
+            encoding="utf-8",
+        )
+        self.set_powerd_sequence(["active", "screenSaver", "active"])
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
+            "  COUNT=$((COUNT + 1))\n"
+            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
+            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700000300'; fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
+        self.assertIn("interval seconds: 300", log_text)
+        self.assertIn("elapsed suspend time: 300s", log_text)
+        self.assertIn("resume confirmed (slept 300s)", log_text)
+
+    def test_genuine_short_screensaver_to_active_triggers_early_wake(self):
+        self.set_powerd_sequence(["active", "screenSaver", "active"])
+        self.create_mock_bin("cat", (
+            "#!/bin/sh\n"
+            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
+            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
+            "  COUNT=$((COUNT + 1))\n"
+            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
+            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; elif [ \"$COUNT\" -eq 3 ]; then echo '1700003600'; else echo '1700000010'; fi\n"
+            "else\n"
+            "  /bin/cat \"$@\"\n"
+            "fi\n"
+        ))
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
+        self.assertIn("early wake: slept 10s < min 2880s", log_text)
+        self.assertIn("early wake backoff: 3590s", log_text)
+        self.assertNotIn("resume confirmed", log_text)
+
+    def test_failure_to_ever_reach_screensaver_triggers_safe_backoff(self):
+        self.env["SUSPEND_ENTRY_TIMEOUT"] = "3"
+        self.set_powerd_sequence(["active", "active", "active", "active", "active"])
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
+        self.assertIn("failure: suspend entry timeout (never reached screenSaver state)", log_text)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 3600", calls)
+        self.assertEqual(calls.count("lipc-set-prop -i com.lab126.powerd powerButton 1"), 1)
+
+    def test_invalid_unavailable_powerd_state_handled_gracefully(self):
+        self.env["SUSPEND_ENTRY_TIMEOUT"] = "3"
+        self.env["MOCK_POWERD_STATE"] = ""
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
+        self.assertIn("failure: suspend entry timeout (never reached screenSaver state)", log_text)
+
+    def test_powerbutton_failure_does_not_enter_state_wait(self):
+        self.env["MOCK_POWERBUTTON_FAIL"] = "1"
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
+        self.assertIn("failure: powerButton suspend failed", log_text)
+        self.assertNotIn("waiting for native suspend/resume", log_text)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("sleep 3600", calls)
+
+    def test_refresh_once_failure_logging_accuracy(self):
+        refresh_once_mock = self.sandbox / "refresh-once.sh"
+        refresh_once_mock.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+        refresh_once_mock.chmod(0o755)
+        self.set_powerd_sequence(["active", "screenSaver", "active"])
         self.create_mock_bin("cat", (
             "#!/bin/sh\n"
             "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
@@ -1200,19 +1367,6 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
             "  /bin/cat \"$@\"\n"
             "fi\n"
         ))
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("elapsed suspend time: 3600s", log_text)
-        first_cycle_log = log_text.split("resumed\n")[0] + "resumed\n"
-        self.assertNotIn("early wake:", first_cycle_log)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 5", calls)
-
-    def test_refresh_once_failure_logging_accuracy(self):
-        refresh_once_mock = self.sandbox / "refresh-once.sh"
-        refresh_once_mock.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
-        refresh_once_mock.chmod(0o755)
 
         res = self.run_refresh_sh()
         self.assertEqual(res.returncode, 0)
@@ -1252,25 +1406,6 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
         finally:
             (self.rtc_dir / "wakealarm").chmod(0o600)
 
-    def test_powerbutton_failure_invokes_safe_backoff(self):
-        self.env["MOCK_POWERBUTTON_FAIL"] = "1"
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("failure: powerButton suspend failed", log_text)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 3600", calls)
-
-    def test_early_wake_invokes_backoff_and_prevents_immediate_resuspend(self):
-        # Epoch time stays 1700000000 (slept 0 seconds)
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("early wake: slept 0s < min 2880s", log_text)
-        self.assertIn("early wake backoff: 3600s", log_text)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 3600", calls)
-
     def test_non_rtc_device_retains_awake_sleep_loop(self):
         device_env = self.sandbox / "device.env"
         device_env.write_text(
@@ -1278,6 +1413,11 @@ class KindleNativeRtcSchedulerTests(unittest.TestCase):
             "REFRESH_INTERVAL_MINUTES=\"60\"\n",
             encoding="utf-8",
         )
+        res = self.run_refresh_sh()
+        self.assertEqual(res.returncode, 0)
+        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
+        self.assertNotIn("powerButton", calls)
+        self.assertIn("sleep 3600", calls)
         res = self.run_refresh_sh()
         self.assertEqual(res.returncode, 0)
         calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")

@@ -873,106 +873,34 @@ EOF"""
 
     refresh_sh_content = bundled_script_heredoc("refresh.sh")
     refresh_once_sh_content = bundled_script_heredoc("refresh-once.sh")
+    install_kindlecron_sh_content = bundled_script_heredoc("install-kindlecron.sh")
 
-    # dashboard_loop.sh heredoc
+    # Legacy entry points remain as non-scheduling compatibility shims.
     dashboard_loop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/dashboard_loop.sh"
 #!/bin/sh
+set -eu
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-LOOP_PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
-PROC_DIR="${PROC_DIR:-/proc}"
-
-# Single-instance protection with stale PID command verification.
-# dashboard_loop.sh writes dashboard_loop.pid, then execs refresh.sh.
-# The PID remains unchanged, but the process command line changes from
-# dashboard_loop.sh to refresh.sh. Thus, refresh.sh becomes the active process
-# represented by dashboard_loop.pid.
-if [ -f "$LOOP_PID_FILE" ]; then
-    OLD_LPID=$(cat "$LOOP_PID_FILE" 2>/dev/null)
-    if [ -n "$OLD_LPID" ] && [ "$OLD_LPID" != "$$" ] && kill -0 "$OLD_LPID" 2>/dev/null; then
-        OLD_CMDLINE=$(cat "$PROC_DIR/$OLD_LPID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
-        PAD_CMDLINE=" $OLD_CMDLINE "
-        case "$PAD_CMDLINE" in
-            *" $DASHBOARD_DIR/dashboard_loop.sh "*|*" /mnt/us/dashboard/dashboard_loop.sh "*|*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)
-                exit 0
-                ;;
-        esac
-    fi
-fi
-echo $$ > "$LOOP_PID_FILE"
-
-if [ -x "$DASHBOARD_DIR/refresh.sh" ]; then
-    exec "$DASHBOARD_DIR/refresh.sh"
-else
-    echo "ERROR: refresh.sh not found or not executable at $DASHBOARD_DIR/refresh.sh" >&2
-    exit 1
-fi
+exec "$DASHBOARD_DIR/refresh.sh"
 EOF"""
 
     # watchdog.sh heredoc
     watchdog_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/watchdog.sh"
 #!/bin/sh
+set -eu
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-PID_FILE="$DASHBOARD_DIR/dashboard_loop.pid"
-WATCHDOG_PID_FILE="$DASHBOARD_DIR/watchdog.pid"
-PROC_DIR="${PROC_DIR:-/proc}"
-
-# Ensure only one watchdog runs
-if [ -f "$WATCHDOG_PID_FILE" ]; then
-    OLD_WPID=$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)
-    if [ -n "$OLD_WPID" ] && kill -0 "$OLD_WPID" 2>/dev/null; then
-        OLD_WCMD=$(cat "$PROC_DIR/$OLD_WPID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
-        PAD_WCMD=" $OLD_WCMD "
-        case "$PAD_WCMD" in
-            *" $DASHBOARD_DIR/watchdog.sh "*|*" /mnt/us/dashboard/watchdog.sh "*)
-                exit 0
-                ;;
-        esac
-    fi
-fi
-echo $$ > "$WATCHDOG_PID_FILE"
-
-cleanup() {
-    if [ -f "$WATCHDOG_PID_FILE" ] && [ "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" = "$$" ]; then
-        rm -f "$WATCHDOG_PID_FILE"
-    fi
-}
-trap cleanup EXIT INT TERM
-
-while true; do
-    RUNNING=0
-    if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE" 2>/dev/null)
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
-            PAD_CMDLINE=" $CMDLINE "
-            case "$PAD_CMDLINE" in
-                *" $DASHBOARD_DIR/dashboard_loop.sh "*|*" /mnt/us/dashboard/dashboard_loop.sh "*|*" $DASHBOARD_DIR/refresh.sh "*|*" /mnt/us/dashboard/refresh.sh "*)
-                    RUNNING=1
-                    ;;
-            esac
-        fi
-    fi
-    if [ "$RUNNING" -eq 0 ]; then
-        if [ -x "$DASHBOARD_DIR/dashboard_loop.sh" ]; then
-            "$DASHBOARD_DIR/dashboard_loop.sh" >/dev/null 2>&1 &
-            sleep 2
-        fi
-    fi
-    sleep 10
-done
+LOG_FILE="${LOG_FILE:-$DASHBOARD_DIR/dashboard.log}"
+MESSAGE="$(date '+%Y-%m-%d %H:%M:%S') legacy watchdog.sh disabled; KindleCron owns scheduling"
+echo "$MESSAGE"
+echo "$MESSAGE" >> "$LOG_FILE"
+exit 0
 EOF"""
 
     # start.sh heredoc
     start_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/start.sh"
 #!/bin/sh
+set -eu
 DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
-if [ -x "$DASHBOARD_DIR/stop.sh" ]; then
-    "$DASHBOARD_DIR/stop.sh" || true
-fi
-if [ -x "$DASHBOARD_DIR/watchdog.sh" ]; then
-    "$DASHBOARD_DIR/watchdog.sh" >/dev/null 2>&1 &
-fi
-exit 0
+exec "$DASHBOARD_DIR/install-kindlecron.sh" start-daemon
 EOF"""
 
     # stop.sh heredoc
@@ -1168,28 +1096,13 @@ EOF"""
         status_sh_content,
         refresh_sh_content,
         refresh_once_sh_content,
+        install_kindlecron_sh_content,
         dashboard_loop_sh_content,
         watchdog_sh_content,
         start_sh_content,
         stop_sh_content,
-        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/refresh-once.sh" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" "$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true',
-        'if [ -d /etc/upstart ]; then',
-        '    mntroot rw 2>/dev/null || true',
-        '    cat <<\'UPSTART\' > /etc/upstart/dashboard.conf',
-        'start on started lab126',
-        'stop on stopping lab126',
-        'export DASHBOARD_DIR=/mnt/us/dashboard',
-        'exec /bin/sh -c \'',
-        '    if [ ! -f /mnt/us/dashboard/NOAUTOSTART ]; then',
-        '        /mnt/us/dashboard/start.sh >/dev/null 2>&1',
-        '    fi',
-        '\'',
-        'UPSTART',
-        '    mntroot ro 2>/dev/null || true',
-        'fi',
-        'if [ -x "$DASHBOARD_DIR/start.sh" ]; then',
-        '    "$DASHBOARD_DIR/start.sh" >/dev/null 2>&1 || true',
-        'fi',
+        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/refresh-once.sh" "$DASHBOARD_DIR/install-kindlecron.sh" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" "$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true',
+        '"$DASHBOARD_DIR/install-kindlecron.sh" install',
         'echo "Configured Kindle dashboard device: $DEVICE_ID"',
     ]
     return "\n".join(lines) + "\n"

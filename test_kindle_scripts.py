@@ -196,6 +196,79 @@ class KindleScriptsTests(unittest.TestCase):
         self.assertIn('LOW_POWER_MODE="0"', installer)
         self.assertIn('NATIVE_RTC_SCHEDULER="0"', installer)
 
+    def test_generated_installer_embeds_and_runs_kindlecron_integration(self):
+        installer = self.generated_installer()
+        self.assertIn(
+            'cat <<\'EOF\' > "$DASHBOARD_DIR/install-kindlecron.sh"',
+            installer,
+        )
+        self.assertIn(
+            '"$DASHBOARD_DIR/install-kindlecron.sh" install',
+            installer,
+        )
+        self.assertNotIn(
+            '"$DASHBOARD_DIR/install-kindlecron.sh" install || true',
+            installer,
+        )
+
+    def test_generated_installer_has_no_legacy_scheduler_autostart(self):
+        installer = self.generated_installer()
+        self.assertNotIn(
+            "cat <<'UPSTART' > /etc/upstart/dashboard.conf",
+            installer,
+        )
+        self.assertNotIn("start on started lab126", installer)
+        self.assertNotIn(
+            '"$DASHBOARD_DIR/watchdog.sh" >/dev/null 2>&1 &',
+            installer,
+        )
+
+    def test_generated_installer_does_not_own_kmc_emergency_hook(self):
+        installer = self.generated_installer()
+        self.assertNotIn("/mnt/us/emergency.sh", installer)
+        self.assertNotIn("/var/local/kmc", installer)
+        self.assertNotIn("framework_ready", installer)
+
+    def test_generated_installer_executes_verified_kindlecron_integration(self):
+        kron_calls = self.sandbox / "generated-kron.calls"
+        kron = self.sandbox / "kron"
+        kron.write_text(
+            "#!/bin/sh\n"
+            f'printf "<%s>" "$@" >> "{kron_calls}"\n'
+            "printf '\\n' >> \"" + str(kron_calls) + "\"\n"
+            'case "$1" in\n'
+            "  version) echo 'KindleCron v0.2.0 (test)' ;;\n"
+            "  list) echo 'dashboard every 1h' ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        kron.chmod(0o755)
+        daemon_state = self.sandbox / "daemon.state"
+        daemon_state.write_text("0\n", encoding="utf-8")
+        result = subprocess.run(
+            ["sh", "-c", self.generated_installer()],
+            env={
+                **self.env,
+                "KRON_BIN": str(kron),
+                "KRON_DAEMON_STATE_FILE": str(daemon_state),
+                "KRON_DAEMON_LOG": str(self.sandbox / "kron.log"),
+                "UPSTART_CONF": str(self.sandbox / "dashboard.conf"),
+                "MNTROOT_BIN": "true",
+                "SLEEP_BIN": "true",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        calls = kron_calls.read_text(encoding="utf-8")
+        self.assertIn(
+            f"<add><-timeout><2m><dashboard><every 1h><{self.sandbox / 'refresh-once.sh'}>",
+            calls,
+        )
+        self.assertIn("<daemon>", calls)
+        self.assertIn("<list>", calls)
+
     def test_refresh_once_missing_device_id_uses_default(self):
         code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
         self.assertEqual(code, 0)
@@ -307,260 +380,88 @@ class KindleScriptsTests(unittest.TestCase):
                 self.assertIn("/device/default-kindle/image.png", calls)
 
 
-    def test_process_manager_scenarios(self):
-        import settings_server
+    def test_generated_legacy_entry_points_are_non_scheduling_shims(self):
+        import re
 
-        class FakeDevice:
-            id = "kindle-131"
-            type = "kindle_pw1"
-            name = "Test Kindle"
-            resolution = (758, 1024)
-            enabled = True
-
-        device = FakeDevice()
-        config = {"status_token": "fake-token"}
-        installer_script = settings_server.kindle_installer_script(device, config, "192.168.68.167", 8767, 8767)
+        installer_script = self.generated_installer()
 
         def extract_script(name):
-            import re
-            match = re.search(f'cat <<\'EOF\' > "\\$DASHBOARD_DIR/{name}"\\n(.*?)\\nEOF', installer_script, re.DOTALL)
-            if not match:
-                raise ValueError(f"Marker for {name} not found")
+            match = re.search(
+                f"cat <<'EOF' > \"\\$DASHBOARD_DIR/{name}\"\n(.*?)\nEOF",
+                installer_script,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, msg=f"Marker for {name} not found")
             return match.group(1)
 
-        watchdog_src = extract_script("watchdog.sh")
         loop_src = extract_script("dashboard_loop.sh")
-        stop_src = extract_script("stop.sh")
+        watchdog_src = extract_script("watchdog.sh")
         start_src = extract_script("start.sh")
 
-        # Setup mock /proc directory
-        proc_dir = self.sandbox / "proc"
-        proc_dir.mkdir(parents=True, exist_ok=True)
-        self.env["PROC_DIR"] = str(proc_dir)
-
-        kill_func = (
-            "kill() {\n"
-            "  echo \"kill $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "  if [ \"$1\" = \"-0\" ]; then\n"
-            "    PID=\"$2\"\n"
-            "    if [ -d \"$PROC_DIR/$PID\" ]; then return 0; else return 1; fi\n"
-            "  fi\n"
-            "  if [ \"$1\" = \"-s\" ]; then\n"
-            "    SIG=\"$2\"; PID=\"$3\"\n"
-            "    echo \"signal $SIG sent to $PID\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "    if [ \"$SIG\" = \"TERM\" ]; then\n"
-            "      if [ -f \"$DASHBOARD_DIR/proc_remove_on_term\" ]; then\n"
-            "        rm -rf \"$PROC_DIR/$PID\"\n"
-            "      fi\n"
-            "      if [ -f \"$DASHBOARD_DIR/proc_change_on_term\" ]; then\n"
-            "        echo \"0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99999\" > \"$PROC_DIR/$PID/stat\"\n"
-            "      fi\n"
-            "    fi\n"
-            "    return 0\n"
-            "  fi\n"
-            "  return 0\n"
-            "}\n"
+        for source in (loop_src, watchdog_src, start_src):
+            self.assertNotIn("while true", source)
+        self.assertIn('exec "$DASHBOARD_DIR/refresh.sh"', loop_src)
+        self.assertIn("KindleCron owns scheduling", watchdog_src)
+        self.assertNotIn('&', watchdog_src)
+        self.assertIn(
+            'exec "$DASHBOARD_DIR/install-kindlecron.sh" start-daemon',
+            start_src,
         )
 
-        (self.sandbox / "watchdog.sh").write_text(kill_func + watchdog_src, encoding="utf-8")
-        (self.sandbox / "watchdog.sh").chmod(0o755)
-        (self.sandbox / "dashboard_loop.sh").write_text(kill_func + loop_src, encoding="utf-8")
-        (self.sandbox / "dashboard_loop.sh").chmod(0o755)
+        for name, source in (
+            ("dashboard_loop.sh", loop_src),
+            ("watchdog.sh", watchdog_src),
+            ("start.sh", start_src),
+        ):
+            path = self.sandbox / name
+            path.write_text(source + "\n", encoding="utf-8")
+            path.chmod(0o755)
 
-        sleep_func = "sleep() { echo \"sleep $@\" >> \"$DASHBOARD_DIR/calls.log\"; }\n"
-        (self.sandbox / "stop.sh").write_text(kill_func + sleep_func + stop_src, encoding="utf-8")
-        (self.sandbox / "stop.sh").chmod(0o755)
-        (self.sandbox / "start.sh").write_text(kill_func + start_src, encoding="utf-8")
-        (self.sandbox / "start.sh").chmod(0o755)
+        calls = self.sandbox / "shim.calls"
+        refresh = self.sandbox / "refresh.sh"
+        refresh.write_text(
+            f'#!/bin/sh\necho refresh >> "{calls}"\nexit 7\n',
+            encoding="utf-8",
+        )
+        refresh.chmod(0o755)
+        integration = self.sandbox / "install-kindlecron.sh"
+        integration.write_text(
+            f'#!/bin/sh\necho "$@" >> "{calls}"\nexit 9\n',
+            encoding="utf-8",
+        )
+        integration.chmod(0o755)
 
-        # Write dummy refresh.sh
-        (self.sandbox / "refresh.sh").write_text("#!/bin/sh\necho refresh run\n", encoding="utf-8")
-        (self.sandbox / "refresh.sh").chmod(0o755)
+        loop = subprocess.run(
+            ["sh", str(self.sandbox / "dashboard_loop.sh")],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(loop.returncode, 7)
 
-        # Helper to setup mock process in /proc
-        def setup_proc(pid, cmdline, start_time="12345", comm="watchdog.sh"):
-            pdir = proc_dir / str(pid)
-            pdir.mkdir(parents=True, exist_ok=True)
-            (pdir / "cmdline").write_text(cmdline, encoding="utf-8")
-            remaining_fields = ["0"] * 19 + [start_time]
-            stat_content = f"{pid} ({comm}) " + " ".join(remaining_fields) + "\n"
-            (pdir / "stat").write_text(stat_content, encoding="utf-8")
+        watchdog = subprocess.run(
+            ["sh", str(self.sandbox / "watchdog.sh")],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(watchdog.returncode, 0)
+        self.assertIn("KindleCron owns scheduling", watchdog.stdout)
 
-        def clean_proc(pid):
-            shutil.rmtree(proc_dir / str(pid), ignore_errors=True)
-
-        calls_log = self.sandbox / "calls.log"
-
-        # ----------------------------------------------------
-        # Scenario 1: dashboard_loop.pid before exec (cmdline has dashboard_loop.sh)
-        # ----------------------------------------------------
-        setup_proc(100, f"/bin/sh {self.sandbox}/dashboard_loop.sh")
-        (self.sandbox / "dashboard_loop.pid").write_text("100\n", encoding="utf-8")
-
-        # Running dashboard_loop.sh again should exit immediately (status 0)
-        code, stdout, stderr = self.run_script(self.sandbox / "dashboard_loop.sh")
-        self.assertEqual(code, 0)
-        self.assertTrue((self.sandbox / "dashboard_loop.pid").exists())
-        self.assertEqual((self.sandbox / "dashboard_loop.pid").read_text(encoding="utf-8").strip(), "100")
-
-        # ----------------------------------------------------
-        # Scenario 2: dashboard_loop.pid after exec (cmdline has refresh.sh)
-        # ----------------------------------------------------
-        setup_proc(100, f"/bin/sh {self.sandbox}/refresh.sh")
-        code, stdout, stderr = self.run_script(self.sandbox / "dashboard_loop.sh")
-        self.assertEqual(code, 0)
-        self.assertEqual((self.sandbox / "dashboard_loop.pid").read_text(encoding="utf-8").strip(), "100")
-
-        # ----------------------------------------------------
-        # Scenario 3: Unrelated process with word "refresh" outside DASHBOARD_DIR
-        # ----------------------------------------------------
-        setup_proc(100, "/bin/sh /some/other/path/refresh.sh")
-        # Run stop.sh, should NOT kill PID 100 because it is outside self.sandbox
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        self.assertEqual(code, 0)
-        calls = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
-        self.assertNotIn("signal TERM sent to 100", calls)
-        self.assertTrue((self.sandbox / "dashboard_loop.pid").exists()) # Untouched since it is unrelated
-
-        # ----------------------------------------------------
-        # Scenario 4: Stale PID
-        # ----------------------------------------------------
-        clean_proc(100)
-        # Run stop.sh, should clean up dashboard_loop.pid
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        self.assertEqual(code, 0)
-        self.assertFalse((self.sandbox / "dashboard_loop.pid").exists())
-
-        # ----------------------------------------------------
-        # Scenario 5: Malformed PID
-        # ----------------------------------------------------
-        (self.sandbox / "dashboard_loop.pid").write_text("abc\n", encoding="utf-8")
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        self.assertEqual(code, 0)
-        self.assertFalse((self.sandbox / "dashboard_loop.pid").exists())
-
-        # ----------------------------------------------------
-        # Scenario 6: Valid watchdog PID
-        # ----------------------------------------------------
-        setup_proc(200, f"/bin/sh {self.sandbox}/watchdog.sh")
-        (self.sandbox / "watchdog.pid").write_text("200\n", encoding="utf-8")
-        # Run watchdog.sh again, should exit immediately
-        code, stdout, stderr = self.run_script(self.sandbox / "watchdog.sh")
-        self.assertEqual(code, 0)
-
-        # ----------------------------------------------------
-        # Scenario 7: Unrelated reused watchdog PID
-        # ----------------------------------------------------
-        setup_proc(200, "/bin/sh /some/other/watchdog.sh")
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        self.assertEqual(code, 0)
-        calls = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
-        self.assertNotIn("signal TERM sent to 200", calls)
-        self.assertTrue((self.sandbox / "watchdog.pid").exists())
-
-        # ----------------------------------------------------
-        # Scenario 8: TERM success
-        # ----------------------------------------------------
-        setup_proc(200, f"/bin/sh {self.sandbox}/watchdog.sh")
-        (self.sandbox / "proc_remove_on_term").write_text("", encoding="utf-8")
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        self.assertEqual(code, 0)
-        calls = calls_log.read_text(encoding="utf-8")
-        self.assertIn("signal TERM sent to 200", calls)
-        self.assertNotIn("kill -s KILL 200", calls)
-        self.assertFalse((self.sandbox / "watchdog.pid").exists())
-
-        # ----------------------------------------------------
-        # Scenario 9: TERM timeout followed by KILL
-        # ----------------------------------------------------
-        shutil.rmtree(proc_dir, ignore_errors=True)
-        proc_dir.mkdir(parents=True)
-        setup_proc(300, f"/bin/sh {self.sandbox}/watchdog.sh")
-        (self.sandbox / "watchdog.pid").write_text("300\n", encoding="utf-8")
-        (self.sandbox / "proc_remove_on_term").unlink(missing_ok=True)
-        (self.sandbox / "proc_change_on_term").unlink(missing_ok=True)
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        calls = calls_log.read_text(encoding="utf-8")
-        self.assertIn("signal TERM sent to 300", calls)
-        self.assertIn("kill -s KILL 300", calls)
-
-        # ----------------------------------------------------
-        # Scenario 10: PID reuse after TERM (process start time changes)
-        # ----------------------------------------------------
-        shutil.rmtree(proc_dir, ignore_errors=True)
-        proc_dir.mkdir(parents=True)
-        setup_proc(400, f"/bin/sh {self.sandbox}/watchdog.sh", start_time="12345")
-        (self.sandbox / "watchdog.pid").write_text("400\n", encoding="utf-8")
-        (self.sandbox / "proc_change_on_term").write_text("", encoding="utf-8")
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        calls = calls_log.read_text(encoding="utf-8")
-        # TERM was sent
-        self.assertIn("signal TERM sent to 400", calls)
-        # KILL must NOT be sent to 400 because its start time changed
-        self.assertNotIn("kill -s KILL 400", calls)
-        # The PID file watchdog.pid must NOT be deleted because it is unsafe
-        self.assertTrue((self.sandbox / "watchdog.pid").exists())
-        (self.sandbox / "proc_change_on_term").unlink(missing_ok=True)
-
-        # ----------------------------------------------------
-        # Scenario 11: Single-writer ownership verification
-        # ----------------------------------------------------
-        # Verify statically that start.sh doesn't write watchdog.pid
-        self.assertNotIn("watchdog.pid", start_src)
-        # Verify statically that watchdog.sh doesn't write dashboard_loop.pid
-        self.assertNotIn('echo $! > "$PID_FILE"', watchdog_src)
-        self.assertNotIn('echo $$ > "$PID_FILE"', watchdog_src)
-
-        # ----------------------------------------------------
-        # Scenario 12: process comm containing spaces in /proc/<pid>/stat
-        # ----------------------------------------------------
-        shutil.rmtree(proc_dir, ignore_errors=True)
-        proc_dir.mkdir(parents=True)
-        setup_proc(500, f"/bin/sh {self.sandbox}/watchdog.sh", start_time="98765", comm="watchdog.sh with spaces inside parentheses")
-        (self.sandbox / "watchdog.pid").write_text("500\n", encoding="utf-8")
-        (self.sandbox / "proc_remove_on_term").write_text("", encoding="utf-8")
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        calls = calls_log.read_text(encoding="utf-8")
-        self.assertIn("signal TERM sent to 500", calls)
-        self.assertFalse((self.sandbox / "watchdog.pid").exists())
-        (self.sandbox / "proc_remove_on_term").unlink(missing_ok=True)
-
-        # ----------------------------------------------------
-        # Scenario 13: regex-like path false positive
-        # ----------------------------------------------------
-        shutil.rmtree(proc_dir, ignore_errors=True)
-        proc_dir.mkdir(parents=True)
-        # Setup process with /mnt/us/dashboard/refresh.sh-fake
-        setup_proc(600, f"/bin/sh {self.sandbox}/refresh.sh-fake")
-        (self.sandbox / "dashboard_loop.pid").write_text("600\n", encoding="utf-8")
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        # Since it is a false positive path, stop.sh must NOT send TERM
-        calls = calls_log.read_text(encoding="utf-8") if calls_log.exists() else ""
-        self.assertNotIn("signal TERM sent to 600", calls)
-        # The PID file must remain untouched
-        self.assertTrue((self.sandbox / "dashboard_loop.pid").exists())
-
-        # ----------------------------------------------------
-        # Scenario 14: literal path match only
-        # ----------------------------------------------------
-        shutil.rmtree(proc_dir, ignore_errors=True)
-        proc_dir.mkdir(parents=True)
-        setup_proc(700, f"/bin/sh {self.sandbox}/refresh.sh")
-        (self.sandbox / "dashboard_loop.pid").write_text("700\n", encoding="utf-8")
-        (self.sandbox / "proc_remove_on_term").write_text("", encoding="utf-8")
-        calls_log.unlink(missing_ok=True)
-        code, stdout, stderr = self.run_script(self.sandbox / "stop.sh")
-        calls = calls_log.read_text(encoding="utf-8")
-        self.assertIn("signal TERM sent to 700", calls)
-        self.assertFalse((self.sandbox / "dashboard_loop.pid").exists())
-        (self.sandbox / "proc_remove_on_term").unlink(missing_ok=True)
+        start = subprocess.run(
+            ["sh", str(self.sandbox / "start.sh")],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(start.returncode, 9)
+        self.assertEqual(
+            calls.read_text(encoding="utf-8").splitlines(),
+            ["refresh", "start-daemon"],
+        )
 
     def test_prevent_screensaver_lifecycle_success(self):
         code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)

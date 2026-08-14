@@ -62,10 +62,10 @@ The existing allowed dashboard refresh intervals remain `5`, `10`, `15`, `30`, a
 The installer registers or replaces one job:
 
 ```sh
-/mnt/us/kron/kron add dashboard -timeout 2m "every <interval>" /mnt/us/dashboard/refresh-once.sh
+/mnt/us/kron/kron add -timeout 2m dashboard "every <interval>" /mnt/us/dashboard/refresh-once.sh
 ```
 
-The `add` operation is naturally idempotent because KindleCron replaces a job with the same name. The installer confirms success with `kron list` and records the output in the integration log. Any registration failure stops installation with a non-zero exit.
+This exact argument ordering is physically verified on Kindle 4 and follows KindleCron's documented `add [-timeout DUR] NAME SCHEDULE COMMAND...` grammar. A regression test must assert the complete ordered argument vector. The `add` operation is naturally idempotent because KindleCron replaces a job with the same name. The installer confirms success with `kron list` and records the output in the integration log. Any registration failure stops installation with a non-zero exit.
 
 ## Legacy scheduler compatibility
 
@@ -78,31 +78,26 @@ Legacy entry points remain as compatibility shims:
 - `refresh.sh` logs that scheduling is managed by KindleCron and performs one foreground `refresh-once.sh` invocation. It does not loop or schedule.
 - `dashboard_loop.sh` delegates once to `refresh.sh` and exits.
 - `watchdog.sh` logs that it is disabled and exits successfully.
-- `start.sh` verifies KindleCron, ensures the daemon is running, and confirms the registered job; it does not start a dashboard loop.
+- `start.sh` is an explicit manual entry point that verifies KindleCron, ensures the daemon is running, and confirms the registered job; it does not install itself into any boot chain or start a dashboard loop.
 - `stop.sh` stops only legacy dashboard scheduler processes. It does not stop KindleCron because the daemon may own jobs for other applications.
 
 The old `/etc/upstart/dashboard.conf` autostart must be removed or replaced so it cannot resurrect the legacy watchdog/loop. The installer must not restart the Kindle framework.
 
-## Persistent daemon startup
+## Persistent daemon startup: unresolved design item
 
-The verified device boot chain is KMC's existing `/var/local/kmc/system_patches/kmc.conf`, which invokes `/mnt/us/emergency.sh` at `framework_ready` when that file exists. The installer does not modify KMC system files.
+The following physical facts are verified:
 
-It verifies that:
+- `/var/local/kmc/system_patches/kmc.conf` references and executes `/mnt/us/emergency.sh` at `framework_ready` when that file is present.
+- Manually executing the temporary `/mnt/us/emergency.sh` helper starts one KindleCron daemon.
+- Repeated manual invocation of that helper does not create a second daemon.
 
-- `/var/local/kmc/system_patches/kmc.conf` exists;
-- the file references `/mnt/us/emergency.sh`;
-- `/mnt/us/kron/kron` has already passed the v0.2.0 dependency check.
+The following is not verified: a genuine Kindle reboot executes that helper, produces a new post-boot log entry, starts a new daemon process, and restores autonomous scheduling. Later diagnostics did not show the required fresh `boot.log` evidence after the supposed reboot.
 
-It then writes an idempotent `/mnt/us/emergency.sh` that:
+`/mnt/us/emergency.sh` is KMC's emergency/recovery hook. It may contain user recovery logic or belong to another workflow. The Kindle Dashboard installer must not create, replace, append to, chmod, rename, delete, or otherwise take ownership of that path. It must not modify `/var/local/kmc/system_patches/kmc.conf`.
 
-- logs boot invocation, dependency/version status, daemon status, startup success, and startup failure to `/mnt/us/kron/boot.log`;
-- leaves an existing KindleCron daemon alone;
-- starts `/mnt/us/kron/kron daemon` only when no matching daemon is running;
-- checks after startup that exactly one matching daemon process exists;
-- never starts `watchdog.sh`, `refresh.sh`, or `dashboard_loop.sh`;
-- exits non-zero on dependency or daemon-start failure.
+Therefore persistent startup is deliberately outside the current repository implementation scope. The installer reports that automatic KindleCron startup is not yet configured by Kindle Dashboard and must not claim reboot persistence. `start.sh` is an idempotent daemon-start/status command that can be invoked directly without installing a boot hook. The installer invokes it once after successful job registration to make the current installation operational, then verifies one daemon and the registered job. Re-running the installer must not create a second daemon or duplicate job; this current-session startup does not imply reboot persistence.
 
-The installer invokes the same startup helper once after job registration and verifies daemon/job status. Re-running the installer must not create a second daemon or duplicate job.
+A production boot mechanism requires a separate evidence-gathering and design cycle. That cycle must first identify a dedicated application-owned KMC/Upstart/KUAL-compatible startup path, or define safe composition semantics that provably preserve any existing recovery hook byte-for-byte and provide an exact rollback. No boot integration may be implemented until ownership, invocation timing, failure isolation, and real-reboot behavior are established and approved.
 
 ## Logging and failure behavior
 
@@ -111,13 +106,12 @@ Scheduler integration actions log to `/mnt/us/dashboard/kindlecron-install.log`.
 - dependency path and accepted version;
 - legacy scheduler shutdown results;
 - chosen interval and exact job registration result;
-- KMC boot-hook verification;
-- startup-helper installation;
-- daemon already-running or newly-started status;
+- explicit notice that persistent boot startup remains unconfigured;
+- manual `start.sh` daemon already-running or newly-started status;
 - final `kron list` output;
 - clear fatal errors.
 
-The boot helper logs separately to `/mnt/us/kron/boot.log`, and KindleCron retains its existing `/mnt/us/kron/kron.log` and `/mnt/us/kron/state/dashboard.log` files.
+KindleCron retains its existing `/mnt/us/kron/kron.log` and `/mnt/us/kron/state/dashboard.log` files. The installer must not use an existing `/mnt/us/kron/boot.log` as proof of reboot persistence unless a genuine reboot produces a new timestamp tied to a new daemon process/start time.
 
 Failures do not remove the current dashboard image. A missing/mismatched KindleCron binary causes no legacy-scheduler shutdown. A later integration failure exits non-zero and leaves diagnostics; it does not fall back to the legacy scheduler, because doing so would silently recreate two competing architectures.
 
@@ -147,9 +141,10 @@ Required coverage:
 - `dashboard` is registered/replaced with timeout `2m` and `refresh-once.sh` as its only command;
 - repeat installation leaves one daemon and one dashboard job;
 - legacy watchdog/loop/refresh processes are stopped with existing identity safeguards and are not restarted;
-- the KMC boot hook is verified without modifying `kmc.conf`;
-- `emergency.sh` is installed and starts KindleCron only when needed;
-- startup, daemon, registration, and failure messages are logged;
+- the exact `kron add -timeout 2m dashboard "every <interval>" /mnt/us/dashboard/refresh-once.sh` argument order is used;
+- neither `/mnt/us/emergency.sh` nor `kmc.conf` is created, overwritten, appended, renamed, chmodded, deleted, or otherwise modified;
+- the generated installer explicitly reports that persistent boot startup is unresolved and unconfigured;
+- manual daemon startup/status, registration, and failure messages are logged;
 - `refresh-once.sh` contains no scheduler, RTC, suspend, watchdog, interval-sleep, or looping primitives;
 - failed downloads preserve the existing image and overlay;
 - successful refresh atomically updates both image and overlay;
@@ -167,4 +162,13 @@ No deployment occurs as part of implementation. After tests pass, the user recei
 - test commands and results;
 - a one-variable-at-a-time deployment and rollback plan.
 
-Deployment requires a new explicit approval. Physical validation then covers multiple hourly sleep/wake cycles, image/overlay hash equality, return to deep sleep, reboot persistence, exactly one KindleCron daemon, no legacy scheduler processes, and battery behavior over a meaningful observation period.
+Deployment requires a new explicit approval. Refresh-path validation then covers multiple hourly sleep/wake cycles, image/overlay hash equality, return to deep sleep, exactly one KindleCron daemon, no legacy scheduler processes, and battery behavior over a meaningful observation period.
+
+Reboot persistence remains a separate unresolved gate. It cannot be marked complete until a dedicated startup design is approved and a genuine reboot proves all of the following:
+
+- a new post-boot startup-log timestamp;
+- a new KindleCron daemon PID/process start time relative to the pre-reboot daemon;
+- exactly one KindleCron daemon;
+- the `dashboard` job remains registered with the configured interval and two-minute timeout;
+- no `watchdog.sh`, `refresh.sh`, or `dashboard_loop.sh` processes;
+- successful autonomous sleep, RTC wake, refresh, overlay synchronization, and return-to-sleep cycles after that reboot.

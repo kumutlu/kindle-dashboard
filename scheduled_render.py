@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render legacy and default-kindle images for the production timer."""
+"""Render all production dashboard images for the production timer."""
 
 from __future__ import annotations
 
@@ -17,6 +17,15 @@ RENDERS = (
             "weather_image.py",
             "--device",
             "default-kindle",
+        ],
+    ),
+    (
+        "kitchen-kindle",
+        [
+            sys.executable,
+            "weather_image.py",
+            "--device",
+            "kitchen-kindle",
         ],
     ),
     (

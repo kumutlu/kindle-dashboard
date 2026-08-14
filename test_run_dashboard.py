@@ -5,7 +5,7 @@ from pathlib import Path
 class ScheduledRenderContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.script = Path("run_dashboard.sh").read_text(encoding="utf-8")
+        cls.script = Path("run_dashboard.sh.example").read_text(encoding="utf-8")
 
     def test_wrapper_delegates_once_to_tracked_scheduler(self):
         self.assertEqual(self.script.count("python3 scheduled_render.py"), 1)

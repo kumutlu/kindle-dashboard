@@ -312,7 +312,7 @@ def public_device_config(device, config):
     if "deep_sleep_minutes" in config:
         payload["deep_sleep_minutes"] = config["deep_sleep_minutes"]
     
-    payload["image_url"] = f"/device/{device.id}/image.png"
+    payload["image_url"] = f"http://192.168.68.167:8765/device/{device.id}/image.png"
     if device.type == "esp32_epaper":
         payload["bmp_url"] = f"/device/{device.id}/image.bmp"
     elif device.type in KINDLE_DEVICE_TYPES:
@@ -334,7 +334,7 @@ def public_devices(registry, legacy_config_path):
             "enabled": device.enabled,
             "resolution": list(device.resolution),
             "theme": config.get("theme") or "",
-            "image_url": f"/device/{device.id}/image.png",
+            "image_url": f"http://192.168.68.167:8765/device/{device.id}/image.png",
             "config_url": f"/api/device/{device.id}/config",
             "status": status,
         }
@@ -1220,7 +1220,7 @@ def render_settings(
             "enabled": True,
             "resolution": [758, 1024],
             "theme": config["theme"],
-            "image_url": "/device/default-kindle/image.png",
+            "image_url": "http://192.168.68.167:8765/device/default-kindle/image.png",
             "config_url": "/api/device/default-kindle/config",
         }]
     device_options = "".join(

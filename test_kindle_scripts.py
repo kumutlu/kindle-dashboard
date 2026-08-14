@@ -169,6 +169,14 @@ class KindleScriptsTests(unittest.TestCase):
         ):
             self.assertNotIn(token, script)
 
+    def test_refresh_once_preserves_proven_best_effort_network_wait(self):
+        script = REFRESH_ONCE_SH.read_text(encoding="utf-8")
+        self.assertIn("wait_for_network || true", script)
+        self.assertNotIn("cmState", script)
+        self.assertNotIn("curl -I", script)
+        self.assertNotIn("curl --head", script)
+        self.assertNotIn('fail "network/server not ready', script)
+
     def test_refresh_sh_runs_refresh_once_exactly_once_and_propagates_status(self):
         calls = self.sandbox / "refresh-once.calls"
         refresh_once = self.sandbox / "refresh-once.sh"

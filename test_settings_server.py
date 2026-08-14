@@ -2757,10 +2757,10 @@ class DeviceConfigEndpointTests(unittest.TestCase):
         # Verify BusyBox-compatible syntax and chmod executions
         self.assertIn('chmod +x "$DASHBOARD_DIR/status.sh"', script)
         self.assertIn('cat <<\'EOF\' > "$DASHBOARD_DIR/status.sh"', script)
-        # Verify upstart config creation
-        self.assertIn('/etc/upstart/dashboard.conf', script)
-        self.assertIn('mntroot rw', script)
-        self.assertIn('mntroot ro', script)
+        # Verify KindleCron integration replaces legacy scheduler autostart.
+        self.assertIn("install-kindlecron.sh", script)
+        self.assertIn('"$DASHBOARD_DIR/install-kindlecron.sh" install', script)
+        self.assertNotIn("cat <<'UPSTART' > /etc/upstart/dashboard.conf", script)
         # Verify wlan0 IP preference, lipc battery level fallback, and prettyversion.txt firmware version extraction
         self.assertIn("ifconfig wlan0", script)
         self.assertIn("lipc-get-prop", script)
@@ -3828,53 +3828,18 @@ class LowPowerDeploymentIntegrationTests(unittest.TestCase):
             )
         registry.get.assert_not_called()
 
-    def test_installer_low_power_mode_preservation(self):
-        import subprocess
-        cases = [
-            (None, "0"),
-            ("LOW_POWER_MODE=0\n", "0"),
-            ("LOW_POWER_MODE=1\n", "1"),
-            ("LOW_POWER_MODE=\"0\"\n", "0"),
-            ("LOW_POWER_MODE=\"1\"\n", "1"),
-            ("LOW_POWER_MODE='0'\n", "0"),
-            ("LOW_POWER_MODE='1'\n", "1"),
-            ("LOW_POWER_MODE=0\nLOW_POWER_MODE=1\n", "1"),
-            ("LOW_POWER_MODE=1\nLOW_POWER_MODE=0\n", "0"),
-            ("LOW_POWER_MODE=malformed\n", "0"),
-            ("LOW_POWER_MODE=\"invalid\"\n", "0"),
-        ]
+    def test_installer_forces_legacy_scheduler_flags_off(self):
+        class FakeDevice:
+            type = "kindle_pw1"
+            id = "kitchen-kindle"
 
-        for content, expected in cases:
-            with self.subTest(content=content, expected=expected):
-                with tempfile.TemporaryDirectory() as td:
-                    tdp = Path(td)
-                    dev_env = tdp / "device.env"
-                    if content is not None:
-                        dev_env.write_text(content, encoding="utf-8")
-
-                    class FakeDevice:
-                        type = "kindle_pw1"
-                        id = "kitchen-kindle"
-                    device = FakeDevice()
-                    config = {"status_token": "fake-token"}
-                    installer = settings_server.kindle_installer_script(
-                        device, config, "127.0.0.1", 8765, 8767
-                    )
-
-                    res = subprocess.run(
-                        ["/bin/sh", "-c", installer],
-                        cwd=td,
-                        env={"DASHBOARD_DIR": td},
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(res.returncode, 0)
-
-                    self.assertTrue(dev_env.exists())
-                    lines = dev_env.read_text(encoding="utf-8").splitlines()
-                    lpm_lines = [l for l in lines if l.startswith("LOW_POWER_MODE=")]
-                    self.assertEqual(len(lpm_lines), 1)
-                    self.assertEqual(lpm_lines[0], f'LOW_POWER_MODE="{expected}"')
+        installer = settings_server.kindle_installer_script(
+            FakeDevice(), {"status_token": "fake-token"}, "127.0.0.1", 8765, 8767
+        )
+        self.assertEqual(installer.count('LOW_POWER_MODE="0"'), 1)
+        self.assertEqual(installer.count('NATIVE_RTC_SCHEDULER="0"'), 1)
+        self.assertNotIn('LOW_POWER_MODE="1"', installer)
+        self.assertNotIn('NATIVE_RTC_SCHEDULER="1"', installer)
 
 
 if __name__ == "__main__":

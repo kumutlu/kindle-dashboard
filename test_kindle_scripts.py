@@ -10,6 +10,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 REFRESH_SH = PROJECT_DIR / "kindle_scripts" / "refresh.sh"
 REFRESH_ONCE_SH = PROJECT_DIR / "kindle_scripts" / "refresh-once.sh"
 SEND_STATUS_SH = PROJECT_DIR / "kindle_scripts" / "send-status.sh"
+INSTALL_KRON_SH = PROJECT_DIR / "kindle_scripts" / "install-kindlecron.sh"
 
 
 class KindleScriptsTests(unittest.TestCase):
@@ -826,6 +827,189 @@ class KindleScriptsTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         temp_files = list(linkss_dir.glob("*.tmp.*"))
         self.assertEqual(len(temp_files), 0)
+
+
+class KindleCronInstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.dashboard = self.root / "dashboard"
+        self.kron_dir = self.root / "kron"
+        self.dashboard.mkdir()
+        self.kron_dir.mkdir()
+        self.calls = self.root / "kron.calls"
+        self.job_file = self.root / "dashboard.job"
+        self.stop_marker = self.root / "stop.called"
+        self.daemon_state = self.root / "daemon.count"
+        self.daemon_state.write_text("0\n", encoding="utf-8")
+        self.kron = self.kron_dir / "kron"
+        self.upstart = self.root / "dashboard.conf"
+        (self.dashboard / "refresh-once.sh").write_text(
+            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+        )
+        (self.dashboard / "refresh-once.sh").chmod(0o755)
+        (self.dashboard / "stop.sh").write_text(
+            f'#!/bin/sh\necho stop > "{self.stop_marker}"\n',
+            encoding="utf-8",
+        )
+        (self.dashboard / "stop.sh").chmod(0o755)
+        self.env = {
+            **os.environ,
+            "DASHBOARD_DIR": str(self.dashboard),
+            "KRON_BIN": str(self.kron),
+            "KRON_CALLS": str(self.calls),
+            "KRON_JOB_FILE": str(self.job_file),
+            "KRON_DAEMON_STATE_FILE": str(self.daemon_state),
+            "KRON_DAEMON_LOG": str(self.root / "kron.log"),
+            "UPSTART_CONF": str(self.upstart),
+            "MNTROOT_BIN": "/usr/bin/true",
+            "SLEEP_BIN": "/usr/bin/true",
+        }
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def write_fake_kron(self, version="KindleCron v0.2.0 (test), go test linux/arm"):
+        self.kron.write_text(
+            "#!/bin/sh\n"
+            "CMD=${1:-}\n"
+            "for ARG in \"$@\"; do printf '<%s>' \"$ARG\" >> \"$KRON_CALLS\"; done\n"
+            "printf '\\n' >> \"$KRON_CALLS\"\n"
+            "case \"$CMD\" in\n"
+            f"  version) echo '{version}' ;;\n"
+            "  add) printf '%s\\n' \"$*\" > \"$KRON_JOB_FILE\" ;;\n"
+            "  list) [ ! -f \"$KRON_JOB_FILE\" ] || cat \"$KRON_JOB_FILE\" ;;\n"
+            "  daemon) exit 0 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        self.kron.chmod(0o755)
+
+    def write_device_env(self, minutes):
+        (self.dashboard / "device.env").write_text(
+            f'REFRESH_INTERVAL_MINUTES="{minutes}"\n', encoding="utf-8"
+        )
+
+    def run_installer(self, action="install", **overrides):
+        return subprocess.run(
+            ["sh", str(INSTALL_KRON_SH), action],
+            env={**self.env, **overrides},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_missing_kron_fails_before_legacy_stop(self):
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required KindleCron binary is missing", result.stderr)
+        self.assertFalse(self.stop_marker.exists())
+
+    def test_wrong_version_fails_before_legacy_stop(self):
+        self.write_fake_kron("KindleCron v0.1.0")
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected KindleCron v0.2.0", result.stderr)
+        self.assertFalse(self.stop_marker.exists())
+
+    def test_supported_intervals_use_exact_verified_argument_order(self):
+        expected = {
+            "5": "every 5m",
+            "10": "every 10m",
+            "15": "every 15m",
+            "30": "every 30m",
+            "60": "every 1h",
+            "999": "every 1h",
+        }
+        for minutes, schedule in expected.items():
+            with self.subTest(minutes=minutes):
+                self.calls.unlink(missing_ok=True)
+                self.job_file.unlink(missing_ok=True)
+                self.stop_marker.unlink(missing_ok=True)
+                self.daemon_state.write_text("0\n", encoding="utf-8")
+                self.write_fake_kron()
+                self.write_device_env(minutes)
+                result = self.run_installer()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(
+                    f"<add><-timeout><2m><dashboard><{schedule}>"
+                    f"<{self.dashboard / 'refresh-once.sh'}>",
+                    self.calls.read_text(encoding="utf-8"),
+                )
+
+    def test_install_preserves_emergency_and_kmc_sentinels(self):
+        self.write_fake_kron()
+        emergency = self.root / "emergency.sh"
+        kmc_conf = self.root / "kmc.conf"
+        emergency.write_bytes(b"user recovery bytes\n")
+        kmc_conf.write_bytes(b"user KMC config bytes\n")
+        emergency.chmod(0o700)
+        kmc_conf.chmod(0o600)
+        before = (
+            emergency.read_bytes(), emergency.stat().st_mode,
+            kmc_conf.read_bytes(), kmc_conf.stat().st_mode,
+        )
+        result = self.run_installer(
+            EMERGENCY_SH=str(emergency), KMC_CONF=str(kmc_conf)
+        )
+        after = (
+            emergency.read_bytes(), emergency.stat().st_mode,
+            kmc_conf.read_bytes(), kmc_conf.stat().st_mode,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, after)
+
+    def test_install_logs_unresolved_boot_persistence(self):
+        self.write_fake_kron()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.dashboard / "kindlecron-install.log").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("persistent startup is not configured", log)
+
+    def test_signal_after_rootfs_rw_restores_read_only_state(self):
+        self.write_fake_kron()
+        self.upstart.write_text(
+            "exec /mnt/us/dashboard/start.sh\n", encoding="utf-8"
+        )
+        mntroot_calls = self.root / "mntroot.calls"
+        mntroot = self.root / "mntroot"
+        mntroot.write_text(
+            "#!/bin/sh\n"
+            f'echo "$1" >> "{mntroot_calls}"\n'
+            "if [ \"$1\" = \"rw\" ]; then\n"
+            "  ( /bin/sleep 0.1; kill -TERM $PPID ) &\n"
+            "  /bin/sleep 2\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        mntroot.chmod(0o755)
+
+        result = self.run_installer(MNTROOT_BIN=str(mntroot))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            mntroot_calls.read_text(encoding="utf-8").splitlines(),
+            ["rw", "ro"],
+        )
+
+    def test_second_install_starts_one_daemon_and_replaces_one_job(self):
+        self.write_fake_kron()
+        first = self.run_installer()
+        second = self.run_installer()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        calls = self.calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum("<daemon>" in line for line in calls), 1)
+        self.assertEqual(
+            sum("<add><-timeout><2m><dashboard>" in line for line in calls),
+            2,
+        )
+        self.assertEqual(
+            self.job_file.read_text(encoding="utf-8").split()[3],
+            "dashboard",
+        )
 
 
 

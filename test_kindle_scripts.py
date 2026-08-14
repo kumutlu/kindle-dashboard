@@ -120,6 +120,81 @@ class KindleScriptsTests(unittest.TestCase):
             res = subprocess.run(["sh", "-n", str(script)], check=True)
             self.assertEqual(res.returncode, 0)
 
+    def generated_installer(self):
+        import settings_server
+
+        class FakeDevice:
+            id = "kindle-131"
+            type = "kindle_pw1"
+            name = "Test Kindle"
+            resolution = (758, 1024)
+            enabled = True
+
+        return settings_server.kindle_installer_script(
+            FakeDevice(),
+            {"status_token": "fake-token"},
+            "192.168.68.167",
+            8765,
+            8767,
+        )
+
+    def test_refresh_sh_is_single_cycle_compatibility_shim(self):
+        script = REFRESH_SH.read_text(encoding="utf-8")
+        for token in (
+            "while true",
+            "RTC_SYS_DIR",
+            "/sys/class/rtc",
+            "wakealarm",
+            "rtcWakeup",
+            "powerButton",
+            "NATIVE_RTC_SCHEDULER",
+            "REFRESH_INTERVAL_MINUTES",
+        ):
+            self.assertNotIn(token, script)
+        self.assertIn('exec "$REFRESH_ONCE_SH"', script)
+
+    def test_refresh_once_has_no_scheduler_or_suspend_primitives(self):
+        script = REFRESH_ONCE_SH.read_text(encoding="utf-8")
+        for token in (
+            "while true",
+            "RTC_SYS_DIR",
+            "/sys/class/rtc",
+            "/sys/power/state",
+            "wakealarm",
+            "rtcWakeup",
+            "powerButton",
+            "watchdog.sh",
+            "REFRESH_INTERVAL_MINUTES",
+        ):
+            self.assertNotIn(token, script)
+
+    def test_refresh_sh_runs_refresh_once_exactly_once_and_propagates_status(self):
+        calls = self.sandbox / "refresh-once.calls"
+        refresh_once = self.sandbox / "refresh-once.sh"
+        refresh_once.write_text(
+            f'#!/bin/sh\necho call >> "{calls}"\nexit 7\n',
+            encoding="utf-8",
+        )
+        refresh_once.chmod(0o755)
+        result = subprocess.run(
+            ["sh", str(REFRESH_SH)],
+            env={**self.env, "DASHBOARD_DIR": str(self.sandbox)},
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(
+            calls.read_text(encoding="utf-8").splitlines(),
+            ["call"],
+        )
+        self.assertIn("KindleCron owns scheduling", result.stdout)
+
+    def test_generated_device_env_disables_legacy_schedulers(self):
+        installer = self.generated_installer()
+        self.assertIn('LOW_POWER_MODE="0"', installer)
+        self.assertIn('NATIVE_RTC_SCHEDULER="0"', installer)
+
     def test_refresh_once_missing_device_id_uses_default(self):
         code, stdout, stderr = self.run_script(REFRESH_ONCE_SH)
         self.assertEqual(code, 0)
@@ -186,22 +261,6 @@ class KindleScriptsTests(unittest.TestCase):
             first_image.encode("latin-1").decode("unicode_escape").encode("latin-1"),
         )
 
-    def test_refresh_loop_delegates_to_refresh_once_and_sleeps(self):
-        shutil.copy2(REFRESH_ONCE_SH, self.sandbox / "refresh-once.sh")
-        (self.sandbox / "refresh-once.sh").chmod(0o755)
-        (self.sandbox / "device.env").write_text(
-            "REFRESH_INTERVAL_MINUTES=\"30\"\n",
-            encoding="utf-8",
-        )
-        code, _, _ = self.run_script(REFRESH_SH, timeout=3)
-        self.assertEqual(code, 0)
-        calls_log = self.sandbox / "calls.log"
-        self.assertTrue(calls_log.exists())
-        calls = calls_log.read_text(encoding="utf-8")
-        self.assertIn(
-            "http://192.168.68.167:8765/device/default-kindle/image.png",
-            calls,
-        )
 
     def test_send_status_posts_available_battery_json(self):
         power = self.sandbox / "power_supply" / "battery"
@@ -246,281 +305,6 @@ class KindleScriptsTests(unittest.TestCase):
                 calls = calls_log.read_text(encoding="utf-8")
                 self.assertIn("/device/default-kindle/image.png", calls)
 
-    def test_static_analysis_for_process_leaks_and_sleep(self):
-        refresh_content = REFRESH_SH.read_text(encoding="utf-8")
-        once_content = REFRESH_ONCE_SH.read_text(encoding="utf-8")
-
-        self.assertIn("/bin/sleep", refresh_content)
-        for line in once_content.splitlines():
-            line = line.strip()
-            if "&" in line:
-                clean_line = line.replace("&&", "").replace(">&", "")
-                if "&" in clean_line:
-                    self.fail(f"Background process leak detected in line: {line}")
-
-        self.assertNotIn("weather.png", once_content)
-        self.assertNotIn("PUBLIC_URL", once_content)
-        self.assertIn('REFRESH_ONCE_SH="$DASHBOARD_DIR/refresh-once.sh"', refresh_content)
-        self.assertIn('SERVER_HOST="${SERVER_HOST:-192.168.68.167}"', once_content)
-        self.assertIn('DEVICE_ID="${DEVICE_ID:-default-kindle}"', once_content)
-        self.assertIn("If-None-Match", once_content)
-        self.assertIn("If-Modified-Since", once_content)
-        self.assertIn("Cache-Control: no-cache", once_content)
-        self.assertIn("?t=", once_content)
-        self.assertIn("sha256sum", once_content)
-        self.assertIn("com.lab126.wifid enable 1", once_content)
-        self.assertIn("com.lab126.wifid enable 0", once_content)
-        self.assertIn("send-status.sh", once_content)
-
-    def test_low_power_mode_disabled_falls_back_to_sleep(self):
-        # LOW_POWER_MODE=0 or unset
-        (self.sandbox / "device.env").write_text("LOW_POWER_MODE=0\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
-        # Run with a short timeout to let the loop execute a cycle and then kill it
-        # Since LOW_POWER_MODE=0, it will not attempt RTC setup but call sleep
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-
-        # Verify the logs do NOT contain low-power suspend logs
-        log_file = self.sandbox / "dashboard.log"
-        self.assertFalse(log_file.exists())
-
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 300", calls)
-
-    def test_low_power_mode_rtc1_missing_falls_back(self):
-        (self.sandbox / "device.env").write_text("NATIVE_RTC_SCHEDULER=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
-        # Ensure sys class rtc directory does NOT exist (rtc1 missing)
-        self.env["RTC_SYS_DIR"] = str(self.sandbox / "nonexistent_rtc")
-
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-
-        log_file = self.sandbox / "dashboard.log"
-        self.assertTrue(log_file.exists())
-        logs = log_file.read_text(encoding="utf-8")
-
-        self.assertIn("native scheduler enabled", logs)
-        self.assertIn("failure: rtc1 missing or permissions invalid", logs)
-        self.assertIn("interval seconds: 300", logs)
-        # Verify that it falls back to normal sleep
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 300", calls)
-
-    def test_low_power_mode_wakealarm_write_failure(self):
-        (self.sandbox / "device.env").write_text("NATIVE_RTC_SCHEDULER=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
-
-        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
-        rtc_dir.mkdir(parents=True)
-        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
-
-        # Make wakealarm a directory to force write failure
-        (rtc_dir / "wakealarm").mkdir()
-
-        self.env["RTC_SYS_DIR"] = str(rtc_dir)
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-
-        log_file = self.sandbox / "dashboard.log"
-        logs = log_file.read_text(encoding="utf-8")
-        self.assertTrue("clear wakealarm failed" in logs or "wakealarm write failure" in logs or "rtc1 missing or permissions invalid" in logs)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 300", calls)
-
-    def test_low_power_mode_wakealarm_verification_mismatch(self):
-        (self.sandbox / "device.env").write_text("NATIVE_RTC_SCHEDULER=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
-
-        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
-        rtc_dir.mkdir(parents=True)
-        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
-        (rtc_dir / "wakealarm").write_text("1720001800\n", encoding="utf-8")
-
-        # Mock 'cat' script inside self.bin_dir to return mismatch when reading wakealarm
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"wakealarm\"; then\n"
-            "  echo '9999999999'\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-
-        self.env["RTC_SYS_DIR"] = str(rtc_dir)
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-
-        log_file = self.sandbox / "dashboard.log"
-        logs = log_file.read_text(encoding="utf-8")
-        self.assertIn("failure: wakealarm verification mismatch", logs)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 300", calls)
-
-    def test_low_power_mode_successful_rtc_setup_and_suspend(self):
-        (self.sandbox / "device.env").write_text("NATIVE_RTC_SCHEDULER=1\nREFRESH_INTERVAL_MINUTES=30\n", encoding="utf-8")
-
-        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
-        rtc_dir.mkdir(parents=True)
-        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
-        (rtc_dir / "wakealarm").write_text("0\n", encoding="utf-8")
-
-        power_state = self.sandbox / "sys/power/state"
-        power_state.parent.mkdir(parents=True, exist_ok=True)
-        power_state.write_text("", encoding="utf-8")
-
-        # Mock cat to update since_epoch when we read it AFTER suspend to simulate elapsed time
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
-            "  if [ -f \"$DASHBOARD_DIR/sys/power/state\" ] && grep -q mem \"$DASHBOARD_DIR/sys/power/state\" 2>/dev/null; then\n"
-            "    echo '1720001800'\n"
-            "  else\n"
-            "    echo '1720000000'\n"
-            "  fi\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-
-        # Mock 'sync' command to sleep briefly so it doesn't spin infinitely fast
-        self.create_mock_bin("sync", "#!/bin/sh\necho \"sync called\" >> \"$DASHBOARD_DIR/calls.log\"\n/bin/sleep 0.1")
-
-        # Override mock wget to terminate parent on the second iteration (config URL request after resume)
-        self.create_mock_bin("wget", (
-            "#!/bin/sh\n"
-            "echo \"wget $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "if echo \"$@\" | grep -q \"config\"; then\n"
-            "  CALLS=0\n"
-            "  if [ -f \"$DASHBOARD_DIR/wget_calls\" ]; then\n"
-            "    CALLS=$(cat \"$DASHBOARD_DIR/wget_calls\")\n"
-            "  fi\n"
-            "  CALLS=$((CALLS + 1))\n"
-            "  echo \"$CALLS\" > \"$DASHBOARD_DIR/wget_calls\"\n"
-            "  if [ \"$CALLS\" -ge 3 ]; then\n"
-            "    GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null || cat /tmp/dashboard_loop.pid 2>/dev/null)\n"
-            "    if [ -n \"$GPID\" ]; then\n"
-            "      kill -s TERM $GPID\n"
-            "    fi\n"
-            "    exit 0\n"
-            "  else\n"
-            "    echo '{\"refresh_interval_minutes\":30,\"kindle_frontlight\":12}'\n"
-            "    exit 0\n"
-            "  fi\n"
-            "fi\n"
-            "OUT=''\n"
-            "while [ $# -gt 0 ]; do\n"
-            "  if [ \"$1\" = \"-O\" ]; then shift; OUT=\"$1\"; fi\n"
-            "  shift\n"
-            "done\n"
-            "if [ -n \"$OUT\" ] && [ \"$OUT\" != \"-\" ]; then echo image > \"$OUT\"; fi\n"
-        ))
-
-        self.env["RTC_SYS_DIR"] = str(rtc_dir)
-        self.env["POWER_STATE_FILE"] = str(power_state)
-        pid_file = self.sandbox / "dashboard_loop.pid"
-        self.env["PID_FILE"] = str(pid_file)
-
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-
-        log_file = self.sandbox / "dashboard.log"
-        logs = log_file.read_text(encoding="utf-8")
-        self.assertIn("verified alarm: 1720001800", logs)
-        self.assertIn("native suspend requested", logs)
-        self.assertIn("refresh completed", logs)
-
-        # Verify sync was called
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sync", calls)
-        self.assertIn("lipc-set-prop -i com.lab126.powerd powerButton 1", calls)
-
-    def test_stale_pid_recovery_and_duplicate_process_prevention(self):
-        # 1. Duplicate process prevention (running PID matches script name)
-        pid_file = self.sandbox / "dashboard_loop.pid"
-        pid_file.write_text("12345\n", encoding="utf-8")
-
-        proc_dir = self.sandbox / "proc"
-        (proc_dir / "12345").mkdir(parents=True)
-        (proc_dir / "12345/cmdline").write_text("sh\n/mnt/us/dashboard/refresh.sh\n", encoding="utf-8")
-
-        # Mock 'mock-kill' command to return 0 for PID 12345
-        self.create_mock_bin("mock-kill", (
-            "#!/bin/sh\n"
-            "if [ \"$1\" = \"-0\" ] && [ \"$2\" = \"12345\" ]; then\n"
-            "  exit 0\n"
-            "else\n"
-            "  /bin/kill \"$@\"\n"
-            "fi\n"
-        ))
-
-        self.env["PROC_DIR"] = str(proc_dir)
-        self.env["PID_FILE"] = str(pid_file)
-        self.env["KILL_CMD"] = "mock-kill"
-
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-
-        # Script should exit immediately with status 0 without sleeping
-        self.assertEqual(code, 0)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8") if (self.sandbox / "calls.log").exists() else ""
-        self.assertNotIn("sleep", calls)
-
-        # 2. Stale PID recovery (running PID does NOT match script name)
-        (proc_dir / "12345/cmdline").write_text("some_other_process\n", encoding="utf-8")
-        calls_log = self.sandbox / "calls.log"
-        calls_log.unlink(missing_ok=True)
-
-        self.create_mock_bin("wget", (
-            "#!/bin/sh\n"
-            "GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null)\n"
-            "if [ -n \"$GPID\" ]; then\n"
-            "  kill -s TERM $GPID\n"
-            "fi\n"
-            "exit 0\n"
-        ))
-
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-
-        # Should overwrite lock and start refresh, then clean it up on exit
-        self.assertEqual(code, 0)
-
-    def test_lock_ownership_cleanup(self):
-        pid_file = self.sandbox / "dashboard_loop.pid"
-        pid_file.write_text("12345\n", encoding="utf-8")
-
-        proc_dir = self.sandbox / "proc"
-        (proc_dir / "12345").mkdir(parents=True)
-        (proc_dir / "12345/cmdline").write_text("sh\n/mnt/us/dashboard/refresh.sh\n", encoding="utf-8")
-
-        self.create_mock_bin("mock-kill", (
-            "#!/bin/sh\n"
-            "if [ \"$1\" = \"-0\" ] && [ \"$2\" = \"12345\" ]; then\n"
-            "  exit 0\n"
-            "else\n"
-            "  /bin/kill \"$@\"\n"
-            "fi\n"
-        ))
-        self.env["PROC_DIR"] = str(proc_dir)
-        self.env["PID_FILE"] = str(pid_file)
-        self.env["KILL_CMD"] = "mock-kill"
-
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-        self.assertEqual(code, 0)
-        # PID file should still exist and still belong to 12345
-        self.assertTrue(pid_file.exists())
-        self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), "12345")
-
-    def test_low_power_mode_suspend_cases(self):
-        (self.sandbox / "device.env").write_text("NATIVE_RTC_SCHEDULER=1\nREFRESH_INTERVAL_MINUTES=5\n", encoding="utf-8")
-
-        rtc_dir = self.sandbox / "sys/class/rtc/rtc1"
-        rtc_dir.mkdir(parents=True)
-        (rtc_dir / "since_epoch").write_text("1720000000\n", encoding="utf-8")
-        (rtc_dir / "wakealarm").write_text("0\n", encoding="utf-8")
-
-        self.env["RTC_SYS_DIR"] = str(rtc_dir)
-        self.env["MOCK_POWERBUTTON_FAIL"] = "1"
-        pid_file = self.sandbox / "dashboard_loop.pid"
-        self.env["PID_FILE"] = str(pid_file)
-
-        code, stdout, stderr = self.run_script(REFRESH_SH, timeout=5.0)
-        log_file = self.sandbox / "dashboard.log"
-        logs = log_file.read_text(encoding="utf-8")
-        self.assertIn("failure: powerButton suspend failed", logs)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 300", calls)
 
     def test_process_manager_scenarios(self):
         import settings_server
@@ -1043,386 +827,6 @@ class KindleScriptsTests(unittest.TestCase):
         temp_files = list(linkss_dir.glob("*.tmp.*"))
         self.assertEqual(len(temp_files), 0)
 
-
-class KindleNativeRtcSchedulerTests(unittest.TestCase):
-    def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.sandbox = Path(self.tempdir.name)
-        self.bin_dir = self.sandbox / "bin"
-        self.bin_dir.mkdir(parents=True)
-
-        shutil.copy2(PROJECT_DIR / "kindle_scripts" / "refresh.sh", self.sandbox / "refresh.sh")
-        (self.sandbox / "refresh.sh").chmod(0o755)
-
-        # Mock refresh-once.sh
-        refresh_once_mock = self.sandbox / "refresh-once.sh"
-        refresh_once_mock.write_text(
-            "#!/bin/sh\n"
-            "echo \"refresh_once_executed\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "exit 0\n",
-            encoding="utf-8",
-        )
-        refresh_once_mock.chmod(0o755)
-
-        self.create_mock_bin("sleep", (
-            "#!/bin/sh\n"
-            "echo \"sleep $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "case \"$1\" in 1|2|10|3780|480) exit 0 ;; esac\n"
-            "GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null)\n"
-            "if [ -n \"$GPID\" ]; then\n"
-            "  kill -TERM $GPID 2>/dev/null || kill $GPID 2>/dev/null || true\n"
-            "fi\n"
-            "exit 0\n"
-        ))
-
-        # Mock lipc-set-prop
-        self.create_mock_bin("lipc-set-prop", (
-            "#!/bin/sh\n"
-            "echo \"lipc-set-prop $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "if [ \"${MOCK_POWERBUTTON_FAIL:-0}\" = \"1\" ] && echo \"$@\" | grep -q \"powerButton\"; then\n"
-            "  exit 1\n"
-            "fi\n"
-            "exit 0\n"
-        ))
-
-        # Mock lipc-get-prop with state sequence file support
-        self.create_mock_bin("lipc-get-prop", (
-            "#!/bin/sh\n"
-            "echo \"lipc-get-prop $@\" >> \"$DASHBOARD_DIR/calls.log\"\n"
-            "STATE_FILE=\"$DASHBOARD_DIR/powerd_state_seq\"\n"
-            "if [ -f \"$STATE_FILE\" ]; then\n"
-            "  NEXT=$(head -n 1 \"$STATE_FILE\" 2>/dev/null || true)\n"
-            "  if [ -n \"$NEXT\" ]; then\n"
-            "    sed -i '' 1d \"$STATE_FILE\" 2>/dev/null || sed -i 1d \"$STATE_FILE\" 2>/dev/null || true\n"
-            "    echo \"$NEXT\"\n"
-            "    exit 0\n"
-            "  else\n"
-            "    GPID=$(cat \"$DASHBOARD_DIR/dashboard_loop.pid\" 2>/dev/null)\n"
-            "    if [ -n \"$GPID\" ]; then kill -TERM $GPID 2>/dev/null || true; fi\n"
-            "  fi\n"
-            "fi\n"
-            "echo \"${MOCK_POWERD_STATE:-active}\"\n"
-            "exit 0\n"
-        ))
-
-        self.create_mock_bin("kill", "#!/bin/sh\n/bin/kill \"$@\" 2>/dev/null || exit 0\n")
-        self.create_mock_bin("date", "#!/bin/sh\necho \"2026-08-12 10:00:00\"\n")
-        self.create_mock_bin("sync", "#!/bin/sh\necho \"sync\" >> \"$DASHBOARD_DIR/calls.log\"\n")
-
-        # Mock RTC directory
-        self.rtc_dir = self.sandbox / "rtc1"
-        self.rtc_dir.mkdir(parents=True)
-        (self.rtc_dir / "since_epoch").write_text("1700000000\n", encoding="utf-8")
-        (self.rtc_dir / "wakealarm").write_text("0\n", encoding="utf-8")
-
-        # Mock device.env
-        device_env = self.sandbox / "device.env"
-        device_env.write_text(
-            "NATIVE_RTC_SCHEDULER=\"1\"\n"
-            "REFRESH_INTERVAL_MINUTES=\"60\"\n",
-            encoding="utf-8",
-        )
-
-        self.env = dict(os.environ)
-        self.env["PATH"] = f"{self.bin_dir}:{self.env.get('PATH', '')}"
-        self.env["DASHBOARD_DIR"] = str(self.sandbox)
-        self.env["RTC_SYS_DIR"] = str(self.rtc_dir)
-        self.env["SLEEP_BIN"] = "sleep"
-        self.env["LIPC_BIN"] = "lipc-set-prop"
-        self.env["LIPC_GET_BIN"] = "lipc-get-prop"
-        self.env["KILL_CMD"] = "kill"
-
-    def tearDown(self):
-        self.tempdir.cleanup()
-
-    def create_mock_bin(self, name, content):
-        bin_path = self.bin_dir / name
-        bin_path.write_text(content, encoding="utf-8")
-        bin_path.chmod(0o755)
-
-    def set_powerd_sequence(self, sequence):
-        seq_file = self.sandbox / "powerd_state_seq"
-        seq_file.write_text("\n".join(sequence) + "\n", encoding="utf-8")
-
-    def run_refresh_sh(self, timeout=5):
-        return subprocess.run(
-            ["sh", str(self.sandbox / "refresh.sh")],
-            env=self.env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-        )
-
-    def test_native_rtc_scheduling_happy_path(self):
-        self.set_powerd_sequence(["active", "screenSaver", "active"])
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
-            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
-            "  COUNT=$((COUNT + 1))\n"
-            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
-            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700003600'; fi\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-
-        # 1. refresh-once executes before RTC scheduling
-        self.assertIn("refresh_once_executed", calls)
-        idx_refresh = calls.index("refresh_once_executed")
-        idx_suspend = calls.index("lipc-set-prop -i com.lab126.powerd powerButton 1")
-        self.assertLess(idx_refresh, idx_suspend)
-
-        # 2. 60 minutes becomes 3600s, target = 1700000000 + 3600 = 1700003600
-        self.assertTrue((self.rtc_dir / "wakealarm").read_text(encoding="utf-8").strip() in ("1700003600", "1700007200"))
-
-        # Log verification
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("native scheduler enabled", log_text)
-        self.assertIn("refresh completed", log_text)
-        self.assertIn("interval seconds: 3600", log_text)
-        self.assertIn("rtc now: 1700000000", log_text)
-        self.assertIn("requested alarm: 1700003600", log_text)
-        self.assertIn("verified alarm: 1700003600", log_text)
-        self.assertIn("preventScreenSaver release", log_text)
-        self.assertIn("native suspend requested", log_text)
-        self.assertIn("suspend command exit: 0", log_text)
-        self.assertIn("powerd state: screenSaver", log_text)
-        self.assertIn("entering passive suspend handoff wait", log_text)
-        self.assertIn("phase A awake ticks: 0", log_text)
-        self.assertIn("RTC target reached: 1700003600", log_text)
-        self.assertIn("powerd state: active", log_text)
-        self.assertIn("resume confirmed (slept 3600s)", log_text)
-        self.assertIn("elapsed suspend time: 3600s", log_text)
-
-        # Passive wait verification: no long relative sleep used as suspend timer
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertNotIn("sleep 3780", calls)
-        self.assertNotIn("sleep 480", calls)
-        # Verify LIPC state was NOT called during pre-TARGET passive wait (4 calls total: active entry, screenSaver entry, active post-TARGET, next cycle entry)
-        self.assertEqual(calls.count("lipc-get-prop com.lab126.powerd state"), 4)
-
-    def test_banned_primitives_audit(self):
-        script_text = (PROJECT_DIR / "kindle_scripts" / "refresh.sh").read_text(encoding="utf-8")
-        self.assertNotIn("/sys/power/state", script_text)
-        self.assertNotIn("DONT_START_FRAMEWORK", script_text)
-        self.assertNotIn("initctl stop framework", script_text)
-        self.assertNotIn("rtcWakeup", script_text)
-        self.assertNotIn("rtcWakeup2", script_text)
-
-    def test_low_power_mode_alone_does_not_enable_native_rtc_path(self):
-        device_env = self.sandbox / "device.env"
-        device_env.write_text(
-            "LOW_POWER_MODE=\"1\"\n"
-            "NATIVE_RTC_SCHEDULER=\"0\"\n"
-            "REFRESH_INTERVAL_MINUTES=\"60\"\n",
-            encoding="utf-8",
-        )
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertNotIn("powerButton", calls)
-        self.assertIn("sleep 3600", calls)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8") if (self.sandbox / "dashboard.log").exists() else ""
-        self.assertNotIn("native scheduler enabled", log_text)
-
-    def test_target_reached_with_delayed_active_state_succeeds(self):
-        # State at TARGET is screenSaver on first poll, active on second poll. Must succeed cleanly!
-        self.set_powerd_sequence(["active", "screenSaver", "screenSaver", "active"])
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
-            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
-            "  COUNT=$((COUNT + 1))\n"
-            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
-            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700003602'; fi\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("powerd state: screenSaver", log_text)
-        self.assertIn("powerd state: active", log_text)
-        self.assertIn("resume confirmed (slept 3602s)", log_text)
-
-    def test_target_reached_with_never_active_state_fails_at_deadline(self):
-        # State stays screenSaver after TARGET until DEADLINE. Must fail at deadline cleanly.
-        self.env["RESUME_GRACE_SECONDS"] = "180"
-        seq = ["active", "screenSaver"] + ["screenSaver"] * 50
-        self.set_powerd_sequence(seq)
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
-            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
-            "  COUNT=$((COUNT + 1))\n"
-            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
-            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700003785'; fi\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("failure: resume transition timeout (never reached active state within grace)", log_text)
-        self.assertIn("failure: powerd suspend lifecycle incomplete", log_text)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 3600", calls)
-        self.assertEqual(calls.count("lipc-set-prop -i com.lab126.powerd powerButton 1"), 1)
-
-    def test_300_second_physical_test_resume_accepted(self):
-        device_env = self.sandbox / "device.env"
-        device_env.write_text(
-            "NATIVE_RTC_SCHEDULER=\"1\"\n"
-            "REFRESH_INTERVAL_MINUTES=\"5\"\n",
-            encoding="utf-8",
-        )
-        self.set_powerd_sequence(["active", "screenSaver", "active"])
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
-            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
-            "  COUNT=$((COUNT + 1))\n"
-            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
-            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700000300'; fi\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("interval seconds: 300", log_text)
-        self.assertIn("elapsed suspend time: 300s", log_text)
-        self.assertIn("resume confirmed (slept 300s)", log_text)
-
-    def test_genuine_short_screensaver_to_active_triggers_early_wake(self):
-        self.set_powerd_sequence(["active", "screenSaver", "active"])
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
-            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
-            "  COUNT=$((COUNT + 1))\n"
-            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
-            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; elif [ \"$COUNT\" -eq 3 ]; then echo '1700003600'; else echo '1700000010'; fi\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("early wake: slept 10s < min 2880s", log_text)
-        self.assertIn("early wake backoff: 3590s", log_text)
-        self.assertNotIn("resume confirmed", log_text)
-
-    def test_failure_to_ever_reach_screensaver_triggers_safe_backoff(self):
-        self.env["SUSPEND_ENTRY_TIMEOUT"] = "3"
-        self.set_powerd_sequence(["active", "active", "active", "active", "active"])
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("failure: suspend entry timeout (never reached screenSaver state)", log_text)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 3600", calls)
-        self.assertEqual(calls.count("lipc-set-prop -i com.lab126.powerd powerButton 1"), 1)
-
-    def test_invalid_unavailable_powerd_state_handled_gracefully(self):
-        self.env["SUSPEND_ENTRY_TIMEOUT"] = "3"
-        self.env["MOCK_POWERD_STATE"] = ""
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("failure: suspend entry timeout (never reached screenSaver state)", log_text)
-
-    def test_powerbutton_failure_does_not_enter_state_wait(self):
-        self.env["MOCK_POWERBUTTON_FAIL"] = "1"
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("failure: powerButton suspend failed", log_text)
-        self.assertNotIn("waiting for native suspend/resume", log_text)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertIn("sleep 3600", calls)
-
-    def test_refresh_once_failure_logging_accuracy(self):
-        refresh_once_mock = self.sandbox / "refresh-once.sh"
-        refresh_once_mock.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
-        refresh_once_mock.chmod(0o755)
-        self.set_powerd_sequence(["active", "screenSaver", "active"])
-        self.create_mock_bin("cat", (
-            "#!/bin/sh\n"
-            "if echo \"$@\" | grep -q \"since_epoch\"; then\n"
-            "  COUNT=$(cat \"$DASHBOARD_DIR/epoch.read.count\" 2>/dev/null || echo 0)\n"
-            "  COUNT=$((COUNT + 1))\n"
-            "  echo \"$COUNT\" > \"$DASHBOARD_DIR/epoch.read.count\"\n"
-            "  if [ \"$COUNT\" -le 2 ]; then echo '1700000000'; else echo '1700003600'; fi\n"
-            "else\n"
-            "  /bin/cat \"$@\"\n"
-            "fi\n"
-        ))
-
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("refresh failed rc=2", log_text)
-
-    def test_missing_rtc_dir_prevents_suspend(self):
-        self.env["RTC_SYS_DIR"] = str(self.sandbox / "nonexistent_rtc")
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertNotIn("powerButton", calls)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("failure: rtc1 missing or permissions invalid", log_text)
-
-    def test_invalid_rtc_time_prevents_suspend(self):
-        (self.rtc_dir / "since_epoch").write_text("INVALID_NON_NUMERIC\n", encoding="utf-8")
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertNotIn("powerButton", calls)
-        log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-        self.assertIn("failure: invalid current epoch time", log_text)
-
-    def test_wakealarm_clear_failure_prevents_suspend(self):
-        (self.rtc_dir / "wakealarm").chmod(0o400) # Read-only
-        try:
-            res = self.run_refresh_sh()
-            self.assertEqual(res.returncode, 0)
-            calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-            self.assertNotIn("powerButton", calls)
-            log_text = (self.sandbox / "dashboard.log").read_text(encoding="utf-8")
-            self.assertTrue(
-                "failure: clear wakealarm failed" in log_text or
-                "failure: rtc1 missing or permissions invalid" in log_text
-            )
-        finally:
-            (self.rtc_dir / "wakealarm").chmod(0o600)
-
-    def test_non_rtc_device_retains_awake_sleep_loop(self):
-        device_env = self.sandbox / "device.env"
-        device_env.write_text(
-            "NATIVE_RTC_SCHEDULER=\"0\"\n"
-            "REFRESH_INTERVAL_MINUTES=\"60\"\n",
-            encoding="utf-8",
-        )
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertNotIn("powerButton", calls)
-        self.assertIn("sleep 3600", calls)
-        res = self.run_refresh_sh()
-        self.assertEqual(res.returncode, 0)
-        calls = (self.sandbox / "calls.log").read_text(encoding="utf-8")
-        self.assertNotIn("powerButton", calls)
-        self.assertIn("sleep 3600", calls)
 
 
 if __name__ == "__main__":

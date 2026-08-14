@@ -30,13 +30,11 @@ RECORD_FIELDS = {
     "connection",
     "use_screensaver_overlay",
     "status_bar_safe_area_px",
-    "native_rtc_scheduler",
 }
 REQUIRED_RECORD_FIELDS = RECORD_FIELDS - {
     "connection",
     "use_screensaver_overlay",
     "status_bar_safe_area_px",
-    "native_rtc_scheduler",
 }
 KINDLE_CONNECTION_FIELDS = {"host", "user", "ssh_profile", "port"}
 ESP32_CONNECTION_FIELDS = {"method", "host", "port"}
@@ -62,7 +60,6 @@ class DeviceRecord:
     connection: dict | None
     use_screensaver_overlay: bool = False
     status_bar_safe_area_px: int = 0
-    native_rtc_scheduler: bool = False
 
 
 def default_device_record() -> dict:
@@ -199,6 +196,8 @@ class DeviceRegistry:
             raise RegistryValidationError(
                 "device record must be an object"
             )
+        value = dict(value)
+        value.pop("native_rtc_scheduler", None)
         unknown = set(value) - RECORD_FIELDS
         missing = REQUIRED_RECORD_FIELDS - set(value)
         if unknown or missing:
@@ -261,12 +260,6 @@ class DeviceRegistry:
                 "device status bar safe area must be an integer between 0 and 200"
             )
 
-        native_rtc_scheduler = value.get("native_rtc_scheduler", False)
-        if not isinstance(native_rtc_scheduler, bool):
-            raise RegistryValidationError(
-                "device native_rtc_scheduler flag must be true or false"
-            )
-
         config_relative = f"devices/{device_id}/config.json"
         image_relative = f"devices/{device_id}/image.png"
         config_path = self._resolve_device_path(
@@ -292,7 +285,6 @@ class DeviceRegistry:
             connection=connection,
             use_screensaver_overlay=use_screensaver_overlay,
             status_bar_safe_area_px=status_bar_safe_area_px,
-            native_rtc_scheduler=native_rtc_scheduler,
         )
 
     def validate_registry(self, value):
@@ -331,8 +323,6 @@ class DeviceRegistry:
             value["use_screensaver_overlay"] = True
         if record.status_bar_safe_area_px > 0:
             value["status_bar_safe_area_px"] = record.status_bar_safe_area_px
-        if record.native_rtc_scheduler:
-            value["native_rtc_scheduler"] = True
         return value
 
     def _public_record(self, record):
@@ -347,7 +337,6 @@ class DeviceRegistry:
             value["connection"] = dict(record.connection)
         value["use_screensaver_overlay"] = record.use_screensaver_overlay
         value["status_bar_safe_area_px"] = record.status_bar_safe_area_px
-        value["native_rtc_scheduler"] = record.native_rtc_scheduler
         return value
 
     def _atomic_write_json(self, path, value):

@@ -190,6 +190,40 @@ class DeviceRegistryTests(unittest.TestCase):
         self.assertNotIn("password", serialized)
         self.assertNotIn("token", serialized)
 
+    def test_retired_native_scheduler_field_is_accepted_but_not_exposed(self):
+        candidate = self.default_record()
+        candidate["native_rtc_scheduler"] = True
+
+        records = self.registry.validate_registry({"devices": [candidate]})
+
+        self.assertFalse(hasattr(records[0], "native_rtc_scheduler"))
+        self.registry.write_registry({"devices": [candidate]})
+        stored = self.read_registry()["devices"][0]
+        self.assertNotIn("native_rtc_scheduler", stored)
+        self.assertNotIn(
+            "native_rtc_scheduler",
+            self.registry.public_records()[0],
+        )
+
+    def test_kindle_overlay_flag_is_validated_and_public(self):
+        candidate = self.default_record()
+        candidate["use_screensaver_overlay"] = True
+
+        records = self.registry.validate_registry({"devices": [candidate]})
+
+        self.assertTrue(records[0].use_screensaver_overlay)
+        self.registry.write_registry({"devices": [candidate]})
+        self.assertTrue(
+            self.registry.public_records()[0]["use_screensaver_overlay"]
+        )
+
+        candidate["use_screensaver_overlay"] = "yes"
+        with self.assertRaisesRegex(
+            RegistryValidationError,
+            "screensaver overlay",
+        ):
+            self.registry.validate_registry({"devices": [candidate]})
+
     def test_unknown_or_disabled_device_is_not_servable(self):
         self.registry.get("default-kindle")
         with self.assertRaises(DeviceNotFoundError):

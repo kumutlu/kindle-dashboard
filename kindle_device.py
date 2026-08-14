@@ -4,6 +4,8 @@
 import subprocess
 from pathlib import Path
 
+from device_registry import KINDLE_DEVICE_TYPES
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
@@ -34,19 +36,79 @@ SSH_PROFILES = {
     },
 }
 
+def require_script_command(path):
+    return (
+        f'if [ ! -x {path} ]; then '
+        f'echo "missing script: {path}" >&2; exit 127; '
+        f"fi; exec {path}"
+    )
+
+
+REFRESH_COMMAND = (
+    "if [ -f /mnt/us/dashboard/device.env ] && "
+    "[ -x /mnt/us/dashboard/refresh.sh ]; then "
+    "exec /mnt/us/dashboard/refresh.sh; "
+    "fi; "
+    "if [ -x /mnt/us/dashboard/refresh-once.sh ]; then "
+    "exec /mnt/us/dashboard/refresh-once.sh; "
+    "fi; "
+    "if [ -x /mnt/us/dashboard/refresh.sh ]; then "
+    "echo \"legacy refresh.sh exists but no device.env; "
+    "refusing to run possible loop\" >&2; exit 124; "
+    "fi; "
+    "echo \"missing script: /mnt/us/dashboard/refresh.sh "
+    "or /mnt/us/dashboard/refresh-once.sh\" >&2; exit 127"
+)
+
+
+START_COMMAND = (
+    "if [ -x /mnt/us/dashboard/start.sh ]; then "
+    "exec /mnt/us/dashboard/start.sh; "
+    "fi; "
+    "if [ -x /mnt/us/dashboard/start-dashboard.sh ]; then "
+    "exec /mnt/us/dashboard/start-dashboard.sh --manual; "
+    "fi; "
+    "echo \"missing script: /mnt/us/dashboard/start.sh "
+    "or /mnt/us/dashboard/start-dashboard.sh\" >&2; exit 127"
+)
+
+
+STOP_COMMAND = (
+    "if [ -x /mnt/us/dashboard/stop.sh ]; then "
+    "exec /mnt/us/dashboard/stop.sh; "
+    "fi; "
+    "pkill -f /mnt/us/dashboard/dashboard_loop.sh 2>/dev/null || true; "
+    "pkill -f /mnt/us/dashboard/watchdog.sh 2>/dev/null || true; "
+    "pkill -f /mnt/us/dashboard/refresh.sh 2>/dev/null || true; "
+    "rm -f /mnt/us/dashboard/dashboard_loop.pid "
+    "/mnt/us/dashboard/watchdog.pid 2>/dev/null || true; "
+    "echo \"Dashboard stopped\""
+)
+
+
 ACTION_COMMANDS = {
     "start": (
-        "/mnt/us/dashboard/start-dashboard.sh --manual",
+        START_COMMAND,
         "Dashboard started",
         20,
     ),
+    "stop": (
+        STOP_COMMAND,
+        "Dashboard stopped",
+        20,
+    ),
     "home": (
-        "/mnt/us/dashboard/home.sh",
+        (
+            "if [ -x /mnt/us/dashboard/home.sh ]; then "
+            "exec /mnt/us/dashboard/home.sh; "
+            "fi; "
+            "lipc-set-prop com.lab126.appmgrd start app://com.lab126.booklet.home"
+        ),
         "Kindle Home opened",
         20,
     ),
     "refresh": (
-        "/mnt/us/dashboard/refresh-once.sh",
+        REFRESH_COMMAND,
         "Dashboard refreshed",
         60,
     ),
@@ -68,6 +130,19 @@ STATUS_GET = (
     "if [ -e /mnt/us/dashboard/NOAUTOSTART ]; "
     "then echo autostart=disabled; else echo autostart=enabled; fi; "
     "lipc-get-prop com.lab126.powerd flIntensity"
+)
+BATTERY_STATUS_GET = (
+    "cap=unknown; stat=unknown; volt=unknown; "
+    "for f in /sys/class/power_supply/*/capacity; do "
+    "[ -r \"$f\" ] && cap=$(cat \"$f\" 2>/dev/null) && break; "
+    "done; "
+    "for f in /sys/class/power_supply/*/status; do "
+    "[ -r \"$f\" ] && stat=$(cat \"$f\" 2>/dev/null) && break; "
+    "done; "
+    "for f in /sys/class/power_supply/*/voltage_now; do "
+    "[ -r \"$f\" ] && volt=$(cat \"$f\" 2>/dev/null) && break; "
+    "done; "
+    "echo capacity=$cap; echo status=$stat; echo voltage_now=$volt"
 )
 
 
@@ -154,6 +229,9 @@ class KindleDevice:
         except OSError as exc:
             raise DeviceError("Kindle command could not start") from exc
         if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            if detail:
+                raise DeviceError(f"Kindle command failed: {detail[-500:]}")
             raise DeviceError("Kindle command failed")
         return result.stdout
 
@@ -161,7 +239,7 @@ class KindleDevice:
         return self._run(ssh_base + [command], timeout)
 
     def run_action(self, action, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         definition = ACTION_COMMANDS.get(action)
         if definition is None:
@@ -178,7 +256,7 @@ class KindleDevice:
         return message
 
     def push(self, connection=None, device_id="default-kindle", device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -197,7 +275,7 @@ class KindleDevice:
         return "Dashboard generated and pushed"
 
     def set_light(self, level, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         if isinstance(level, bool) or not isinstance(level, int):
             raise ValueError("brightness must be an integer")
@@ -213,7 +291,7 @@ class KindleDevice:
         return self.get_light(connection=conn, device_id=device_id, device_type=device_type)
 
     def get_light(self, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -227,8 +305,47 @@ class KindleDevice:
             raise DeviceError("Kindle returned an invalid brightness value")
         return values[-1]
 
+    def get_battery_status(self, connection=None, device_id=None, device_type="kindle_pw1"):
+        if device_type not in KINDLE_DEVICE_TYPES:
+            raise ValueError("unsupported device type")
+        conn = connection if connection is not None else self.connection
+        ssh_base = self._get_ssh_base(conn, device_id)
+        output = self._run_remote(BATTERY_STATUS_GET, ssh_base, 10)
+        values = {}
+        for line in output.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+
+        battery_percent = None
+        capacity = values.get("capacity")
+        if capacity and capacity.isdigit():
+            parsed = int(capacity)
+            if 0 <= parsed <= 100:
+                battery_percent = parsed
+
+        charging = None
+        status = values.get("status", "").lower()
+        if status in ("charging", "full"):
+            charging = True
+        elif status in ("discharging", "not charging"):
+            charging = False
+
+        battery_voltage = None
+        voltage = values.get("voltage_now")
+        if voltage and voltage.isdigit():
+            parsed_voltage = int(voltage)
+            if parsed_voltage > 0:
+                battery_voltage = round(parsed_voltage / 1000000, 3)
+
+        return {
+            "battery_percent": battery_percent,
+            "charging": charging,
+            "battery_voltage": battery_voltage,
+        }
+
     def get_status(self, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -250,7 +367,7 @@ class KindleDevice:
         }
 
     def get_log(self, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         conn = connection if connection is not None else self.connection
         ssh_base = self._get_ssh_base(conn, device_id)
@@ -258,7 +375,7 @@ class KindleDevice:
         return output.replace("\x00", "")[-32768:]
 
     def restart(self, confirmation, connection=None, device_id=None, device_type="kindle_pw1"):
-        if device_type != "kindle_pw1":
+        if device_type not in KINDLE_DEVICE_TYPES:
             raise ValueError("unsupported device type")
         if confirmation != "RESTART":
             raise ValueError("restart confirmation is required")

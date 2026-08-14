@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import http.client
+import hashlib
 import json
 import tempfile
 import threading
@@ -24,7 +25,11 @@ class DeviceImageServerTests(unittest.TestCase):
         self.legacy_image = self.root / "kindle_weather.png"
         self.legacy_image.write_bytes(self.PNG_BYTES)
         self.registry = DeviceRegistry(self.root)
-        self.registry.get("default-kindle")
+        self.default_device = self.registry.get("default-kindle")
+        self.device_image = self.default_device.image_path
+        self.device_image.write_bytes(
+            b"\x89PNG\r\n\x1a\ndefault-device-image"
+        )
         self.server = serve_image.make_server(
             host="127.0.0.1",
             port=0,
@@ -59,13 +64,27 @@ class DeviceImageServerTests(unittest.TestCase):
         connection.close()
         return status, headers, body
 
+    def request_with_headers(self, path, headers, method="GET"):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=3,
+        )
+        connection.request(method, path, headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        response_headers = dict(response.getheaders())
+        status = response.status
+        connection.close()
+        return status, response_headers, body
+
     def test_default_device_image_returns_png_for_get_and_head(self):
         status, headers, body = self.request(
             "/device/default-kindle/image.png"
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "image/png")
-        self.assertEqual(body, self.PNG_BYTES)
+        self.assertEqual(body, self.device_image.read_bytes())
 
         status, headers, body = self.request(
             "/device/default-kindle/image.png",
@@ -75,13 +94,44 @@ class DeviceImageServerTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "image/png")
         self.assertEqual(
             int(headers["Content-Length"]),
-            len(self.PNG_BYTES),
+            len(self.device_image.read_bytes()),
         )
         self.assertEqual(body, b"")
 
-    def test_weather_png_remains_the_live_default_alias(self):
+    def test_device_endpoint_returns_etag_and_last_modified(self):
+        status, headers, _ = self.request("/device/default-kindle/image.png")
+        self.assertEqual(status, 200)
+        self.assertIn("ETag", headers)
+        self.assertIn("Last-Modified", headers)
+        self.assertEqual(
+            headers["X-Image-SHA256"],
+            hashlib.sha256(self.device_image.read_bytes()).hexdigest(),
+        )
+
+    def test_device_endpoint_supports_if_none_match(self):
+        _, headers, _ = self.request("/device/default-kindle/image.png")
+        status, response_headers, body = self.request_with_headers(
+            "/device/default-kindle/image.png",
+            {"If-None-Match": headers["ETag"]},
+        )
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(response_headers["ETag"], headers["ETag"])
+
+    def test_device_endpoint_supports_if_modified_since(self):
+        _, headers, _ = self.request("/device/default-kindle/image.png")
+        status, _, body = self.request_with_headers(
+            "/device/default-kindle/image.png",
+            {"If-Modified-Since": headers["Last-Modified"]},
+        )
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+
+    def test_weather_png_remains_legacy_alias_but_device_endpoint_is_isolated(self):
         newer = b"\x89PNG\r\n\x1a\nnewer-legacy-image"
+        device_bytes = b"\x89PNG\r\n\x1a\nmaarif-device-image"
         self.legacy_image.write_bytes(newer)
+        self.device_image.write_bytes(device_bytes)
 
         status, headers, body = self.request("/weather.png")
         self.assertEqual(status, 200)
@@ -92,7 +142,21 @@ class DeviceImageServerTests(unittest.TestCase):
             "/device/default-kindle/image.png"
         )
         self.assertEqual(status, 200)
-        self.assertEqual(device_body, newer)
+        self.assertEqual(device_body, device_bytes)
+
+    def test_maarif_device_endpoint_does_not_serve_stale_home_legacy_png(self):
+        stale_home_png = b"\x89PNG\r\n\x1a\nNOTTINGHAM HOME layout"
+        current_maarif_png = b"\x89PNG\r\n\x1a\nMAARIF CALENDAR layout"
+        self.legacy_image.write_bytes(stale_home_png)
+        self.device_image.write_bytes(current_maarif_png)
+
+        status, _, body = self.request(
+            "/device/default-kindle/image.png"
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, current_maarif_png)
+        self.assertNotIn(b"NOTTINGHAM HOME", body)
 
     def test_invalid_unknown_and_traversal_device_paths_are_404(self):
         for path in (

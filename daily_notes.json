@@ -1,0 +1,105 @@
+{
+  "items": [
+    {
+      "id": "6a4299e3-a050-4710-ba96-b341564a2965",
+      "enabled": true,
+      "category": "NOTE",
+      "title": "CARBOOT DAY",
+      "detail": "",
+      "priority": "high",
+      "date": null,
+      "recurrence": {
+        "type": "weekly",
+        "days": [
+          "SAT",
+          "SUN"
+        ]
+      },
+      "expires_after_date": null
+    },
+    {
+      "id": "a1723608-e459-41cf-a103-c354bbfaaf39",
+      "enabled": true,
+      "category": "SCHOOL",
+      "title": "OSMAN PE DAY",
+      "detail": "",
+      "priority": "normal",
+      "date": null,
+      "recurrence": {
+        "type": "weekly",
+        "days": [
+          "THU"
+        ]
+      },
+      "expires_after_date": null
+    },
+    {
+      "id": "f892cb2f-5c48-4575-91d2-2fdfb4022041",
+      "enabled": true,
+      "category": "SCHOOL",
+      "title": "ALI PE DAY",
+      "detail": "",
+      "priority": "normal",
+      "date": null,
+      "recurrence": {
+        "type": "weekly",
+        "days": [
+          "THU"
+        ]
+      },
+      "expires_after_date": null
+    },
+    {
+      "id": "544b1def-4f89-4537-bd90-e3a33a42664d",
+      "enabled": true,
+      "category": "SCHOOL",
+      "title": "ALISYA PE DAY",
+      "detail": "",
+      "priority": "normal",
+      "date": null,
+      "recurrence": {
+        "type": "weekly",
+        "days": [
+          "FRI"
+        ]
+      },
+      "expires_after_date": null
+    },
+    {
+      "id": "17996b29-ea92-462c-bf82-b69dfd2bb6b7",
+      "enabled": true,
+      "category": "BIN",
+      "title": "Brown Bin Out",
+      "detail": "",
+      "priority": "normal",
+      "start_date": "2026-07-06",
+      "date": null,
+      "recurrence": {
+        "type": "fortnightly",
+        "days": [
+          "MON"
+        ],
+        "anchor_date": "2026-07-06"
+      },
+      "expires_after_date": null
+    },
+    {
+      "id": "e0f8ed0f-f9a4-4a43-803c-8736408e711f",
+      "enabled": true,
+      "category": "BIN",
+      "title": "Green Bin",
+      "detail": "",
+      "priority": "normal",
+      "start_date": "2026-07-13",
+      "date": null,
+      "recurrence": {
+        "type": "fortnightly",
+        "days": [
+          "MON"
+        ],
+        "anchor_date": "2026-07-13"
+      },
+      "expires_after_date": null
+    }
+  ]
+}

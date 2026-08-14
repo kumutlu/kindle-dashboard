@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from dashboard_themes import effective_visibility, validate_theme
 from device_registry import (
@@ -21,6 +21,12 @@ from device_registry import (
     DeviceRegistry,
     RegistryValidationError,
 )
+import special_events
+from providers.local_task_provider import LocalTaskProvider
+from themes.registry import ThemeRegistry
+from themes.theme import ThemeRenderContext
+from themes.todo.theme import TodoTheme
+from themes.weather.theme import WeatherTheme
 
 W, H = 758, 1024
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -63,6 +69,8 @@ DEFAULT_CONFIG = {
     "prayer_high_latitude": 3,
     "hijri_adjustment": 0,
     "refresh_interval_minutes": 10,
+    "wifi_power_save": True,
+    "update_only_if_changed": True,
 }
 
 STRING_LIMITS = {
@@ -74,6 +82,19 @@ STRING_LIMITS = {
     "weather_query": 100,
     "timezone": 64,
     "theme": 40,
+}
+THEME_ALIAS_FIELDS = (
+    "dashboard_type",
+    "dashboard_mode",
+    "display_mode",
+    "layout",
+    "mode",
+    "style",
+)
+NON_RENDER_CONFIG_FIELDS = {
+    "status_token",
+    "device_token",
+    "pairing_token",
 }
 OPTIONAL_LOCATION_FIELDS = {
     "location",
@@ -87,6 +108,8 @@ OPTIONAL_LOCATION_FIELDS = {
     "prayer_high_latitude",
     "hijri_adjustment",
     "refresh_interval_minutes",
+    "wifi_power_save",
+    "update_only_if_changed",
 }
 BOOLEAN_FIELDS = {
     "show_weather",
@@ -94,6 +117,8 @@ BOOLEAN_FIELDS = {
     "show_server",
     "show_pihole",
     "show_tailscale",
+    "wifi_power_save",
+    "update_only_if_changed",
 }
 
 
@@ -186,9 +211,26 @@ def should_regenerate_maarif(config):
 
 
 
+def normalize_theme_field(value):
+    value = dict(value)
+    theme = value.get("theme")
+    if not (isinstance(theme, str) and theme.strip()):
+        for alias in THEME_ALIAS_FIELDS:
+            alias_value = value.get(alias)
+            if isinstance(alias_value, str) and alias_value.strip():
+                value["theme"] = alias_value
+                break
+    for alias in THEME_ALIAS_FIELDS:
+        value.pop(alias, None)
+    for field in NON_RENDER_CONFIG_FIELDS:
+        value.pop(field, None)
+    return value
+
+
 def validate_config(value):
     if not isinstance(value, dict):
         raise ValueError("configuration must be a JSON object")
+    value = normalize_theme_field(value)
     unknown = set(value) - set(DEFAULT_CONFIG)
     required = set(DEFAULT_CONFIG) - OPTIONAL_LOCATION_FIELDS
     if unknown or not required.issubset(value):
@@ -234,7 +276,7 @@ def validate_config(value):
         config["latitude"] = None
         config["longitude"] = None
 
-    validate_theme(config["theme"])
+    config["theme"] = validate_theme(config["theme"])
     try:
         ZoneInfo(config["timezone"])
     except Exception as exc:
@@ -281,6 +323,43 @@ def load_config(path=CONFIG_PATH):
     except Exception:
         print("Dashboard config missing or invalid; using Nottingham defaults")
         return dict(DEFAULT_CONFIG)
+
+
+def load_config_strict(path):
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return validate_config(raw)
+
+
+def merge_config(base, override):
+    merged = dict(base)
+    override = normalize_theme_field(override)
+    for key, value in override.items():
+        if key == "theme" and not (
+            isinstance(value, str) and value.strip()
+        ):
+            continue
+        merged[key] = value
+    try:
+        validate_theme(merged.get("theme"))
+    except (TypeError, ValueError):
+        try:
+            merged["theme"] = validate_theme(base.get("theme"))
+        except (TypeError, ValueError):
+            merged["theme"] = DEFAULT_CONFIG["theme"]
+    return validate_config(merged)
+
+
+def load_effective_device_config(device, registry):
+    try:
+        base = load_config_strict(registry.legacy_config_path)
+    except Exception:
+        base = dict(DEFAULT_CONFIG)
+
+    if not device.config_path.exists():
+        return base
+
+    raw_device = json.loads(device.config_path.read_text(encoding="utf-8"))
+    return merge_config(base, raw_device)
 
 
 def weather_url(query):
@@ -1502,13 +1581,16 @@ def dashboard_fonts():
 
 
 def save_dashboard(img, data):
-    img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+    img = img.convert("L")
     output_path = ACTIVE_OUTPUT.get() or Path(OUT)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = Path(f"{output_path}.tmp")
     try:
-        img.save(temporary_output, format="PNG")
+        save_kwargs = {"format": "PNG", "optimize": False}
+        if img.size == (600, 800):
+            save_kwargs["compress_level"] = 0
+        img.save(temporary_output, **save_kwargs)
         os.replace(temporary_output, output_path)
     finally:
         temporary_output.unlink(missing_ok=True)
@@ -1759,6 +1841,82 @@ def render_minimal_weather(config):
     save_dashboard(img, data)
 
 
+def render_minimal_weather_600x800(config, status_bar_safe_area_px=32):
+    data = collect_dashboard_data(config)
+    fonts = dashboard_fonts()
+    current = data["current"]
+    img = Image.new("L", (600, 800), 255)
+    d = ImageDraw.Draw(img)
+
+    top_offset = status_bar_safe_area_px
+    box(d, (8, top_offset, 592, 792), 8, 2)
+
+    title = config["title"][:24]
+    location = config["location_label"][:34]
+    txt(d, 24, top_offset + 16, title, fonts["FB24"])
+    txt(d, 24, top_offset + 44, location, fonts["FR16"])
+    txt(d, 576, top_offset + 16, data["now"].strftime("%A").upper(), fonts["FB18"], anchor="ra")
+    txt(d, 576, top_offset + 44, data["now"].strftime("%d %B %Y"), fonts["FR16"], anchor="ra")
+    d.line((20, top_offset + 70, 580, top_offset + 70), fill=0, width=2)
+
+    cur_top = top_offset + 82
+    box(d, (20, cur_top, 580, cur_top + 260), 8, 2)
+    txt(d, 40, cur_top + 18, "CURRENT WEATHER", fonts["FB18"])
+    draw_weather_icon(
+        d, weather_kind(current.get("weatherCode")), 122, cur_top + 120, 110
+    )
+    txt(d, 360, cur_top + 88, f"{data['temp']}°C", fonts["FB68"], anchor="mm")
+    txt(d, 360, cur_top + 151, data["desc"].upper()[:18], fonts["FB24"], anchor="mm")
+    txt(
+        d, 360, cur_top + 186, f"Feels like {data['feels']}°C",
+        fonts["FR18"], anchor="mm",
+    )
+    d.line((40, cur_top + 210, 560, cur_top + 210), fill=0, width=1)
+    txt(d, 45, cur_top + 232, f"H/L {data['hi']}°/{data['lo']}°", fonts["FR14"])
+    txt(d, 235, cur_top + 232, f"Humidity {data['humidity']}%", fonts["FR14"])
+    txt(d, 415, cur_top + 232, f"Wind {data['wind']} mph", fonts["FR14"])
+
+    forecast_top = cur_top + 276
+    txt(d, 24, forecast_top, "FORECAST", fonts["FB18"])
+    card_w = 176
+    gap = 12
+    cards_top = forecast_top + 26
+    for i, day in enumerate(data["days"][:3]):
+        x = 24 + i * (card_w + gap)
+        box(d, (x, cards_top, x + card_w, cards_top + 185), 8, 2)
+        try:
+            date_obj = datetime.strptime(day["date"], "%Y-%m-%d")
+            label = date_obj.strftime("%a").upper()
+        except Exception:
+            label = str(day.get("date", ""))[:6].upper()
+        noon = day.get("hourly", [{}])[0]
+        txt(d, x + card_w // 2, cards_top + 20, label, fonts["FB18"], anchor="mm")
+        draw_weather_icon(
+            d,
+            weather_kind(noon.get("weatherCode", day.get("weatherCode"))),
+            x + card_w // 2,
+            cards_top + 72,
+            58,
+        )
+        txt(
+            d, x + card_w // 2, cards_top + 124,
+            f"{day['maxtempC']}°/{day['mintempC']}°",
+            fonts["FB20"], anchor="mm",
+        )
+        txt(
+            d, x + card_w // 2, cards_top + 156,
+            f"{noon.get('chanceofrain', 0)}% rain",
+            fonts["FR14"], anchor="mm",
+        )
+
+    footer_line_y = 730
+    d.line((20, footer_line_y, 580, footer_line_y), fill=0, width=2)
+    txt(d, 24, footer_line_y + 30, f"Updated {data['now'].strftime('%H:%M')}", fonts["FR14"])
+    txt(d, 220, footer_line_y + 30, f"Pressure {data['pressure']} hPa", fonts["FR14"])
+    txt(d, 430, footer_line_y + 30, f"Humidity {data['humidity']}%", fonts["FR14"])
+    save_dashboard(img, data)
+
+
 def render_server_monitor(config):
     data = collect_dashboard_data(config)
     fonts = dashboard_fonts()
@@ -1806,49 +1964,6 @@ def render_server_monitor(config):
     )
     save_dashboard(img, data)
 
-
-def render_travel_weather(config):
-    data = collect_dashboard_data(config)
-    fonts = dashboard_fonts()
-    current = data["current"]
-    img = Image.new("L", (W, H), 255)
-    d = ImageDraw.Draw(img)
-    box(d, (10, 10, 748, 1014), 10, 2)
-
-    txt(d, 379, 35, config["title"], fonts["FB32"], anchor="ma")
-    txt(
-        d, 379, 82, config["location_label"].upper(),
-        fonts["FB24"], anchor="ma",
-    )
-    txt(
-        d, 379, 119,
-        data["now"].strftime("%A · %d %B %Y").upper(),
-        fonts["FR18"], anchor="ma",
-    )
-    d.line((24, 142, 734, 142), fill=0, width=2)
-
-    box(d, (24, 165, 734, 505), 10, 2)
-    draw_weather_icon(
-        d, weather_kind(current.get("weatherCode")), 170, 315, 155
-    )
-    txt(d, 465, 260, f"{data['temp']}°C", fonts["FB96"], anchor="mm")
-    txt(d, 465, 352, data["desc"].upper(), fonts["FB28"], anchor="mm")
-    txt(
-        d, 465, 398, f"Feels like {data['feels']}°C",
-        fonts["FR20"], anchor="mm",
-    )
-    d.line((48, 447, 710, 447), fill=0, width=2)
-    txt(
-        d, 80, 476, f"{data['hi']}° / {data['lo']}°  HIGH / LOW",
-        fonts["FR16"],
-    )
-    txt(d, 325, 476, f"SUNRISE  {data['sunrise']}", fonts["FR16"])
-    txt(d, 545, 476, f"SUNSET  {data['sunset']}", fonts["FR16"])
-
-    txt(d, 34, 545, "3-DAY OUTLOOK", fonts["FB24"])
-    draw_large_forecast(d, data["days"], fonts, 590)
-    draw_weather_footer(d, data, fonts)
-    save_dashboard(img, data)
 
 
 def maarif_font(style, weight, size):
@@ -2055,215 +2170,6 @@ def render_maarif_calendar(config):
     
     save_dashboard(img, data)
 
-
-def render_compact_dashboard(config):
-    data = collect_dashboard_data(config)
-    current = data["current"]
-    days = data["days"]
-    (
-        now, temp, feels, desc, humidity, wind, wind_dir, pressure,
-        hi, lo, sunrise, sunset, cpu, ram, disk, ph, ts,
-    ) = (
-        data[key] for key in (
-            "now", "temp", "feels", "desc", "humidity", "wind",
-            "wind_dir", "pressure", "hi", "lo", "sunrise", "sunset",
-            "cpu", "ram", "disk", "ph", "ts",
-        )
-    )
-    fonts = dashboard_fonts()
-    (
-        FB68, FB28, FB24, FB22, FB20, FB18, FR18, FR16, FR14,
-    ) = (
-        fonts[key] for key in (
-            "FB68", "FB28", "FB24", "FB22", "FB20", "FB18",
-            "FR18", "FR16", "FR14",
-        )
-    )
-
-    img = Image.new("L", (W, H), 255)
-    d = ImageDraw.Draw(img)
-
-    # Outer border (thin e-ink border)
-    box(d, (10, 10, 748, 1014), 10, 2)
-
-    # Language and Locales
-    lang = get_dashboard_lang(config)
-    locale = LOCALES[lang]
-
-    # Header
-    txt(d, 34, 28, config["title"].upper(), FB24)
-    
-    if lang == "en":
-        date_str = now.strftime("%A, %d %B %Y").upper()
-        updated_str = f"UPDATED: {now.strftime('%H:%M')}"
-    else:
-        date_str = data["day_name_localized"].upper() + ", " + now.strftime("%d ") + locale["months"].get(now.month, "OCAK") + now.strftime(" %Y")
-        updated_str = f"GÜNCELLEME: {now.strftime('%H:%M')}"
-        
-    txt(d, 720, 30, date_str, FB18, anchor="ra")
-    txt(d, 34, 62, updated_str, FR14)
-    txt(d, 720, 60, data["weather_desc_localized"].upper(), FB18, anchor="ra")
-
-    d.line((24, 90, 734, 90), fill=0, width=2)
-
-    visibility = effective_visibility("compact_dashboard", config)
-    y = 110
-
-    # 1. Current Weather Block
-    if visibility["show_weather"]:
-        box(d, (24, y, 734, y + 150), 8, 2)
-        # Weather Icon
-        draw_weather_icon(
-            d,
-            weather_kind(current.get("weatherCode")),
-            110,
-            y + 75,
-            90,
-        )
-        # Temp
-        txt(d, 280, y + 60, f"{temp}°C", FB68, anchor="mm")
-        txt(d, 280, y + 115, f"{feels}°C / {data['weather_desc_localized'].upper()}", FB18, anchor="mm")
-
-        # Stats on right
-        left_metric_x = 420
-        left_value_x = 475
-        right_metric_x = 575
-        right_value_x = 635
-        
-        hi_lo_lbl = "H/L" if lang == "en" else "Der"
-        humid_lbl = "Hum" if lang == "en" else "Nem"
-        press_lbl = "Pres" if lang == "en" else "Bas"
-        
-        wind_lbl = "Wind" if lang == "en" else "Rüz"
-        sunset_lbl = "Set" if lang == "en" else "Bat"
-        sr_lbl = "Rise" if lang == "en" else "Doğ"
-
-        # Format values cleanly to prevent any potential overflow
-        hl_val = f"{hi}/{lo}"
-        hum_val = f"%{humidity}" if lang == "tr" else f"{humidity}%"
-        pres_val = f"{pressure}"
-        wind_val = f"{wind}"
-        
-        # Row 1
-        txt(d, left_metric_x, y + 25, hi_lo_lbl, FR16)
-        txt(d, left_value_x, y + 23, hl_val, FB18)
-        
-        txt(d, right_metric_x, y + 25, wind_lbl, FR16)
-        txt(d, right_value_x, y + 23, wind_val, FB18)
-        
-        # Row 2
-        txt(d, left_metric_x, y + 75, humid_lbl, FR16)
-        txt(d, left_value_x, y + 73, hum_val, FB18)
-        
-        txt(d, right_metric_x, y + 75, sunset_lbl, FR16)
-        txt(d, right_value_x, y + 73, sunset, FB18)
-        
-        # Row 3 (Sunrise / Sunset or Pressure)
-        txt(d, left_metric_x, y + 125, press_lbl, FR16)
-        txt(d, left_value_x, y + 123, pres_val, FB18)
-        
-        txt(d, right_metric_x, y + 125, sr_lbl, FR16)
-        txt(d, right_value_x, y + 123, sunrise, FB18)
-
-        y += 170
-
-    # 2. Compact Forecast Block
-    if visibility["show_forecast"]:
-        heading_lbl = "FORECAST" if lang == "en" else "TAHMİN"
-        txt(d, 34, y, heading_lbl, FB18)
-        y += 30
-        
-        num_days = min(5, len(days))
-        col_width = (710 - (num_days - 1) * 12) // num_days
-        
-        today_lbl = "BUGÜN" if lang == "tr" else "TODAY"
-        tomorrow_lbl = "YARIN" if lang == "tr" else "TOMORROW"
-        
-        for i, day in enumerate(days[:num_days]):
-            x = 24 + i * (col_width + 12)
-            box(d, (x, y, x + col_width, y + 155), 6, 1)
-            
-            if i == 0:
-                day_name = today_lbl
-            elif i == 1:
-                day_name = tomorrow_lbl
-            else:
-                try:
-                    dt = datetime.strptime(day["date"], "%Y-%m-%d")
-                    w_day = dt.weekday()
-                    if lang == "tr":
-                        tr_short = {0: "PZT", 1: "SAL", 2: "ÇAR", 3: "PER", 4: "CUM", 5: "CMT", 6: "PAZ"}
-                        day_name = tr_short.get(w_day, "GÜN")
-                    else:
-                        day_name = locale["weekdays"][w_day][:3]
-                except Exception:
-                    day_name = f"DAY {i+1}"
-            
-            txt(d, x + col_width // 2, y + 22, day_name, FB18, anchor="mm")
-            
-            noon = day["hourly"][4]
-            draw_weather_icon(
-                d,
-                weather_kind(noon.get("weatherCode")),
-                x + col_width // 2,
-                y + 65,
-                42,
-            )
-            
-            txt(d, x + col_width // 2, y + 105, f"{day['maxtempC']}°/{day['mintempC']}°", FB18, anchor="mm")
-            txt(d, x + col_width // 2, y + 132, f"%{noon['chanceofrain']}" if lang == "tr" else f"{noon['chanceofrain']}%", FR14, anchor="mm")
-            
-        y += 180
-
-    # 3. Server Status Block
-    if visibility["show_server"]:
-        heading_lbl = "SERVER STATUS" if lang == "en" else "SUNUCU DURUMU"
-        txt(d, 34, y, heading_lbl, FB18)
-        y += 30
-        
-        box(d, (24, y, 734, y + 120), 8, 2)
-        
-        cols = []
-        sys_lbl = "SYSTEM" if lang == "en" else "SİSTEM"
-        sys_rows = [
-            f"CPU: {cpu}%",
-            f"RAM: {ram}%",
-            f"DISK: {disk}%"
-        ]
-        cols.append((sys_lbl, sys_rows))
-        
-        if visibility["show_pihole"]:
-            ph_lbl = "PI-HOLE"
-            ph_rows = [
-                f"Blocked: {fmt(ph['blocked'])}" if lang == "en" else f"Engellenen: {fmt(ph['blocked'])}",
-                f"Queries: {fmt(ph['queries'])}" if lang == "en" else f"Sorgular: {fmt(ph['queries'])}"
-            ]
-            cols.append((ph_lbl, ph_rows))
-            
-        if visibility["show_tailscale"]:
-            ts_lbl = "TAILSCALE"
-            ts_rows = [
-                f"Online: {ts['online']}" if lang == "en" else f"Çevrimiçi: {ts['online']}",
-                f"Total: {ts['total']}" if lang == "en" else f"Toplam: {ts['total']}"
-            ]
-            cols.append((ts_lbl, ts_rows))
-            
-        num_cols = len(cols)
-        col_w = 710 // num_cols
-        for idx, (col_title, col_items) in enumerate(cols):
-            cx_start = 24 + idx * col_w
-            txt(d, cx_start + 15, y + 18, col_title, FB18)
-            for item_idx, item_text in enumerate(col_items):
-                txt(d, cx_start + 15, y + 48 + item_idx * 24, item_text, FR16)
-
-    # 4. Footer
-    d.line((24, 965, 734, 965), fill=0, width=2)
-    
-    interval_minutes = config.get("refresh_interval_minutes", 10)
-    footer_lbl = f"UPDATED: {now.strftime('%Y-%m-%d %H:%M:%S')}  ·  INTERVAL: {interval_minutes} MIN  ·  COMPACT" if lang == "en" else f"GÜNCELLEME: {now.strftime('%Y-%m-%d %H:%M:%S')}  ·  SÜRE: {interval_minutes} DK  ·  KOMPAKT"
-    txt(d, 379, 985, footer_lbl, FR14, anchor="ma")
-
-    save_dashboard(img, data)
 
 
 def load_daily_notes():
@@ -2597,9 +2503,7 @@ THEME_RENDERERS = {
     "home_dashboard": render_home_dashboard,
     "minimal_weather": render_minimal_weather,
     "server_monitor": render_server_monitor,
-    "travel_weather": render_travel_weather,
     "maarif_calendar": render_maarif_calendar,
-    "compact_dashboard": render_compact_dashboard,
     "family_dashboard": render_family_dashboard,
 }
 
@@ -2627,33 +2531,129 @@ def _write_render_state(config, state_file):
         print(f"Warning: Failed to save render state: {exc}")
 
 
+def _render_existing_weather_theme(config, context):
+    """Run an existing renderer unchanged and return its Pillow image."""
+    resolution = tuple(context.resolution)
+    safe_area = getattr(context, "status_bar_safe_area_px", 0)
+    with tempfile.TemporaryDirectory(prefix="kindle-weather-theme-") as directory:
+        temporary_dir = Path(directory)
+        generated_path = temporary_dir / "weather.png"
+        if resolution == (600, 800):
+            if config["theme"] == "minimal_weather":
+                token = ACTIVE_OUTPUT.set(generated_path)
+                try:
+                    render_minimal_weather_600x800(config, status_bar_safe_area_px=safe_area)
+                finally:
+                    ACTIVE_OUTPUT.reset(token)
+            else:
+                renderer = THEME_RENDERERS.get(config["theme"])
+                if renderer is None:
+                    raise ValueError("theme renderer is not available")
+                legacy_path = temporary_dir / "weather-758x1024.png"
+                token = ACTIVE_OUTPUT.set(legacy_path)
+                try:
+                    renderer(config)
+                finally:
+                    ACTIVE_OUTPUT.reset(token)
+                with Image.open(legacy_path) as generated:
+                    if safe_area > 0:
+                        target_h = max(1, 800 - safe_area)
+                        fitted = ImageOps.fit(
+                            generated.convert("L"),
+                            (600, target_h),
+                            method=Image.Resampling.LANCZOS,
+                            centering=(0.5, 0.5),
+                        )
+                        canvas = Image.new("L", (600, 800), 255)
+                        canvas.paste(fitted, (0, safe_area))
+                        return canvas
+                    else:
+                        return ImageOps.fit(
+                            generated.convert("L"),
+                            resolution,
+                            method=Image.Resampling.LANCZOS,
+                            centering=(0.5, 0.5),
+                        )
+        else:
+            if resolution != (W, H):
+                raise ValueError(
+                    "existing dashboard themes currently require 758x1024"
+                )
+            renderer = THEME_RENDERERS.get(config["theme"])
+            if renderer is None:
+                raise ValueError("theme renderer is not available")
+            token = ACTIVE_OUTPUT.set(generated_path)
+            try:
+                renderer(config)
+            finally:
+                ACTIVE_OUTPUT.reset(token)
+
+        with Image.open(generated_path) as generated:
+            return generated.copy()
+
+
+def build_theme_registry(project_root=PROJECT_DIR, task_provider=None):
+    registry = ThemeRegistry()
+    weather_theme = WeatherTheme(_render_existing_weather_theme)
+    for theme_id in THEME_RENDERERS:
+        registry.register(theme_id, weather_theme)
+    provider = task_provider or LocalTaskProvider(project_root)
+    registry.register("todo", TodoTheme(provider))
+    return registry
+
+
+def _save_rendered_theme_image(image, output_path):
+    image = image.convert("L")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    os.close(descriptor)
+    temporary_output = Path(temporary_name)
+    try:
+        save_kwargs = {"format": "PNG", "optimize": False}
+        if image.size == (600, 800):
+            save_kwargs["compress_level"] = 0
+        image.save(temporary_output, **save_kwargs)
+        os.replace(temporary_output, output_path)
+        os.chmod(output_path, 0o644)
+    finally:
+        temporary_output.unlink(missing_ok=True)
+    return output_path
+
+
 def render_dashboard(
     config,
     output_path,
     resolution=(W, H),
     state_file=None,
+    device_id="default-kindle",
+    project_root=PROJECT_DIR,
+    task_provider=None,
+    theme_registry=None,
+    status_bar_safe_area_px=None,
 ):
     resolution = tuple(resolution or (W, H))
-    if resolution != (W, H):
-        raise ValueError(
-            "existing dashboard themes currently require 758x1024"
-        )
-    renderer = THEME_RENDERERS.get(config["theme"])
-    if renderer is None:
-        raise ValueError("theme renderer is not available")
-    token = ACTIVE_OUTPUT.set(Path(output_path))
-    try:
-        renderer(config)
-    finally:
-        ACTIVE_OUTPUT.reset(token)
-    with Image.open(output_path) as generated:
-        if generated.size != resolution:
-            raise ValueError(
-                "generated image does not match device resolution"
-            )
+    if status_bar_safe_area_px is None:
+        status_bar_safe_area_px = 32 if resolution == (600, 800) else 0
+    context = ThemeRenderContext(
+        device_id=device_id,
+        resolution=resolution,
+        timezone=config["timezone"],
+        status_bar_safe_area_px=status_bar_safe_area_px,
+    )
+    registry = theme_registry or build_theme_registry(
+        project_root=project_root,
+        task_provider=task_provider,
+    )
+    image = registry.render(config["theme"], config, context)
+    output_path = _save_rendered_theme_image(image, output_path)
     if state_file is not None:
         _write_render_state(config, state_file)
-    return Path(output_path)
+    return output_path
 
 
 def _atomic_copy(source, destination):
@@ -2679,25 +2679,50 @@ def render_device(device_id, force=False, registry=None):
         registry = DeviceRegistry(PROJECT_DIR)
     device = registry.get(device_id, require_enabled=True)
     resolution = tuple(device.resolution or (W, H))
-    config_path = device.config_path
-    if (
-        device.id == "default-kindle"
-        and not config_path.exists()
-    ):
-        config_path = registry.legacy_config_path
-    config = load_config(config_path)
+    configured_safe_area = getattr(device, "status_bar_safe_area_px", 32 if resolution == (600, 800) else 0)
+    use_screensaver_overlay = getattr(device, "use_screensaver_overlay", False)
+    effective_safe_area = 0 if use_screensaver_overlay else configured_safe_area
+    config = load_effective_device_config(device, registry)
     config["device_id"] = device.id
     lock_path = device.image_path.with_name(".render.lock")
     state_path = device.image_path.with_name("render_state.json")
+    valid_device_ids = [record.id for record in registry.load()]
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        output_path = render_dashboard(
-            config,
-            device.image_path,
-            resolution=resolution,
-            state_file=state_path,
+        active_event = special_events.active_event_for_device(
+            registry.project_root,
+            device,
+            config["timezone"],
+            valid_device_ids,
         )
+        if active_event is not None:
+            special_events.render_event_image(
+                special_events.event_image_absolute(registry.project_root, active_event),
+                device.image_path,
+                resolution,
+                kt4_safe=(resolution == (600, 800)),
+                status_bar_safe_area_px=effective_safe_area,
+            )
+            output_path = Path(device.image_path)
+            _write_render_state(
+                {
+                    **config,
+                    "theme": "special_event",
+                    "special_event_id": active_event.id,
+                },
+                state_path,
+            )
+        else:
+            output_path = render_dashboard(
+                config,
+                device.image_path,
+                resolution=resolution,
+                state_file=state_path,
+                device_id=device.id,
+                project_root=registry.project_root,
+                status_bar_safe_area_px=effective_safe_area,
+            )
         if device.id == "default-kindle":
             _atomic_copy(
                 output_path,

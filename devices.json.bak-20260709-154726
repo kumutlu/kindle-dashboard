@@ -1,0 +1,40 @@
+{
+  "devices": [
+    {
+      "id": "default-kindle",
+      "name": "Default Kindle",
+      "type": "kindle_pw1",
+      "resolution": [
+        758,
+        1024
+      ],
+      "enabled": true,
+      "config_path": "devices/default-kindle/config.json",
+      "image_path": "devices/default-kindle/image.png",
+      "connection": {
+        "host": "192.168.68.119",
+        "user": "root",
+        "ssh_profile": "kindle_dashboard",
+        "port": 22
+      }
+    },
+    {
+      "id": "kitchen-kindle",
+      "name": "Kitchen Kindle",
+      "type": "kindle_pw1",
+      "resolution": [
+        758,
+        1024
+      ],
+      "enabled": true,
+      "config_path": "devices/kitchen-kindle/config.json",
+      "image_path": "devices/kitchen-kindle/image.png",
+      "connection": {
+        "host": "192.168.68.122",
+        "user": "root",
+        "ssh_profile": "kindle_dashboard",
+        "port": 22
+      }
+    }
+  ]
+}

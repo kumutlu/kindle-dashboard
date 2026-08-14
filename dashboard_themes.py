@@ -25,11 +25,6 @@ THEMES = {
         "description": "Focused system and network status",
         "implemented": True,
     },
-    "travel_weather": {
-        "label": "Travel Weather",
-        "description": "Location-focused weather for trips",
-        "implemented": True,
-    },
     "maarif_calendar": {
         "label": "Maarif Calendar",
         "name": "Maarif Calendar",
@@ -38,16 +33,21 @@ THEMES = {
         "status": "active",
         "implemented": True,
     },
-    "compact_dashboard": {
-        "label": "Compact Dashboard",
-        "description": "Narrow, dense information-rich layout",
-        "implemented": True,
-    },
     "family_dashboard": {
         "label": "Family Dashboard",
         "description": "Compact weather with daily family reminders",
         "implemented": True,
     },
+    "todo": {
+        "label": "Todo",
+        "description": "Per-device task list",
+        "implemented": True,
+    },
+}
+
+THEME_ALIASES = {
+    "travel_weather": "minimal_weather",
+    "compact_dashboard": "home_dashboard",
 }
 
 WEATHER_ONLY = {
@@ -68,6 +68,7 @@ SERVER_ONLY = {
 
 
 def validate_theme(theme):
+    theme = THEME_ALIASES.get(theme, theme)
     definition = THEMES.get(theme)
     if definition is None:
         raise ValueError("unsupported theme")
@@ -77,8 +78,8 @@ def validate_theme(theme):
 
 
 def effective_visibility(theme, config):
-    validate_theme(theme)
-    if theme in ("home_dashboard", "compact_dashboard"):
+    theme = validate_theme(theme)
+    if theme == "home_dashboard":
         return {key: config[key] for key in VISIBILITY_FIELDS}
     if theme == "family_dashboard":
         return {
@@ -88,8 +89,10 @@ def effective_visibility(theme, config):
             "show_pihole": False,
             "show_tailscale": False,
         }
-    if theme in ("minimal_weather", "travel_weather", "maarif_calendar"):
+    if theme in ("minimal_weather", "maarif_calendar"):
         return dict(WEATHER_ONLY)
     if theme == "server_monitor":
         return dict(SERVER_ONLY)
+    if theme == "todo":
+        return {key: False for key in VISIBILITY_FIELDS}
     raise ValueError("unsupported theme")

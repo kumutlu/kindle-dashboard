@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import base64
 import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,11 +9,13 @@ from unittest import mock
 
 from PIL import Image
 
+import special_events
 import weather_image
 from device_registry import (
     DeviceNotFoundError,
     DeviceRegistry,
 )
+from providers.local_task_provider import LocalTaskProvider
 
 
 class DeviceRendererTests(unittest.TestCase):
@@ -44,6 +48,40 @@ class DeviceRendererTests(unittest.TestCase):
                 "ph": {"queries": 0},
                 "ts": {"online": 0, "total": 0},
             },
+        )
+
+    def test_atomic_rendered_image_has_world_readable_permissions(self):
+        output_path = self.root / "rendered.png"
+
+        weather_image._save_rendered_theme_image(
+            Image.new("1", (600, 800), 1),
+            output_path,
+        )
+
+        self.assertEqual(stat.S_IMODE(output_path.stat().st_mode), 0o644)
+
+    def create_test_event(self, start_date, end_date):
+        return special_events.create_event(
+            self.root,
+            {
+                "title": "Celebration",
+                "start_date": start_date,
+                "end_date": end_date,
+                "image_data": (
+                    "data:image/png;base64,"
+                    + base64.b64encode(
+                        (
+                            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x00\x00\x00\x00"
+                            b"\x3a\x7e\x9b\x55\x00\x00\x00\x0bIDATx\x9cc`\x00\x02\x00\x00\x05\x00\x01"
+                            b"\x0d\x0a\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+                        )
+                    ).decode("ascii")
+                ),
+                "devices": ["default-kindle"],
+                "enabled": True,
+            },
+            ["default-kindle"],
         )
 
     def test_legacy_generate_command_keeps_global_config_and_output(self):
@@ -102,6 +140,124 @@ class DeviceRendererTests(unittest.TestCase):
         with Image.open(self.default_device.image_path) as generated:
             self.assertEqual(generated.size, (758, 1024))
 
+    def test_default_device_inherits_global_theme_when_device_theme_missing(self):
+        self.legacy_config["theme"] = "maarif_calendar"
+        (self.root / "dashboard_config.json").write_text(
+            json.dumps(self.legacy_config),
+            encoding="utf-8",
+        )
+        device_config = dict(self.legacy_config)
+        device_config.pop("theme")
+        device_config["title"] = "DEVICE DEFAULT"
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        rendered_themes = []
+
+        def fake_maarif_renderer(config):
+            rendered_themes.append(config["theme"])
+            self.fake_renderer(config)
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"maarif_calendar": fake_maarif_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(rendered_themes, ["maarif_calendar"])
+        self.assertEqual(result["theme"], "maarif_calendar")
+
+    def test_deprecated_device_theme_is_normalized_for_rendering(self):
+        self.legacy_config["theme"] = "maarif_calendar"
+        (self.root / "dashboard_config.json").write_text(
+            json.dumps(self.legacy_config),
+            encoding="utf-8",
+        )
+        device_config = dict(self.legacy_config)
+        device_config["theme"] = "compact_dashboard"
+        device_config["title"] = "DEVICE DEFAULT"
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        rendered_themes = []
+
+        def fake_home_renderer(config):
+            rendered_themes.append(config["theme"])
+            self.fake_renderer(config)
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"home_dashboard": fake_home_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(rendered_themes, ["home_dashboard"])
+        self.assertEqual(result["theme"], "home_dashboard")
+
+    def test_unknown_persisted_device_theme_falls_back_to_base_theme(self):
+        self.legacy_config["theme"] = "family_dashboard"
+        (self.root / "dashboard_config.json").write_text(
+            json.dumps(self.legacy_config),
+            encoding="utf-8",
+        )
+        device_config = dict(self.legacy_config)
+        device_config.update({
+            "title": "DEVICE TITLE",
+            "theme": "unknown-theme",
+        })
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        loaded = weather_image.load_effective_device_config(
+            self.default_device,
+            self.registry,
+        )
+
+        self.assertEqual(loaded["theme"], "family_dashboard")
+        self.assertEqual(loaded["title"], "DEVICE TITLE")
+
+    def test_legacy_theme_alias_is_normalized_for_device_rendering(self):
+        device_config = dict(self.legacy_config)
+        device_config.pop("theme")
+        device_config["dashboard_mode"] = "maarif_calendar"
+        self.default_device.config_path.write_text(
+            json.dumps(device_config),
+            encoding="utf-8",
+        )
+
+        rendered_themes = []
+
+        def fake_maarif_renderer(config):
+            rendered_themes.append(config["theme"])
+            self.fake_renderer(config)
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"maarif_calendar": fake_maarif_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(rendered_themes, ["maarif_calendar"])
+        self.assertEqual(result["theme"], "maarif_calendar")
+
     def test_render_named_device_uses_isolated_config_and_output(self):
         kitchen = self.registry.add({
             "id": "kitchen-kindle",
@@ -139,6 +295,39 @@ class DeviceRendererTests(unittest.TestCase):
             (self.root / "dashboard_config.json").read_bytes(),
             legacy_before,
         )
+
+    def test_active_special_event_overrides_normal_rendering(self):
+        event = self.create_test_event("2000-01-01", "2100-01-01")
+        special_events.save_events(self.root, [event])
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"home_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(self.rendered_titles, [])
+        self.assertEqual(result["output_path"], self.default_device.image_path)
+        self.assertTrue(self.default_device.image_path.exists())
+
+    def test_expired_special_event_falls_back_to_normal_rendering(self):
+        event = self.create_test_event("2026-07-08", "2026-07-08")
+        special_events.save_events(self.root, [event])
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"home_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+
+        self.assertEqual(self.rendered_titles, ["LEGACY DEFAULT"])
+        self.assertEqual(result["theme"], "home_dashboard")
 
     def test_default_missing_device_config_falls_back_to_legacy(self):
         self.default_device.config_path.unlink()
@@ -217,6 +406,333 @@ class DeviceRendererTests(unittest.TestCase):
                 panel.id,
                 registry=self.registry,
             )
+
+    def test_minimal_weather_renders_600x800_kindle_device(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+            "connection": {
+                "host": "192.168.68.131",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            },
+            "use_screensaver_overlay": True,
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "title": "KINDLE 131",
+            "theme": "minimal_weather",
+        })
+        kt4.config_path.write_text(
+            json.dumps(config),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(weather_image, "collect_dashboard_data", return_value={
+            "now": mock.Mock(
+                strftime=lambda fmt: {
+                    "%A": "Friday",
+                    "%d %B %Y": "10 July 2026",
+                    "%H:%M": "12:00",
+                }.get(fmt, "Friday"),
+            ),
+            "current": {"weatherCode": "113"},
+            "temp": 20,
+            "desc": "Clear",
+            "weather_desc_localized": "Clear",
+            "feels": 18,
+            "hi": 24,
+            "lo": 12,
+            "humidity": 45,
+            "wind": 9,
+            "wind_dir": "W",
+            "pressure": 1012,
+            "sunrise": "04:52",
+            "sunset": "21:28",
+            "days": [
+                {
+                    "date": "2026-07-10",
+                    "maxtempC": 24,
+                    "mintempC": 12,
+                    "hourly": [{"weatherCode": "113", "chanceofrain": 10}],
+                }
+            ] * 3,
+            "ph": {"queries": 0, "blocked": 0, "clients": 0},
+            "ts": {"online": 0, "total": 0},
+        }):
+            result = weather_image.render_device(
+                kt4.id,
+                registry=self.registry,
+            )
+
+        self.assertEqual(result["resolution"], [600, 800])
+        self.assertEqual(result["theme"], "minimal_weather")
+        with Image.open(kt4.image_path) as generated:
+            self.assertEqual(generated.size, (600, 800))
+
+    def test_family_dashboard_renders_600x800_kindle_device(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+            "connection": {
+                "host": "192.168.68.131",
+                "user": "root",
+                "ssh_profile": "kindle_dashboard",
+            },
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "family_dashboard"
+        kt4.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"family_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            result = weather_image.render_device(
+                kt4.id,
+                registry=self.registry,
+            )
+
+        self.assertEqual(result["resolution"], [600, 800])
+        self.assertEqual(result["theme"], "family_dashboard")
+        with Image.open(kt4.image_path) as generated:
+            self.assertEqual(generated.size, (600, 800))
+
+    def test_all_canonical_weather_themes_render_600x800_kindle_device(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131",
+            "name": "Kindle 131",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-131/config.json",
+            "image_path": "devices/kindle-131/image.png",
+        })
+        weather_themes = {
+            "home_dashboard",
+            "server_monitor",
+            "maarif_calendar",
+        }
+
+        for theme in weather_themes:
+            with self.subTest(theme=theme):
+                config = dict(weather_image.DEFAULT_CONFIG, theme=theme)
+                kt4.config_path.write_text(
+                    json.dumps(config),
+                    encoding="utf-8",
+                )
+                with mock.patch.dict(
+                    weather_image.THEME_RENDERERS,
+                    {theme: self.fake_renderer},
+                    clear=True,
+                ):
+                    result = weather_image.render_device(
+                        kt4.id,
+                        registry=self.registry,
+                    )
+
+                self.assertEqual(result["theme"], theme)
+                with Image.open(kt4.image_path) as generated:
+                    self.assertEqual(generated.size, (600, 800))
+
+    def test_todo_theme_renders_device_tasks_without_weather_fetches(self):
+        with mock.patch.dict(
+            weather_image.THEME_RENDERERS,
+            {"home_dashboard": self.fake_renderer},
+            clear=True,
+        ):
+            weather_image.render_device(
+                "default-kindle",
+                registry=self.registry,
+            )
+        with Image.open(self.default_device.image_path) as home_image:
+            home_properties = (home_image.mode, home_image.size)
+
+        kitchen = self.registry.add({
+            "id": "kitchen-kindle",
+            "name": "Kitchen Kindle",
+            "type": "kindle_pw1",
+            "resolution": [758, 1024],
+            "enabled": True,
+            "config_path": "devices/kitchen-kindle/config.json",
+            "image_path": "devices/kitchen-kindle/image.png",
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "todo"
+        kitchen.config_path.write_text(json.dumps(config), encoding="utf-8")
+        provider = LocalTaskProvider(self.root)
+        provider.create_task(kitchen.id, "Buy milk")
+        provider.create_task(kitchen.id, "Call GP")
+
+        with mock.patch.object(weather_image, "collect_dashboard_data") as weather:
+            result = weather_image.render_device(kitchen.id, registry=self.registry)
+
+        weather.assert_not_called()
+        self.assertEqual(result["theme"], "todo")
+        with Image.open(kitchen.image_path) as generated:
+            self.assertEqual((generated.mode, generated.size), home_properties)
+            self.assertEqual(generated.mode, "L")
+
+    def test_todo_theme_renders_600x800_without_weather_theme_restriction(self):
+        kt4 = self.registry.add({
+            "id": "kindle-todo",
+            "name": "Todo Kindle",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "config_path": "devices/kindle-todo/config.json",
+            "image_path": "devices/kindle-todo/image.png",
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config["theme"] = "todo"
+        kt4.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        result = weather_image.render_device(kt4.id, registry=self.registry)
+
+        self.assertEqual(result["resolution"], [600, 800])
+        with Image.open(kt4.image_path) as generated:
+            self.assertEqual(generated.size, (600, 800))
+            self.assertEqual(generated.mode, "L")
+
+    def test_kindle_131_status_bar_safe_area_top_offset(self):
+        kt4 = self.registry.add({
+            "id": "kindle-131-safe",
+            "name": "Kindle 131 Safe Area",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "status_bar_safe_area_px": 32,
+            "config_path": "devices/kindle-131-safe/config.json",
+            "image_path": "devices/kindle-131-safe/image.png",
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "title": "KINDLE 131",
+            "theme": "minimal_weather",
+        })
+        kt4.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with mock.patch.object(weather_image, "collect_dashboard_data", return_value={
+            "now": mock.Mock(
+                strftime=lambda fmt: {
+                    "%A": "Friday",
+                    "%d %B %Y": "10 July 2026",
+                    "%H:%M": "12:00",
+                }.get(fmt, "Friday"),
+            ),
+            "current": {"weatherCode": "113"},
+            "temp": 20,
+            "desc": "Clear",
+            "weather_desc_localized": "Clear",
+            "feels": 18,
+            "hi": 24,
+            "lo": 12,
+            "humidity": 45,
+            "wind": 9,
+            "wind_dir": "W",
+            "pressure": 1012,
+            "sunrise": "04:52",
+            "sunset": "21:28",
+            "days": [
+                {
+                    "date": "2026-07-10",
+                    "maxtempC": 24,
+                    "mintempC": 12,
+                    "hourly": [{"weatherCode": "113", "chanceofrain": 10}],
+                }
+            ] * 3,
+            "ph": {"queries": 0, "blocked": 0, "clients": 0},
+            "ts": {"online": 0, "total": 0},
+        }):
+            result = weather_image.render_device(kt4.id, registry=self.registry)
+
+        self.assertEqual(kt4.status_bar_safe_area_px, 32)
+        self.assertEqual(self.default_device.status_bar_safe_area_px, 0)
+        self.assertEqual(result["resolution"], [600, 800])
+        with Image.open(kt4.image_path) as img:
+            self.assertEqual(img.size, (600, 800))
+            # 1. Top 32px (Y=0..31) reserved for status bar
+            top_crop = img.crop((0, 0, 600, 32))
+            self.assertEqual(top_crop.getextrema(), (255, 255))
+            # 2. Content exists below Y=32
+            content_crop = img.crop((0, 32, 600, 800))
+            self.assertLess(content_crop.getextrema()[0], 255)
+            # 3. Footer line & text present in original bottom region Y=730..770
+            footer_crop = img.crop((0, 730, 600, 770))
+            self.assertLess(footer_crop.getextrema()[0], 255)
+            # 4. Zero clipping below Y=800 (bottom margin at Y=793..799 is clean)
+            bottom_margin = img.crop((0, 793, 600, 799))
+            self.assertEqual(bottom_margin.getextrema(), (255, 255))
+
+    def test_screensaver_overlay_mode_uses_zero_effective_safe_area(self):
+        kt4_overlay = self.registry.add({
+            "id": "kindle-overlay",
+            "name": "Kindle Overlay",
+            "type": "kindle_kt4",
+            "resolution": [600, 800],
+            "enabled": True,
+            "use_screensaver_overlay": True,
+            "status_bar_safe_area_px": 32,
+            "config_path": "devices/kindle-overlay/config.json",
+            "image_path": "devices/kindle-overlay/image.png",
+        })
+        config = dict(weather_image.DEFAULT_CONFIG)
+        config.update({
+            "title": "KINDLE OVERLAY",
+            "theme": "minimal_weather",
+        })
+        kt4_overlay.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with mock.patch.object(weather_image, "collect_dashboard_data", return_value={
+            "now": mock.Mock(
+                strftime=lambda fmt: {
+                    "%A": "Friday",
+                    "%d %B %Y": "10 July 2026",
+                    "%H:%M": "12:00",
+                }.get(fmt, "Friday"),
+            ),
+            "current": {"weatherCode": "113"},
+            "temp": 20,
+            "desc": "Clear",
+            "weather_desc_localized": "Clear",
+            "feels": 18,
+            "hi": 24,
+            "lo": 12,
+            "humidity": 45,
+            "wind": 9,
+            "wind_dir": "W",
+            "pressure": 1012,
+            "sunrise": "04:52",
+            "sunset": "21:28",
+            "days": [
+                {
+                    "date": "2026-07-10",
+                    "maxtempC": 24,
+                    "mintempC": 12,
+                    "hourly": [{"weatherCode": "113", "chanceofrain": 10}],
+                }
+            ] * 3,
+            "ph": {"queries": 0, "blocked": 0, "clients": 0},
+            "ts": {"online": 0, "total": 0},
+        }):
+            weather_image.render_device(kt4_overlay.id, registry=self.registry)
+
+        with Image.open(kt4_overlay.image_path) as img:
+            self.assertEqual(img.size, (600, 800))
+            # In screensaver overlay mode, content starts at Y=0 (effective_safe_area = 0)
+            top_crop = img.crop((0, 0, 600, 32))
+            self.assertLess(top_crop.getextrema()[0], 255)
 
 
 if __name__ == "__main__":

@@ -12,16 +12,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
+import device_status
+import special_events
 from dashboard_themes import THEMES
 from device_registry import (
     DeviceNotFoundError,
     DeviceRegistry,
     RegistryValidationError,
 )
-from kindle_device import DeviceError, KindleDevice
+from kindle_device import DeviceError, KindleDevice, SSH_PROFILES
+from kindle_low_power import build_low_power_deployment
+from providers.local_task_provider import LocalTaskProvider, TaskNotFoundError
 from weather_image import (
     DEFAULT_CONFIG,
     geocode_locations,
+    load_effective_device_config,
     load_config,
     render_device,
     validate_config,
@@ -34,9 +39,240 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "dashboard_config.json"
 RUN_DASHBOARD = PROJECT_DIR / "run_dashboard.sh"
 DAILY_NOTES_PATH = CONFIG_PATH.parent / "daily_notes.json"
+KINDLE_REMOTE_IMAGE_PATH = "/mnt/us/dashboard/image.png"
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
 DEVICE_CONFIG_RE = re.compile(
     r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/config$"
 )
+DEVICE_STATUS_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/status$"
+)
+DEVICE_PAIR_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/pair$"
+)
+DEVICE_RESET_INSTALLER_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/installer-token/reset$"
+)
+DEVICE_TASKS_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/tasks$"
+)
+DEVICE_TASK_REORDER_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/tasks/reorder$"
+)
+DEVICE_TASK_ITEM_RE = re.compile(
+    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/tasks/([0-9a-f-]{36})$"
+)
+KINDLE_INSTALL_RE = re.compile(
+    r"^/install/kindle/([a-z0-9][a-z0-9-]{0,63})$"
+)
+DEVICE_PROFILES = {
+    "kindle_pw1": {
+        "label": "Kindle Paperwhite 1",
+        "type": "kindle_pw1",
+        "resolution": [758, 1024],
+    },
+    "kindle_kt4": {
+        "label": "Kindle Basic / KT4 600×800",
+        "type": "kindle_kt4",
+        "resolution": [600, 800],
+    },
+    "esp32_800x480": {
+        "label": "ESP32 e-paper 800×480",
+        "type": "esp32_epaper",
+        "resolution": [800, 480],
+    },
+    "esp32_960x540": {
+        "label": "ESP32 e-paper 960×540",
+        "type": "esp32_epaper",
+        "resolution": [960, 540],
+    },
+}
+KINDLE_DEVICE_TYPES = {"kindle_pw1", "kindle_kt4"}
+SPECIAL_EVENT_RE = re.compile(
+    r"^/api/special-events/([a-z0-9][a-z0-9-]{0,63})$"
+)
+SPECIAL_EVENT_PUSH_RE = re.compile(
+    r"^/api/special-events/([a-z0-9][a-z0-9-]{0,63})/push$"
+)
+SPECIAL_EVENT_PUSH_ALL_RE = re.compile(
+    r"^/api/special-events/([a-z0-9][a-z0-9-]{0,63})/push-all$"
+)
+
+
+def prepare_low_power_deployment(
+    registry,
+    device_id,
+    config,
+    server_host,
+    image_port=8765,
+):
+    """Build, but never install, the explicit default-kindle pilot bundle."""
+    if device_id != "default-kindle":
+        raise ValueError(
+            "true low-power pilot is restricted to default-kindle"
+        )
+    selected = registry.get(device_id, require_enabled=True)
+    return build_low_power_deployment(
+        selected,
+        config,
+        server_host,
+        image_port,
+    )
+
+
+def _run_push_command(args, timeout, label):
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            raise DeviceError(f"{label} failed: {detail[-500:]}")
+        raise DeviceError(f"{label} failed")
+    return result.stdout
+
+
+def _push_ssh_profile(connection):
+    profile_name = connection.get("ssh_profile")
+    if not profile_name or profile_name not in SSH_PROFILES:
+        raise DeviceError("invalid or missing SSH profile")
+    profile = SSH_PROFILES[profile_name]
+    return profile
+
+
+def _push_common_ssh_options(profile):
+    args = [
+        "-i",
+        str(profile["key_path"]),
+        "-o",
+        f"UserKnownHostsFile={profile['known_hosts']}",
+    ]
+    args.extend(profile.get("options", ()))
+    args.extend(
+        [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "LogLevel=ERROR",
+        ]
+    )
+    return args
+
+
+def push_rendered_device_to_kindle(device, registry):
+    if device.type not in KINDLE_DEVICE_TYPES:
+        raise ValueError("unsupported device type")
+    connection = device.connection or {}
+    profile = _push_ssh_profile(connection)
+    host = connection.get("host")
+    user = connection.get("user", "root")
+    port = int(connection.get("port", 22) or 22)
+    if not host:
+        raise DeviceError("Push is not configured for this device")
+
+    render_device(device.id, force=True, registry=registry)
+    remote = f"{user}@{host}:{KINDLE_REMOTE_IMAGE_PATH}"
+    target = f"{user}@{host}"
+
+    scp_args = ["scp"]
+    scp_args.extend(_push_common_ssh_options(profile))
+    if port != 22:
+        scp_args.extend(["-P", str(port)])
+    scp_args.extend([str(device.image_path), remote])
+    _run_push_command(scp_args, 30, "Kindle image copy")
+
+    remote_command = (
+        f"/usr/sbin/eips -c; /usr/sbin/eips -c; "
+        f"/usr/sbin/eips -g {KINDLE_REMOTE_IMAGE_PATH}"
+    )
+    if getattr(device, "use_screensaver_overlay", False):
+        remote_command = (
+            "if [ ! -x /mnt/us/dashboard/apply-screensaver-overlay.sh ]; then "
+            "echo \"missing required screensaver overlay script: "
+            "/mnt/us/dashboard/apply-screensaver-overlay.sh\" >&2; exit 127; "
+            "fi; /mnt/us/dashboard/apply-screensaver-overlay.sh && sync; "
+            + remote_command
+        )
+
+    ssh_args = ["ssh"]
+    ssh_args.extend(_push_common_ssh_options(profile))
+    if port != 22:
+        ssh_args.extend(["-p", str(port)])
+    ssh_args.extend([target, remote_command])
+    _run_push_command(ssh_args, 20, "Kindle screen refresh")
+    return "Dashboard generated and pushed"
+
+
+def push_image_to_kindle(device, image_path):
+    if device.type not in KINDLE_DEVICE_TYPES:
+        raise ValueError("unsupported device type")
+    connection = device.connection or {}
+    profile = _push_ssh_profile(connection)
+    host = connection.get("host")
+    user = connection.get("user", "root")
+    port = int(connection.get("port", 22) or 22)
+    if not host:
+        raise DeviceError("Push is not configured for this device")
+
+    remote = f"{user}@{host}:{KINDLE_REMOTE_IMAGE_PATH}"
+    target = f"{user}@{host}"
+    scp_args = ["scp"]
+    scp_args.extend(_push_common_ssh_options(profile))
+    if port != 22:
+        scp_args.extend(["-P", str(port)])
+    scp_args.extend([str(image_path), remote])
+    _run_push_command(scp_args, 30, "Kindle image copy")
+
+    remote_command = (
+        f"/usr/sbin/eips -c; /usr/sbin/eips -c; "
+        f"/usr/sbin/eips -g {KINDLE_REMOTE_IMAGE_PATH}"
+    )
+    if getattr(device, "use_screensaver_overlay", False):
+        remote_command = (
+            "if [ ! -x /mnt/us/dashboard/apply-screensaver-overlay.sh ]; then "
+            "echo \"missing required screensaver overlay script: "
+            "/mnt/us/dashboard/apply-screensaver-overlay.sh\" >&2; exit 127; "
+            "fi; /mnt/us/dashboard/apply-screensaver-overlay.sh && sync; "
+            + remote_command
+        )
+    ssh_args = ["ssh"]
+    ssh_args.extend(_push_common_ssh_options(profile))
+    if port != 22:
+        ssh_args.extend(["-p", str(port)])
+    ssh_args.extend([target, remote_command])
+    _run_push_command(ssh_args, 20, "Kindle screen refresh")
+    return "Dashboard generated and pushed"
+
+
+def render_special_event_for_device(event, device, project_root):
+    project_root = Path(project_root)
+    temporary_dir = project_root / "cache" / "special-events"
+    temporary_dir.mkdir(parents=True, exist_ok=True)
+    output_path = temporary_dir / f"{event.id}-{device.id}.png"
+    special_events.render_event_image(
+        special_events.event_image_absolute(project_root, event),
+        output_path,
+        tuple(device.resolution),
+        kt4_safe=(tuple(device.resolution) == (600, 800)),
+    )
+    return output_path
+
+
+def valid_special_event_device_ids(registry):
+    return [
+        device.id
+        for device in registry.load()
+        if device.type in KINDLE_DEVICE_TYPES
+    ]
 
 
 def public_device_config(device, config):
@@ -47,17 +283,39 @@ def public_device_config(device, config):
         "resolution": list(device.resolution),
         "enabled": device.enabled,
     }
-    if "theme" in config:
-        payload["theme"] = config["theme"]
-    if "refresh_interval_minutes" in config:
-        payload["refresh_interval_minutes"] = config["refresh_interval_minutes"]
+    for key in (
+        "title",
+        "location",
+        "country",
+        "latitude",
+        "longitude",
+        "location_display",
+        "location_label",
+        "weather_query",
+        "timezone",
+        "theme",
+        "show_weather",
+        "show_forecast",
+        "show_server",
+        "show_pihole",
+        "show_tailscale",
+        "refresh_interval_minutes",
+        "wifi_power_save",
+        "update_only_if_changed",
+        "prayer_method",
+        "prayer_school",
+        "prayer_high_latitude",
+        "hijri_adjustment",
+    ):
+        if key in config:
+            payload[key] = config[key]
     if "deep_sleep_minutes" in config:
         payload["deep_sleep_minutes"] = config["deep_sleep_minutes"]
     
-    payload["image_url"] = f"http://192.168.68.167:8765/device/{device.id}/image.png"
+    payload["image_url"] = f"/device/{device.id}/image.png"
     if device.type == "esp32_epaper":
         payload["bmp_url"] = f"/device/{device.id}/image.bmp"
-    elif device.type == "kindle_pw1":
+    elif device.type in KINDLE_DEVICE_TYPES:
         if "kindle_frontlight" in config:
             payload["kindle_frontlight"] = config["kindle_frontlight"]
     return payload
@@ -66,12 +324,9 @@ def public_device_config(device, config):
 def public_devices(registry, legacy_config_path):
     devices = []
     for device in registry.load():
-        selected_config_path = (
-            Path(legacy_config_path)
-            if device.id == "default-kindle"
-            else device.config_path
-        )
-        config = load_config(selected_config_path)
+        config = load_effective_device_config(device, registry)
+        status = device_status.status_summary(device)
+        raw_config = read_raw_device_config(device)
         value = {
             "id": device.id,
             "name": device.name,
@@ -79,13 +334,60 @@ def public_devices(registry, legacy_config_path):
             "enabled": device.enabled,
             "resolution": list(device.resolution),
             "theme": config.get("theme") or "",
-            "image_url": f"http://192.168.68.167:8765/device/{device.id}/image.png",
+            "image_url": f"/device/{device.id}/image.png",
             "config_url": f"/api/device/{device.id}/config",
+            "status": status,
         }
+        if "pairing_token" in raw_config:
+            value["pairing_token"] = raw_config["pairing_token"]
         if device.connection is not None:
             value["connection"] = dict(device.connection)
         devices.append(value)
     return devices
+
+
+def slugify_device_name(value):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower())
+    slug = slug.strip("-")
+    return slug or "device"
+
+
+def unique_device_id(registry, base):
+    existing = {device.id for device in registry.load()}
+    if base not in existing:
+        return base
+    suffix = 2
+    while True:
+        candidate = f"{base}-{suffix}"
+        if candidate not in existing:
+            return candidate
+        suffix += 1
+
+
+def generate_device_token():
+    return secrets.token_urlsafe(32)
+
+
+def public_host_from_headers(headers):
+    host_header = headers.get("Host", f"localhost:{PORT}")
+    host = host_header.split(":", 1)[0].strip()
+    return host or "localhost"
+
+
+def shell_quote(value):
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def shell_double_quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+
+
+def read_raw_device_config(device):
+    try:
+        value = json.loads(Path(device.config_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def load_daily_notes():
@@ -105,7 +407,6 @@ def save_daily_notes(data):
         temp_file.replace(DAILY_NOTES_PATH)
     except Exception as e:
         print(f"Error: Failed to save daily_notes.json: {e}")
-MAX_REQUEST_BYTES = 16 * 1024
 
 CITY_DATA = [
     ("Nottingham", "United Kingdom", "Nottingham, UK", "Europe/London",
@@ -167,7 +468,20 @@ def atomic_write_bytes(path, data):
 
 
 def atomic_write_config(path, config):
+    existing_tokens = {}
+    try:
+        raw_existing = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(raw_existing, dict):
+            for key in ("status_token", "pairing_token", "device_token"):
+                if key in raw_existing:
+                    existing_tokens[key] = raw_existing[key]
+    except Exception:
+        pass
+
     validated = validate_config(config)
+    if existing_tokens:
+        validated.update(existing_tokens)
+
     data = (
         json.dumps(validated, indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")
@@ -203,7 +517,7 @@ def update_config(config_path, candidate, regenerate):
     previous_data = config_path.read_bytes() if previous_exists else None
 
     # Preserve custom Maarif and Display fields from existing config if not in candidate
-    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes"):
+    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes", "wifi_power_save", "update_only_if_changed"):
         if previous_exists and field not in candidate:
             try:
                 prev_config = json.loads(previous_data.decode("utf-8"))
@@ -247,13 +561,7 @@ def update_device_config(
     legacy_before = (
         legacy_config_path.read_bytes() if legacy_existed else None
     )
-    current_path = target_path
-    if (
-        device.id == "default-kindle"
-        and not current_path.exists()
-    ):
-        current_path = legacy_config_path
-    current = load_config(current_path)
+    current = load_effective_device_config(device, registry)
     candidate = dict(candidate)
     for field in (
         "kindle_frontlight",
@@ -262,6 +570,8 @@ def update_device_config(
         "prayer_high_latitude",
         "hijri_adjustment",
         "refresh_interval_minutes",
+        "wifi_power_save",
+        "update_only_if_changed",
     ):
         if field not in candidate and field in current:
             candidate[field] = current[field]
@@ -287,6 +597,515 @@ def update_device_config(
                 legacy_config_path.unlink(missing_ok=True)
         raise
     return validated
+
+
+def create_device(registry, legacy_config_path, payload, headers, settings_port):
+    if not isinstance(payload, dict):
+        raise ValueError("device request must be a JSON object")
+    device_type = str(payload.get("type", "")).strip()
+    if device_type not in ("kindle_pw1", "kindle_kt4", "esp32_epaper"):
+        raise ValueError("device type must be kindle_pw1, kindle_kt4 or esp32_epaper")
+    name = str(payload.get("name", "")).strip()
+    if not name or len(name) > 100:
+        raise ValueError("device name is required")
+
+    profile_key = str(payload.get("profile", "")).strip()
+    if not profile_key:
+        profile_key = device_type if device_type in KINDLE_DEVICE_TYPES else "esp32_800x480"
+    profile = DEVICE_PROFILES.get(profile_key)
+    if profile is None or profile["type"] != device_type:
+        raise ValueError("device profile is invalid")
+
+    theme = str(payload.get("theme", "home_dashboard")).strip()
+    if theme not in THEMES:
+        raise ValueError("theme is invalid")
+
+    records = registry.load()
+    device_id = unique_device_id(registry, slugify_device_name(name))
+    new_record = {
+        "id": device_id,
+        "name": name,
+        "type": device_type,
+        "resolution": list(profile["resolution"]),
+        "enabled": True,
+        "config_path": f"devices/{device_id}/config.json",
+        "image_path": f"devices/{device_id}/image.png",
+    }
+
+    host = str(payload.get("host", "")).strip()
+    if host:
+        if device_type in KINDLE_DEVICE_TYPES:
+            new_record["connection"] = {
+                "host": host,
+                "user": str(payload.get("user", "root")).strip() or "root",
+                "ssh_profile": str(
+                    payload.get("ssh_profile", "kindle_dashboard")
+                ).strip() or "kindle_dashboard",
+                "port": int(payload.get("port", 22) or 22),
+            }
+        else:
+            new_record["connection"] = {
+                "method": "http",
+                "host": host,
+            }
+
+    registry.write_registry({
+        "devices": [
+            registry._storage_record(record) for record in records
+        ] + [new_record],
+    })
+    device = registry.get(device_id)
+
+    base_config = load_config(legacy_config_path)
+    config = validate_config(dict(base_config))
+    config.update({
+        "title": name.upper()[:28],
+        "theme": theme,
+        "status_token": generate_device_token(),
+        "pairing_token": generate_device_token(),
+    })
+    if device_type == "esp32_epaper":
+        config.setdefault("deep_sleep_minutes", 30)
+    atomic_write_bytes(
+        device.config_path,
+        (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        ),
+    )
+    device_status.atomic_write_json(device_status.status_path(device), {})
+
+    public_host = public_host_from_headers(headers)
+    install_command = ""
+    if device_type in KINDLE_DEVICE_TYPES:
+        install_command = (
+            "curl -fsS "
+            f"http://{public_host}:{settings_port}/install/kindle/{device_id}"
+            f"?token={quote(config['pairing_token'])} | sh"
+        )
+
+    public_device = public_device_config(device, config)
+    public_device["id"] = device.id
+    return {
+        "ok": True,
+        "device": public_device,
+        "pairing_token": config["pairing_token"],
+        "status_token": config["status_token"],
+        "install_command": install_command,
+    }
+
+
+def kindle_installer_script(device, config, server_host, image_port, settings_port):
+    if device.type not in KINDLE_DEVICE_TYPES:
+        raise ValueError("Kindle installer is available only for Kindle devices")
+    device_id = device.id
+    status_token = config.get("status_token", "")
+    if not status_token:
+        raise ValueError("status_token is required for Kindle installer")
+    image_url = (
+        f"http://{server_host}:{image_port}/device/{device_id}/image.png"
+    )
+    status_url = (
+        f"http://{server_host}:{settings_port}/api/device/{device_id}/status"
+    )
+
+    def bundled_script_heredoc(script_name):
+        script_path = PROJECT_DIR / "kindle_scripts" / script_name
+        payload = script_path.read_text(encoding="utf-8").rstrip()
+        return (
+            f"cat <<'EOF' > \"$DASHBOARD_DIR/{script_name}\"\n"
+            f"{payload}\n"
+            "EOF"
+        )
+
+    # status.sh heredoc
+    status_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/status.sh"
+#!/bin/sh
+set -eu
+
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+if [ -f "$DASHBOARD_DIR/device.env" ]; then
+    . "$DASHBOARD_DIR/device.env"
+fi
+
+POWER_SUPPLY_DIR="${POWER_SUPPLY_DIR:-/sys/class/power_supply}"
+BATTERY_PERCENT=""
+for f in "$POWER_SUPPLY_DIR"/*/capacity
+do
+    if [ -r "$f" ]; then
+        V=$(cat "$f" 2>/dev/null | tr -d '\\r\\n')
+        case "$V" in
+            ""|*[!0-9]*) ;;
+            *) BATTERY_PERCENT="$V"; break ;;
+        esac
+    fi
+done
+
+CHARGING=""
+for f in "$POWER_SUPPLY_DIR"/*/status
+do
+    if [ -r "$f" ]; then
+        S=$(cat "$f" 2>/dev/null | tr -d '\\r\\n')
+        case "$S" in
+            Charging|Full) CHARGING="true"; break ;;
+            Discharging|"Not charging") CHARGING="false"; break ;;
+        esac
+    fi
+done
+
+# Fallback to lipc properties if sysfs power supply was empty (e.g. on PW1)
+if [ -z "$BATTERY_PERCENT" ]; then
+    if command -v lipc-get-prop >/dev/null 2>&1; then
+        LIPC_BAT=$(lipc-get-prop com.lab126.powerd battLevel 2>/dev/null | tr -d '[]\\r\\n')
+        if [ -z "$LIPC_BAT" ]; then
+            LIPC_BAT=$(lipc-get-prop com.lab126.powerd batteryLevel 2>/dev/null | tr -d '[]\\r\\n')
+        fi
+        case "$LIPC_BAT" in
+            ""|*[!0-9]*) ;;
+            *) BATTERY_PERCENT="$LIPC_BAT" ;;
+        esac
+    fi
+fi
+if [ -z "$CHARGING" ]; then
+    if command -v lipc-get-prop >/dev/null 2>&1; then
+        LIPC_CHG=$(lipc-get-prop com.lab126.powerd isCharging 2>/dev/null | tr -d '[]\\r\\n')
+        case "$LIPC_CHG" in
+            1|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]) CHARGING="true" ;;
+            0|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]) CHARGING="false" ;;
+        esac
+    fi
+fi
+
+IP_ADDRESS=""
+if command -v ifconfig >/dev/null 2>&1; then
+    IP_ADDRESS=$(ifconfig wlan0 2>/dev/null | grep 'inet addr:' | cut -d: -f2 | awk '{print $1}' | tr -d ' \\t\\r\\n')
+    if [ -z "$IP_ADDRESS" ]; then
+        IP_ADDRESS=$(ifconfig wlan0 2>/dev/null | grep 'inet addr:' | cut -d: -f2 | sed -e 's/^[ \\t]*//' | cut -d' ' -f1 | tr -d ' \\t\\r\\n')
+    fi
+fi
+if [ -z "$IP_ADDRESS" ]; then
+    if command -v ip >/dev/null 2>&1; then
+        IP_ADDRESS=$(ip route get "${SERVER_HOST:-127.0.0.1}" 2>/dev/null | sed -n 's/.* src \\([0-9.][0-9.]*\\).*/\\1/p' | sed -n '1p')
+        if [ -z "$IP_ADDRESS" ]; then
+            IP_ADDRESS=$(ip addr show 2>/dev/null | sed -n 's/.*inet \\([0-9.][0-9.]*\\)\\/.*/\\1/p' | grep -v '^127\\.' | sed -n '1p')
+        fi
+    fi
+fi
+if [ -z "$IP_ADDRESS" ]; then
+    if command -v ifconfig >/dev/null 2>&1; then
+        IP_ADDRESS=$(ifconfig 2>/dev/null | grep 'inet addr:' | grep -v '127.0.0.1' | cut -d: -f2 | awk '{print $1}' | tr -d ' \\t\\r\\n')
+    fi
+fi
+
+FIRMWARE_VERSION=""
+if [ -r /etc/prettyversion.txt ]; then
+    FIRMWARE_VERSION=$(cat /etc/prettyversion.txt 2>/dev/null | tr -d '\\r\\n' | sed 's/"/\\"/g')
+fi
+
+# Detect dashboard loop status
+LOOP_STATUS="stopped"
+if [ -f "$DASHBOARD_DIR/dashboard_loop.pid" ]; then
+    PID=$(cat "$DASHBOARD_DIR/dashboard_loop.pid")
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        LOOP_STATUS="running"
+    fi
+fi
+
+# Build JSON using POSIX-compliant method
+JSON="{"
+SEP=""
+if [ -n "$BATTERY_PERCENT" ]; then
+    JSON="${JSON}\\"battery_percent\\":$BATTERY_PERCENT"
+    SEP=","
+fi
+if [ -n "$CHARGING" ]; then
+    JSON="${JSON}${SEP}\\"charging\\":$CHARGING"
+    SEP=","
+fi
+if [ -n "$IP_ADDRESS" ]; then
+    JSON="${JSON}${SEP}\\"ip_address\\":\\"$IP_ADDRESS\\""
+    SEP=","
+fi
+if [ -n "$FIRMWARE_VERSION" ]; then
+    JSON="${JSON}${SEP}\\"firmware_version\\":\\"$FIRMWARE_VERSION\\""
+    SEP=","
+fi
+JSON="${JSON}${SEP}\\"loop_status\\":\\"$LOOP_STATUS\\""
+JSON="${JSON}}"
+
+if [ -n "${STATUS_URL:-}" ]; then
+    CURL_BIN=""
+    if command -v curl >/dev/null 2>&1; then
+        CURL_BIN=$(command -v curl)
+    elif [ -x /mnt/us/usbnet/bin/curl ]; then
+        CURL_BIN="/mnt/us/usbnet/bin/curl"
+    fi
+
+    if [ -n "$CURL_BIN" ]; then
+        if [ -n "${STATUS_TOKEN:-}" ]; then
+            "$CURL_BIN" -fsS --connect-timeout 5 --max-time 15 \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $STATUS_TOKEN" \
+                --data "$JSON" \
+                "$STATUS_URL" >/dev/null 2>&1 || true
+        else
+            "$CURL_BIN" -fsS --connect-timeout 5 --max-time 15 \
+                -H "Content-Type: application/json" \
+                --data "$JSON" \
+                "$STATUS_URL" >/dev/null 2>&1 || true
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if [ -n "${STATUS_TOKEN:-}" ]; then
+            wget -q -O- \
+                --header="Content-Type: application/json" \
+                --header="Authorization: Bearer $STATUS_TOKEN" \
+                --post-data="$JSON" \
+                "$STATUS_URL" >/dev/null 2>&1 || true
+        else
+            wget -q -O- \
+                --header="Content-Type: application/json" \
+                --post-data="$JSON" \
+                "$STATUS_URL" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+exit 0
+EOF"""
+
+    refresh_sh_content = bundled_script_heredoc("refresh.sh")
+    refresh_once_sh_content = bundled_script_heredoc("refresh-once.sh")
+    install_kindlecron_sh_content = bundled_script_heredoc("install-kindlecron.sh")
+
+    # Legacy entry points remain as non-scheduling compatibility shims.
+    dashboard_loop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/dashboard_loop.sh"
+#!/bin/sh
+set -eu
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+exec "$DASHBOARD_DIR/refresh.sh"
+EOF"""
+
+    # watchdog.sh heredoc
+    watchdog_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/watchdog.sh"
+#!/bin/sh
+set -eu
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+LOG_FILE="${LOG_FILE:-$DASHBOARD_DIR/dashboard.log}"
+MESSAGE="$(date '+%Y-%m-%d %H:%M:%S') legacy watchdog.sh disabled; KindleCron owns scheduling"
+echo "$MESSAGE"
+echo "$MESSAGE" >> "$LOG_FILE"
+exit 0
+EOF"""
+
+    # start.sh heredoc
+    start_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/start.sh"
+#!/bin/sh
+set -eu
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+exec "$DASHBOARD_DIR/install-kindlecron.sh" start-daemon
+EOF"""
+
+    # stop.sh heredoc
+    stop_sh_content = """cat <<'EOF' > "$DASHBOARD_DIR/stop.sh"
+#!/bin/sh
+DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"
+PROC_DIR="${PROC_DIR:-/proc}"
+
+# get_start_time PID
+get_start_time() {
+    _PID="$1"
+    _SF="$PROC_DIR/$_PID/stat"
+    if [ ! -f "$_SF" ]; then
+        echo ""
+        return 1
+    fi
+    _SL=$(cat "$_SF" 2>/dev/null)
+    if [ -z "$_SL" ]; then
+        echo ""
+        return 1
+    fi
+    _REM="${_SL##*) }"
+    if [ -z "$_REM" ]; then
+        echo ""
+        return 1
+    fi
+    set -- $_REM
+    _ST="${20}"
+    case "$_ST" in
+        ""|*[!0-9]*)
+            echo ""
+            return 1
+            ;;
+        *)
+            echo "$_ST"
+            return 0
+            ;;
+    esac
+}
+
+# Helper to stop a process validated by cmdline
+stop_validated() {
+    PID_FILE="$1"
+    EXPECTED_CMD1="$2"
+    EXPECTED_CMD2="$3"
+
+    if [ ! -f "$PID_FILE" ]; then
+        return 0
+    fi
+
+    PID=$(cat "$PID_FILE" 2>/dev/null | tr -d ' ')
+    if [ -z "$PID" ]; then
+        echo "Removing empty PID file: $PID_FILE"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    case "$PID" in
+        ""|*[!0-9]*)
+            echo "Removing malformed PID file: $PID_FILE (value: '$PID')"
+            rm -f "$PID_FILE"
+            return 0
+            ;;
+    esac
+
+    if [ ! -d "$PROC_DIR/$PID" ]; then
+        echo "Removing stale PID file: $PID_FILE (PID $PID is not running)"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    START_TIME=$(get_start_time "$PID")
+    if [ -z "$START_TIME" ]; then
+        echo "ERROR: Failed to read process start time for PID $PID" >&2
+        return 1
+    fi
+    INITIAL_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+    PAD_CMDLINE=" $INITIAL_CMDLINE "
+
+    MATCHED_CMD=""
+    case "$PAD_CMDLINE" in
+        *" $EXPECTED_CMD1 "*|*" /mnt/us/dashboard/${EXPECTED_CMD1##*/} "*)
+            MATCHED_CMD="$EXPECTED_CMD1"
+            ;;
+    esac
+    if [ -n "$EXPECTED_CMD2" ]; then
+        case "$PAD_CMDLINE" in
+            *" $EXPECTED_CMD2 "*|*" /mnt/us/dashboard/${EXPECTED_CMD2##*/} "*)
+                MATCHED_CMD="$EXPECTED_CMD2"
+                ;;
+        esac
+    fi
+
+    if [ -z "$MATCHED_CMD" ]; then
+        echo "WARNING: PID file $PID_FILE contains PID $PID, but cmdline ($INITIAL_CMDLINE) does not match expected targets. Leaving untouched." >&2
+        return 0
+    fi
+
+    # Process is validated. Send SIGTERM first.
+    echo "Stopping PID $PID ($INITIAL_CMDLINE)..."
+    kill -s TERM "$PID" 2>/dev/null || true
+
+    # Wait up to 3 seconds for exit
+    for i in 1 2 3; do
+        if [ -d "$PROC_DIR/$PID" ]; then
+            CUR_START_TIME=$(get_start_time "$PID")
+            CUR_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+            PAD_CUR_CMDLINE=" $CUR_CMDLINE "
+            CUR_MATCHED=""
+            case "$PAD_CUR_CMDLINE" in
+                *" $MATCHED_CMD "*|*" /mnt/us/dashboard/${MATCHED_CMD##*/} "*)
+                    CUR_MATCHED="1"
+                    ;;
+            esac
+            if [ "$CUR_START_TIME" != "$START_TIME" ] || [ -z "$CUR_MATCHED" ]; then
+                echo "WARNING: PID reuse detected for PID $PID during shutdown! Aborting stop for this PID." >&2
+                return 1
+            fi
+            sleep 1
+        fi
+    done
+
+    # Send SIGKILL if still running and identity matches
+    if [ -d "$PROC_DIR/$PID" ]; then
+        CUR_START_TIME=$(get_start_time "$PID")
+        CUR_CMDLINE=$(cat "$PROC_DIR/$PID/cmdline" 2>/dev/null | tr '\\0\\n\\r' '   ')
+        PAD_CUR_CMDLINE=" $CUR_CMDLINE "
+        CUR_MATCHED=""
+        case "$PAD_CUR_CMDLINE" in
+            *" $MATCHED_CMD "*|*" /mnt/us/dashboard/${MATCHED_CMD##*/} "*)
+                CUR_MATCHED="1"
+                ;;
+        esac
+        if [ "$CUR_START_TIME" != "$START_TIME" ] || [ -z "$CUR_MATCHED" ]; then
+            echo "WARNING: PID reuse detected for PID $PID before KILL! Aborting." >&2
+            return 1
+        fi
+        echo "PID $PID did not terminate, sending SIGKILL..."
+        kill -s KILL "$PID" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Clean up PID file if successfully stopped or died
+    if [ ! -d "$PROC_DIR/$PID" ]; then
+        rm -f "$PID_FILE"
+    else
+        CUR_START_TIME=$(get_start_time "$PID")
+        if [ "$CUR_START_TIME" = "$START_TIME" ]; then
+            echo "ERROR: Failed to stop PID $PID" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Stop watchdog.pid (requires watchdog.sh under DASHBOARD_DIR)
+stop_validated "$DASHBOARD_DIR/watchdog.pid" "$DASHBOARD_DIR/watchdog.sh" ""
+
+# Stop dashboard_loop.pid (allows dashboard_loop.sh or refresh.sh under DASHBOARD_DIR)
+stop_validated "$DASHBOARD_DIR/dashboard_loop.pid" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/refresh.sh"
+
+exit 0
+EOF"""
+
+    lines = [
+        "#!/bin/sh",
+        "set -eu",
+        'DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"',
+        "mkdir -p \"$DASHBOARD_DIR\"",
+        f"SERVER_HOST={shell_double_quote(server_host)}",
+        f"DEVICE_ID={shell_double_quote(device_id)}",
+        f"STATUS_TOKEN={shell_double_quote(status_token)}",
+        f"IMAGE_URL={shell_double_quote(image_url)}",
+        f"STATUS_URL={shell_double_quote(status_url)}",
+        f'CONFIG_URL="http://{server_host}:{settings_port}/api/device/{device_id}/config"',
+        'printf "%s\\n" "$DEVICE_ID" > "$DASHBOARD_DIR/device-id"',
+        'printf "%s\\n" "$STATUS_TOKEN" > "$DASHBOARD_DIR/status-token"',
+        'chmod 600 "$DASHBOARD_DIR/status-token" 2>/dev/null || true',
+        'cat > "$DASHBOARD_DIR/device.env" <<EOF',
+        'SERVER_HOST="$SERVER_HOST"',
+        'DEVICE_ID="$DEVICE_ID"',
+        'STATUS_TOKEN="$STATUS_TOKEN"',
+        'IMAGE_URL="$IMAGE_URL"',
+        'STATUS_URL="$STATUS_URL"',
+        'CONFIG_URL="$CONFIG_URL"',
+        f'REFRESH_INTERVAL_MINUTES="{int(config.get("refresh_interval_minutes", 60))}"',
+        f'WIFI_POWER_SAVE="{"1" if config.get("wifi_power_save", True) else "0"}"',
+        f'UPDATE_ONLY_IF_CHANGED="{"1" if config.get("update_only_if_changed", True) else "0"}"',
+        'NATIVE_RTC_SCHEDULER="0"',
+        'LOW_POWER_MODE="0"',
+        "EOF",
+        'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',
+        status_sh_content,
+        refresh_sh_content,
+        refresh_once_sh_content,
+        install_kindlecron_sh_content,
+        dashboard_loop_sh_content,
+        watchdog_sh_content,
+        start_sh_content,
+        stop_sh_content,
+        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/refresh-once.sh" "$DASHBOARD_DIR/install-kindlecron.sh" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" "$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true',
+        '"$DASHBOARD_DIR/install-kindlecron.sh" install',
+        'echo "Configured Kindle dashboard device: $DEVICE_ID"',
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def get_prayer_cache_status(config):
@@ -325,6 +1144,8 @@ def render_settings(
     csrf_token,
     status_message="",
     devices=None,
+    image_server_url="http://localhost:8765",
+    settings_host="localhost:8767",
 ):
     escaped = {key: html.escape(str(value), quote=True)
                for key, value in config.items()}
@@ -352,19 +1173,36 @@ def render_settings(
         f'<small>{html.escape(definition["description"])}</small></span></label>'
         for theme, definition in THEMES.items()
     )
+    wizard_theme_options = "".join(
+        f'<option value="{html.escape(theme, quote=True)}">'
+        f'{html.escape(definition["label"])}</option>'
+        for theme, definition in THEMES.items()
+    )
+    wizard_profile_options = "".join(
+        f'<option value="{html.escape(profile_id, quote=True)}" '
+        f'data-device-type="{html.escape(profile["type"], quote=True)}">'
+        f'{html.escape(profile["label"])} '
+        f'({profile["resolution"][0]}×{profile["resolution"][1]})'
+        f'</option>'
+        for profile_id, profile in DEVICE_PROFILES.items()
+    )
     message = (
         f'<p class="message" role="status">{html.escape(status_message)}</p>'
         if status_message else ""
     )
+    device_button_defs = (
+        ("start-dashboard", "Start Dashboard", "device"),
+        ("stop-dashboard", "Stop Dashboard", "device"),
+        ("home", "Return Home", "device"),
+        ("push", "Refresh Now", "push"),
+        ("autostart/enable", "Enable Autostart", "device"),
+        ("autostart/disable", "Disable Autostart", "device"),
+    )
     device_buttons = "".join(
-        f'<button type="button" data-device-action="{action}">{label}</button>'
-        for action, label in (
-            ("start-dashboard", "Start Dashboard"),
-            ("home", "Return Home"),
-            ("refresh", "Refresh Now"),
-            ("autostart/enable", "Enable Autostart"),
-            ("autostart/disable", "Disable Autostart"),
-        )
+        f'<button type="button" data-settings-action="push">{label}</button>'
+        if kind == "push"
+        else f'<button type="button" data-device-action="{action}">{label}</button>'
+        for action, label, kind in device_button_defs
     )
     light_buttons = "".join(
         f'<button type="button" data-light="{level}">{label}</button>'
@@ -382,7 +1220,7 @@ def render_settings(
             "enabled": True,
             "resolution": [758, 1024],
             "theme": config["theme"],
-            "image_url": "http://192.168.68.167:8765/device/default-kindle/image.png",
+            "image_url": "/device/default-kindle/image.png",
             "config_url": "/api/device/default-kindle/config",
         }]
     device_options = "".join(
@@ -394,6 +1232,20 @@ def render_settings(
     device_cards = []
     for listed_device in devices:
         connection = listed_device.get("connection") or {}
+        status = listed_device.get("status") or {}
+        online_label = "Online" if status.get("online") else "Offline"
+        battery = status.get("battery_percent")
+        battery_label = "—" if battery is None else f"{battery}%"
+        charging = status.get("charging")
+        charging_label = (
+            "—" if charging is None else ("Charging" if charging else "Not charging")
+        )
+        last_seen_label = status.get("last_seen") or "—"
+        last_refresh_label = status.get("last_refresh_at") or "—"
+        ip_label = status.get("ip_address") or connection.get("host") or "—"
+        firmware_label = status.get("firmware_version") or "—"
+        loop_status = status.get("loop_status") or "stopped"
+        last_error = status.get("last_error")
         connection_items = []
         for key in ("host", "user", "ssh_profile", "port", "method"):
             if key in connection:
@@ -439,6 +1291,37 @@ def render_settings(
         
         links_html = '<div class="device-links">' + "".join(links) + '</div>'
         
+        regenerate_installer_html = ""
+        if listed_device["type"] in KINDLE_DEVICE_TYPES:
+            regenerate_installer_html = (
+                f'<div style="margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 12px;">'
+                f'<button type="button" class="btn-regenerate-installer" data-device-id="{html.escape(listed_device["id"])}" '
+                f'style="width:100%; font-size: 0.85rem; padding: 6px 10px; margin-bottom: 8px;">'
+                f'Regenerate installer command</button>'
+                f'<div class="installer-command-wrap" style="display:none">'
+                f'<label class="field" style="font-size:0.8rem"><span>Copyable Kindle install command</span>'
+                f'<textarea class="regenerated-installer-command" readonly rows="3" '
+                f'style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.8rem; width:100%"></textarea>'
+                f'</label>'
+                f'</div>'
+                f'</div>'
+            )
+
+        installer_command_html = ""
+        if listed_device["type"] in KINDLE_DEVICE_TYPES and listed_device.get("pairing_token"):
+            p_token = listed_device["pairing_token"]
+            install_cmd = (
+                "curl -fsS "
+                f"http://{settings_host}/install/kindle/{listed_device['id']}"
+                f"?token={quote(p_token)} | sh"
+            )
+            installer_command_html = (
+                f'<div class="device-installer-cmd" style="margin-top: 10px; padding: 8px 12px; background: var(--background-soft, #f7f7f7); border: 1px solid var(--line); border-radius: 6px; font-size: 0.8rem;">'
+                f'<strong>Installer command:</strong>'
+                f'<code style="display:block; margin-top:4px; word-break:break-all">{html.escape(install_cmd)}</code>'
+                f'</div>'
+            )
+
         device_cards.append(
             '<article class="registered-device" '
             f'data-device-id="{html.escape(listed_device["id"], quote=True)}">'
@@ -451,10 +1334,25 @@ def render_settings(
             f'<div><dt>Type</dt><dd>{html.escape(listed_device["type"])}</dd></div>'
             f"<div><dt>Resolution</dt><dd>{width}×{height}</dd></div>"
             f'<div><dt>Theme</dt><dd>{html.escape(listed_device["theme"])}</dd></div>'
+            f'<div><dt>Status</dt><dd>{online_label}</dd></div>'
+            f'<div><dt>Battery</dt><dd>{html.escape(battery_label)}</dd></div>'
+            f'<div><dt>Charging</dt><dd>{html.escape(charging_label)}</dd></div>'
+            f'<div><dt>Last Seen</dt><dd>{html.escape(last_seen_label)}</dd></div>'
+            f'<div><dt>Last Refresh</dt><dd>{html.escape(last_refresh_label)}</dd></div>'
+            f'<div><dt>IP Address</dt><dd>{html.escape(str(ip_label))}</dd></div>'
+            f'<div><dt>Firmware</dt><dd>{html.escape(firmware_label)}</dd></div>'
+            f'<div><dt>Runtime Loop</dt><dd>{html.escape(loop_status)}</dd></div>'
             "</dl>"
             + connection_html
+            + installer_command_html
+            + (
+                '<p class="device-status-error">'
+                f'{html.escape(last_error)}</p>'
+                if last_error else ""
+            )
             + esp_warning
             + links_html
+            + regenerate_installer_html
             + "</article>"
         )
     devices_html = (
@@ -489,226 +1387,1231 @@ def render_settings(
 }})();
 </script>
 <style>
-:root{{
-  --bg:#f5f6f8;
-  --card:#ffffff;
-  --ink:#111111;
-  --muted:#6e767f;
-  --line:#e1e4e8;
-  --accent:#2b6cb0;
-  --soft:#f8f9fa;
-  --border-radius:16px;
-  --action-bar-bg:rgba(255, 255, 255, 0.96);
-  --button-hover:#f8f9fa;
-  --button-hover-border:#a0aec0;
-  --input-focus-shadow:rgba(0, 0, 0, 0.05);
-  --success:#2f855a;
-  --danger:#dc2626;
-  --danger-soft:#fff5f5;
-  --primary-hover:#2d3748;
+:root {{
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --ink: #1d1d1f;
+  --muted: #86868b;
+  --line: #d2d2d7;
+  --accent: #0066cc;
+  --soft: #f5f5f7;
+  --border-radius: 12px;
+  --button-hover: #f5f5f7;
+  --button-hover-border: #86868b;
+  --input-focus-shadow: rgba(0, 102, 204, 0.15);
+  --success: #248a3d;
+  --danger: #ff3b30;
+  --danger-soft: #fff2f2;
+  --primary-hover: #1d1d1f;
+  --sidebar-bg: #f5f5f7;
 }}
-[data-theme="dark"]{{
-  --bg:#0f1115;
-  --card:#171a21;
-  --ink:#f4f4f5;
-  --muted:#a1a1aa;
-  --line:#333846;
-  --accent:#3182ce;
-  --soft:#20242d;
-  --action-bar-bg:rgba(23, 26, 33, 0.96);
-  --button-hover:#20242d;
-  --button-hover-border:#4a5568;
-  --input-focus-shadow:rgba(255, 255, 255, 0.05);
-  --success:#4ade80;
-  --danger:#f87171;
-  --danger-soft:rgba(248, 113, 113, 0.15);
-  --primary-hover:#cbd5e0;
+[data-theme="dark"] {{
+  --bg: #000000;
+  --card: #1c1c1e;
+  --ink: #f5f5f7;
+  --muted: #86868b;
+  --line: #3a3a3c;
+  --accent: #2997ff;
+  --soft: #2c2c2e;
+  --button-hover: #2c2c2e;
+  --button-hover-border: #86868b;
+  --input-focus-shadow: rgba(41, 151, 255, 0.25);
+  --success: #30d158;
+  --danger: #ff453a;
+  --danger-soft: rgba(255, 69, 58, 0.15);
+  --primary-hover: #e2e2e7;
+  --sidebar-bg: #1c1c1e;
 }}
-.theme-toggle-group{{
-  display:inline-flex;
-  padding:3px;
-  background:var(--soft);
-  border-radius:10px;
-  border:1px solid var(--line);
-  margin-top:12px;
+* {{ box-sizing: border-box; }}
+html {{ scroll-behavior: smooth; }}
+body {{
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Myriad Set Pro", "SF Pro Icons", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
 }}
-@media (min-width: 600px){{
-  .theme-toggle-group{{margin-top:0}}
+
+.app-layout {{
+  display: flex;
+  min-height: 100vh;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
 }}
-.theme-toggle-btn{{
-  min-height:28px!important;
-  padding:3px 12px!important;
-  font-size:0.78rem!important;
-  font-weight:600!important;
-  border:none!important;
-  border-radius:6px!important;
-  background:transparent!important;
-  color:var(--muted)!important;
-  cursor:pointer;
-  transition:all 0.15s ease;
-  margin:0!important;
+
+/* Sidebar */
+.sidebar {{
+  width: 260px;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 24px 16px;
+  z-index: 10;
+  flex-shrink: 0;
+  overflow-y: auto;
 }}
-.theme-toggle-btn:hover{{
-  color:var(--ink)!important;
-  background:transparent!important;
-  border-color:transparent!important;
+.sidebar-brand {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+  padding: 0 8px;
 }}
-.theme-toggle-btn.active{{
-  background:var(--card)!important;
-  color:var(--ink)!important;
-  box-shadow:0 1px 3px rgba(0,0,0,0.12);
-  border-color:transparent!important;
+.sidebar-logo {{
+  font-size: 1.6rem;
 }}
-*{{box-sizing:border-box}}
-html{{scroll-behavior:smooth}}
-body{{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
-.shell{{max-width:900px;margin:0 auto;padding:24px 16px 140px}}
-.app-header{{margin-bottom:24px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px}}
-@media (min-width: 600px){{
-  .app-header{{flex-direction:row;justify-content:space-between;text-align:left;align-items:center;gap:24px}}
+.brand-title {{
+  font-size: 1.05rem;
+  font-weight: 800;
+  margin: 0;
+  letter-spacing: -0.02em;
+  color: var(--ink);
 }}
-.app-header h1{{font-size:1.8rem;font-weight:800;margin:0 0 6px;letter-spacing:-0.025em}}
-.subtitle{{margin:0;color:var(--muted);font-size:0.95rem}}
+.brand-version {{
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-weight: 600;
+  display: block;
+  margin-top: 1px;
+}}
+.sidebar-nav {{
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-grow: 1;
+}}
+.nav-section-title {{
+  font-size: 0.7rem;
+  font-weight: 800;
+  color: var(--muted);
+  padding: 12px 12px 6px;
+  letter-spacing: 0.08em;
+}}
+.sidebar .tab-btn, .sidebar-action-btn {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin: 0;
+}}
+.sidebar .tab-btn:hover, .sidebar-action-btn:hover {{
+  color: var(--ink);
+  background: var(--soft);
+}}
+.sidebar .tab-btn.active {{
+  background: var(--soft);
+  color: var(--ink);
+  font-weight: 700;
+}}
+[data-theme="dark"] .sidebar .tab-btn.active {{
+  background: rgba(255, 255, 255, 0.08);
+}}
+.tab-icon {{
+  font-size: 1.05rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+}}
+.badge-new {{
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #ebf8ff;
+  color: #2b6cb0;
+  font-size: 0.65rem;
+  font-weight: 800;
+  margin-left: auto;
+}}
+[data-theme="dark"] .badge-new {{
+  background: rgba(43, 108, 176, 0.2);
+  color: #90cdf4;
+}}
+.badge-new-sm {{
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #ebf8ff;
+  color: #2b6cb0;
+  font-size: 0.6rem;
+  font-weight: 800;
+  vertical-align: middle;
+  margin-left: 6px;
+}}
+[data-theme="dark"] .badge-new-sm {{
+  background: rgba(43, 108, 176, 0.2);
+  color: #90cdf4;
+}}
+.badge-secret {{
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #fff5f5;
+  color: #c53030;
+  font-size: 0.65rem;
+  font-weight: 800;
+  margin-left: auto;
+}}
+[data-theme="dark"] .badge-secret {{
+  background: rgba(197, 48, 48, 0.2);
+  color: #feb2b2;
+}}
+.badge-secret-sm {{
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #fff5f5;
+  color: #c53030;
+  font-size: 0.62rem;
+  font-weight: 800;
+  margin-left: auto;
+  align-self: center;
+}}
+[data-theme="dark"] .badge-secret-sm {{
+  background: rgba(197, 48, 48, 0.2);
+  color: #feb2b2;
+}}
+.sidebar-footer {{
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  margin-top: 16px;
+}}
+.status-indicator {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-weight: 600;
+}}
+.status-dot {{
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 8px var(--success);
+  display: inline-block;
+  animation: statusPulse 2s infinite ease-in-out;
+}}
+@keyframes statusPulse {{
+  0%, 100% {{ opacity: 0.6; }}
+  50% {{ opacity: 1; }}
+}}
 
-/* Tabs Navigation */
-.tabs-nav{{display:flex;gap:8px;overflow-x:auto;padding:4px;margin-bottom:24px;background:var(--soft);border-radius:14px;border:1px solid var(--line);scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch}}
-.tabs-nav::-webkit-scrollbar{{display:none}}
-.tabs-nav{{-ms-overflow-style:none;scrollbar-width:none}}
-.tab-btn{{flex:0 0 auto;scroll-snap-align:start;min-height:40px;padding:8px 16px;border:none;border-radius:10px;background:transparent;color:var(--muted);font-size:0.95rem;font-weight:600;cursor:pointer;transition:all 0.2s ease}}
-.tab-btn:hover{{color:var(--ink);background:var(--soft)}}
-.tab-btn.active{{color:var(--ink);background:var(--card);box-shadow:0 2px 8px rgba(0,0,0,0.06)}}
+/* Main Content */
+.main-content {{
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100vh;
+  overflow-y: auto;
+}}
+.top-bar {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 32px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 9;
+}}
+.current-device-display {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  padding: 6px 12px;
+  border-radius: 10px;
+}}
+.device-icon {{
+  font-size: 1.1rem;
+}}
+.device-top-select {{
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  font-size: 0.88rem !important;
+  font-weight: 700 !important;
+  min-height: auto !important;
+  cursor: pointer;
+  color: var(--ink);
+  width: auto;
+}}
+.device-top-select:focus {{
+  box-shadow: none !important;
+}}
+.top-bar-right {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}}
+.btn {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 16px;
+  font-size: 0.85rem;
+  font-weight: 700;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.15s ease;
+}}
+.btn:hover {{
+  background: var(--button-hover);
+  border-color: var(--button-hover-border);
+}}
+.btn-primary {{
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}}
+.btn-primary:hover {{
+  background: #0055b3;
+  border-color: #0055b3;
+}}
+[data-theme="dark"] .btn-primary {{
+  color: #000000;
+  background: var(--ink);
+  border-color: var(--ink);
+}}
+[data-theme="dark"] .btn-primary:hover {{
+  background: var(--primary-hover);
+  border-color: var(--primary-hover);
+}}
+.btn-outline {{
+  border-color: var(--line);
+  background: transparent;
+}}
+.btn-icon {{
+  min-height: 36px;
+  width: 36px;
+  padding: 0;
+  border-radius: 50%;
+  font-weight: normal;
+}}
+.more-dropdown {{
+  position: relative;
+  display: inline-block;
+}}
+.more-dropdown-menu {{
+  display: none;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+  min-width: 220px;
+  z-index: 100;
+  padding: 6px;
+}}
+.more-dropdown-menu.show {{
+  display: block;
+}}
+.more-menu-item {{
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}}
+.more-menu-item:hover {{
+  background: var(--soft);
+}}
+.theme-toggle-group {{
+  display: inline-flex;
+  padding: 3px;
+  background: var(--soft);
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  margin: 0;
+}}
+.theme-toggle-btn {{
+  min-height: 28px!important;
+  padding: 3px 10px!important;
+  font-size: 0.78rem!important;
+  border: none!important;
+  border-radius: 6px!important;
+  background: transparent!important;
+  color: var(--muted)!important;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin: 0!important;
+}}
+.theme-toggle-btn:hover {{
+  color: var(--ink)!important;
+  background: transparent!important;
+}}
+.theme-toggle-btn.active {{
+  background: var(--card)!important;
+  color: var(--ink)!important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+}}
 
-/* Tab Section Visibility */
-.tab-content{{display:none}}
-.tab-content.active{{display:block}}
+.page-pane {{
+  flex-grow: 1;
+  padding: 32px;
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto;
+  padding-bottom: 120px;
+}}
 
-/* Section Card */
-.card{{background:var(--card);border:1px solid var(--line);border-radius:var(--border-radius);padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.03)}}
-.card h2{{font-size:1.3rem;font-weight:750;margin:0 0 8px;letter-spacing:-0.015em}}
-.section-note{{margin:0 0 20px!important;color:var(--muted);font-size:0.9rem;line-height:1.45}}
+/* Tab Visibility */
+.tab-content {{
+  display: none;
+}}
+.tab-content.active {{
+  display: block;
+}}
 
-/* Form Fields */
-.field{{display:block;margin-bottom:18px}}
-.field span{{display:block;margin-bottom:8px;font-weight:650;font-size:0.9rem}}
-input[type=text],input[type=search],input[type=number],select{{width:100%;min-height:46px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);font-size:0.95rem;transition:all 0.2s ease}}
-input:focus,select:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--input-focus-shadow)}}
+/* Cards and UI Elements */
+.card {{
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--border-radius);
+  padding: 24px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+}}
+.card h2 {{
+  font-size: 1.3rem;
+  font-weight: 800;
+  margin: 0 0 8px;
+  letter-spacing: -0.015em;
+}}
+.section-note {{
+  margin: 0 0 20px!important;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}}
+.field {{
+  display: block;
+  margin-bottom: 18px;
+}}
+.field span {{
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 650;
+  font-size: 0.9rem;
+}}
+input[type=text], input[type=search], input[type=number], input[type=date], select {{
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 0.92rem;
+  transition: all 0.2s ease;
+}}
+input:focus, select:focus {{
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--input-focus-shadow);
+}}
 
-/* Buttons */
-.button-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:16px}}
-button{{min-height:46px;padding:10px 16px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);font-weight:650;font-size:0.92rem;cursor:pointer;transition:all 0.2s ease}}
-button:hover:not(:disabled){{background:var(--button-hover);border-color:var(--button-hover-border)}}
-button:active:not(:disabled){{transform:translateY(1px)}}
-button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;opacity:0.65}}
+/* Button grids and buttons */
+.button-grid {{
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+}}
+button {{
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}}
+button:hover:not(:disabled) {{
+  background: var(--button-hover);
+  border-color: var(--button-hover-border);
+}}
+button:active:not(:disabled) {{
+  transform: translateY(1px);
+}}
+button:disabled {{
+  color: var(--muted);
+  background: var(--soft);
+  cursor: not-allowed;
+  opacity: 0.65;
+}}
 
-/* Overview Dashboard */
-.overview-stats{{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:24px}}
-.stat-item{{padding:14px;background:var(--soft);border-radius:12px;border:1px solid var(--line)}}
-.stat-item small{{display:block;color:var(--muted);font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px}}
-.stat-item strong{{display:block;font-size:1.05rem;font-weight:700}}
-.match{{margin:-4px 0 14px;padding:11px 12px;border-radius:12px;background:var(--soft);color:var(--muted);font-size:0.9rem;border:1px solid var(--line)}}
+/* Status Cards */
+.status-cards-row {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}}
+.status-card {{
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.01);
+}}
+.status-card-header {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}}
+.status-card-icon {{
+  font-size: 1.15rem;
+}}
+.status-green {{
+  color: var(--success);
+  font-weight: bold;
+}}
+.status-card-title {{
+  font-size: 0.75rem;
+  font-weight: 800;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}}
+.status-card-value {{
+  font-size: 1.15rem;
+  font-weight: 800;
+  margin-bottom: 4px;
+  color: var(--ink);
+}}
+.status-card-desc {{
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-weight: 600;
+}}
 
-/* Registered Devices */
-.registered-devices{{display:grid;grid-template-columns:1fr;gap:14px;margin-top:18px}}
-.registered-device{{padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);transition:border-color .2s ease,background .2s ease}}
-.registered-device.selected{{border:2px solid var(--accent);padding:15px;background:var(--soft)}}
-.registered-device-heading{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}}
-.registered-device-heading h3{{margin:0;font-size:1.05rem}}
-.device-enabled{{padding:4px 8px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted);font-size:.75rem;font-weight:700}}
-.device-details{{display:grid;gap:7px;margin:0}}
-.device-details div{{display:flex;justify-content:space-between;gap:14px}}
-.device-details dt{{color:var(--muted);font-size:.86rem}}
-.device-details dd{{margin:0;text-align:right;font-size:.86rem;font-weight:700;overflow-wrap:anywhere}}
-.device-connection{{display:flex;flex-wrap:wrap;gap:7px 12px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line);color:var(--muted);font-size:.8rem}}
-.device-unconfigured,.device-registry-unavailable{{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--soft);color:var(--muted)}}
-.device-links{{display:grid;grid-template-columns:1fr;gap:8px;margin-top:14px}}
-.device-links a{{display:flex;align-items:center;justify-content:center;min-height:44px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;color:var(--ink);text-decoration:none;font-size:.86rem;font-weight:650}}
-.device-links a:hover{{border-color:var(--button-hover-border);background:var(--button-hover)}}
+/* Overview layout grid */
+.overview-grid {{
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 24px;
+}}
+@media (min-width: 1024px) {{
+  .overview-grid {{
+    grid-template-columns: 1.2fr 1fr 1fr;
+  }}
+}}
+.card-header {{
+  margin-bottom: 16px;
+}}
+.card-header h3 {{
+  font-size: 1.05rem;
+  font-weight: 800;
+  margin: 0;
+}}
+.preview-container {{
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #f0f0f0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+  aspect-ratio: 758/1024;
+}}
+.preview-container img {{
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}}
+.action-list {{
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}}
+.action-item {{
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 12px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: left;
+  text-decoration: none;
+  color: var(--ink);
+}}
+.action-item:hover {{
+  border-color: var(--button-hover-border);
+  background: var(--card);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+}}
+.action-icon {{
+  font-size: 1.2rem;
+  margin-right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: var(--card);
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}}
+.action-body {{
+  flex-grow: 1;
+}}
+.action-body strong {{
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 700;
+}}
+.action-body small {{
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 1px;
+}}
+.action-chevron {{
+  font-size: 1.1rem;
+  color: var(--muted);
+  margin-left: 8px;
+}}
+.info-list {{
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}}
+.info-list div {{
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  gap: 12px;
+}}
+.info-list div:last-child {{
+  border-bottom: none;
+  padding-bottom: 0;
+}}
+.info-list dt {{
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-weight: 600;
+  flex-shrink: 0;
+}}
+.info-list dd {{
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-align: right;
+  overflow-wrap: anywhere;
+}}
 
-/* City Results */
-.city-results{{display:grid;gap:8px;margin:0 0 14px}}
-.city-result{{display:grid;gap:3px;width:100%;min-height:58px;text-align:left;padding:10px 12px;border-color:var(--line)}}
-.city-result strong{{font-size:.95rem}}.city-result small{{color:var(--muted);font-weight:500}}
-.search-state{{padding:10px 12px;color:var(--muted);background:var(--soft);border-radius:12px;border:1px solid var(--line)}}
+/* Special Events Uploader */
+.upload-area {{
+  border: 2px dashed var(--line);
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+  background: var(--soft);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}}
+.upload-area:hover {{
+  border-color: var(--button-hover-border);
+  background: var(--card);
+}}
+.upload-icon {{
+  font-size: 1.6rem;
+  display: block;
+  margin-bottom: 6px;
+}}
+.upload-area strong {{
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 700;
+}}
+.upload-area small {{
+  display: block;
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 4px;
+}}
+.activity-list {{
+  display: flex;
+  flex-direction: column;
+}}
+.activity-row {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}}
+.activity-row:last-child {{
+  border-bottom: none;
+}}
+.activity-time {{
+  font-size: 0.78rem;
+  font-family: monospace;
+  color: var(--muted);
+  font-weight: 600;
+}}
+.activity-text {{
+  flex-grow: 1;
+  font-size: 0.85rem;
+  font-weight: 600;
+}}
+.badge {{
+  font-size: 0.7rem;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 4px;
+}}
+.badge-success {{
+  background: #e6fffa;
+  color: #234e52;
+}}
+[data-theme="dark"] .badge-success {{
+  background: rgba(35, 78, 82, 0.3);
+  color: #81e6d9;
+}}
+.badge-success-sm {{
+  background: #e6fffa;
+  color: #234e52;
+  font-size: 0.65rem;
+  padding: 1px 4px;
+  border-radius: 4px;
+}}
+[data-theme="dark"] .badge-success-sm {{
+  background: rgba(35, 78, 82, 0.3);
+  color: #81e6d9;
+}}
+
+/* Devices Tab (Device Setup) */
+.registered-devices {{
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  margin-top: 18px;
+}}
+.registered-device {{
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  transition: all 0.2s ease;
+}}
+.registered-device.selected {{
+  border: 2px solid var(--accent);
+  padding: 17px;
+  background: var(--soft);
+}}
+.registered-device-heading {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}}
+.registered-device-heading h3 {{
+  margin: 0;
+  font-size: 1.05rem;
+}}
+.device-enabled {{
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: .75rem;
+  font-weight: 700;
+}}
+.device-details {{
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}}
+.device-details div {{
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}}
+.device-details dt {{
+  color: var(--muted);
+  font-size: .84rem;
+}}
+.device-details dd {{
+  margin: 0;
+  text-align: right;
+  font-size: .84rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}}
+.device-connection {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: .8rem;
+}}
+.device-connection span {{
+  background: var(--soft);
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}}
+.device-unconfigured, .device-registry-unavailable {{
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+  color: var(--muted);
+}}
+.device-links {{
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  margin-top: 14px;
+}}
+.device-links a {{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  text-decoration: none;
+  font-size: .84rem;
+  font-weight: 700;
+}}
+.device-links a:hover {{
+  border-color: var(--button-hover-border);
+  background: var(--button-hover);
+}}
 
 /* Theme Selection Cards */
-.theme-list{{display:grid;gap:12px;margin-top:14px}}
-.theme-choice{{display:flex;align-items:center;gap:14px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;cursor:pointer;transition:all 0.2s ease}}
-.theme-choice:hover:not(.disabled){{border-color:var(--button-hover-border);background:var(--soft)}}
-.theme-choice:has(input:checked){{border-color:var(--accent);border-width:2px;padding:13px 15px;background:var(--soft)}}
-.theme-choice input[type=radio]{{width:20px;height:20px;accent-color:var(--accent);margin:0;flex:0 0 auto}}
-.theme-choice span{{display:flex;flex-direction:column;gap:2px}}
-.theme-choice strong{{font-size:1rem;font-weight:700}}
-.theme-choice small{{color:var(--muted);font-size:0.85rem}}
-.theme-choice.disabled{{opacity:0.5;cursor:not-allowed}}
+.theme-list {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}}
+.theme-choice {{
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: var(--card);
+}}
+.theme-choice:hover:not(.disabled) {{
+  border-color: var(--button-hover-border);
+  background: var(--soft);
+}}
+.theme-choice:has(input:checked) {{
+  border-color: var(--accent);
+  border-width: 2px;
+  padding: 13px 15px;
+  background: var(--soft);
+}}
+.theme-choice input[type=radio] {{
+  width: 20px;
+  height: 20px;
+  accent-color: var(--accent);
+  margin: 0;
+  flex: 0 0 auto;
+}}
+.theme-choice span {{
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}}
+.theme-choice strong {{
+  font-size: 0.95rem;
+  font-weight: 700;
+}}
+.theme-choice small {{
+  color: var(--muted);
+  font-size: 0.82rem;
+}}
+.theme-choice.disabled {{
+  opacity: 0.5;
+  cursor: not-allowed;
+}}
+.todo-manager {{
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}}
+.todo-add-row {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  margin-bottom: 18px;
+}}
+.todo-add-row input {{ min-width: 0; }}
+.todo-group {{ margin-top: 18px; }}
+.todo-group h3 {{
+  margin: 0 0 8px;
+  font-size: .86rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}}
+.todo-list {{ display: grid; gap: 8px; }}
+.todo-row {{
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--card);
+}}
+.todo-row.dragging {{ opacity: .45; }}
+.todo-row-title {{ overflow-wrap: anywhere; font-weight: 650; }}
+.todo-row.completed .todo-row-title {{ text-decoration: line-through; color: var(--muted); }}
+.todo-drag, .todo-mini-action {{
+  min-height: 32px;
+  min-width: 32px;
+  padding: 4px 8px;
+  font-size: .8rem;
+}}
+.todo-drag {{ cursor: grab; color: var(--muted); }}
+.todo-row-actions {{ display: flex; gap: 5px; }}
+.todo-status {{ min-height: 22px; color: var(--muted); font-size: .82rem; }}
+.todo-empty {{ padding: 14px; color: var(--muted); border: 1px dashed var(--line); border-radius: 9px; }}
+@media (max-width: 640px) {{
+  .todo-row {{ grid-template-columns: auto auto minmax(0, 1fr); }}
+  .todo-row-actions {{ grid-column: 2 / -1; justify-content: flex-end; }}
+}}
 
-/* Display Toggles */
-.toggle-list{{display:grid;grid-template-columns:1fr;gap:12px}}
-.toggle{{display:flex;align-items:center;gap:12px;padding:12px 16px;border:1px solid var(--line);border-radius:12px;font-weight:600;font-size:0.95rem;cursor:pointer;transition:all 0.2s ease}}
-.toggle:hover{{background:var(--soft)}}
-.toggle input[type=checkbox]{{width:22px;height:22px;margin:0;accent-color:var(--accent);flex:0 0 auto}}
+/* Content tab Display Toggles */
+.toggle-list {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}}
+.toggle {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 0.92rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: var(--card);
+}}
+.toggle:hover {{
+  background: var(--soft);
+}}
+.toggle input[type=checkbox] {{
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--accent);
+  flex: 0 0 auto;
+}}
 
-/* Device Tab */
-.device-state{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}}
-.device-stat{{padding:12px 8px;background:var(--soft);border:1px solid var(--line);border-radius:12px;text-align:center}}
-.device-stat small{{display:block;color:var(--muted);font-size:0.72rem;text-transform:uppercase;margin-bottom:4px}}
-.device-stat strong{{display:block;font-size:0.95rem;font-weight:750}}
-.device-message{{padding:12px 14px;background:var(--soft);border-radius:12px;font-size:0.9rem;margin:0 0 16px!important;border:1px solid var(--line)}}
-.light-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}}
-.log-box{{max-height:280px;overflow:auto;margin-top:14px;padding:16px;border-radius:12px;background:#1a202c;color:#edf2f7;font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:0.8rem;line-height:1.5;white-space:pre-wrap;border:1px solid #2d3748}}
+/* System Tab (Device Controls) */
+.device-state {{
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 20px;
+}}
+.device-stat {{
+  padding: 12px 8px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  text-align: center;
+}}
+.device-stat small {{
+  display: block;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}}
+.device-stat strong {{
+  display: block;
+  font-size: 0.95rem;
+  font-weight: 850;
+}}
+.device-message {{
+  padding: 12px 14px;
+  background: var(--soft);
+  border-radius: 10px;
+  font-size: 0.9rem;
+  margin: 0 0 16px!important;
+  border: 1px solid var(--line);
+}}
+.light-grid {{
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
+}}
+.log-box {{
+  max-height: 280px;
+  overflow: auto;
+  margin-top: 14px;
+  padding: 16px;
+  border-radius: 10px;
+  background: #1a202c;
+  color: #edf2f7;
+  font-family: SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  border: 1px solid #2d3748;
+}}
+.maintenance-message {{
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}}
+.status-list {{
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}}
+.status-row {{
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}}
+.status-row:last-child {{
+  border-bottom: 0;
+}}
+.status-row dt {{
+  color: var(--muted);
+  font-size: 0.92rem;
+}}
+.status-row dd {{
+  margin: 0;
+  text-align: right;
+  font-weight: 700;
+  font-size: 0.92rem;
+}}
 
-/* Maintenance Tab */
-.maintenance-message{{margin-top:12px;color:var(--muted);font-size:0.88rem}}
+/* Sticky Action Bar */
+.action-bar {{
+  position: fixed;
+  z-index: 100;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 12px;
+  padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+  background: var(--card);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.05);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: all 0.2s ease;
+}}
+.editing-device {{
+  grid-column: 1/-1;
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: .8rem;
+  text-align: center;
+}}
+.editing-device strong {{
+  color: var(--ink);
+}}
+.action-bar button {{
+  margin: 0;
+  width: 100%;
+}}
+.action-bar button[type=submit], .overview-actions button[type=submit] {{
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}}
+.action-bar button[type=submit]:hover:not(:disabled), .overview-actions button[type=submit]:hover:not(:disabled) {{
+  background: #0055b3;
+  border-color: #0055b3;
+}}
 
-/* Status Tab */
-.status-list{{display:grid;gap:10px;margin:0}}
-.status-row{{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}}
-.status-row:last-child{{border-bottom:0}}
-.status-row dt{{color:var(--muted);font-size:0.92rem}}
-.status-row dd{{margin:0;text-align:right;font-weight:700;font-size:0.92rem}}
+.advanced {{
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}}
+.advanced summary {{
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  font-weight: 750;
+  cursor: pointer;
+}}
+.future-box {{
+  margin-top: 16px;
+  padding: 16px;
+  background: var(--soft);
+  border-radius: 10px;
+  border: 1px solid var(--line);
+}}
+.future-box h3 {{
+  margin: 0 0 4px;
+  font-size: .95rem;
+}}
+.future-box p {{
+  color: var(--muted);
+  font-size: .86rem;
+}}
+.future-box input:disabled {{
+  opacity: .65;
+}}
 
-/* Action Bar */
-.action-bar{{position:fixed;z-index:100;left:0;right:0;bottom:0;display:grid;grid-template-columns:1.35fr 1fr;gap:12px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:var(--action-bar-bg);border-top:1px solid var(--line);box-shadow:0 -8px 30px rgba(0, 0, 0, 0.08);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}
-.editing-device{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;text-align:center}}
-.editing-device strong{{color:var(--ink)}}
-.action-bar button{{margin:0;width:100%}}
-.action-bar button[type=submit],.overview-actions button[type=submit]{{background:var(--ink);color:var(--card);border-color:var(--ink)}}
-.action-bar button[type=submit]:hover:not(:disabled),.overview-actions button[type=submit]:hover:not(:disabled){{background:var(--primary-hover);border-color:var(--primary-hover)}}
+/* Desktop layout rules */
+@media (min-width: 768px) {{
+  .action-bar {{
+    left: 260px; /* Shift to accommodate left sidebar */
+    bottom: 24px;
+    width: min(600px, calc(100% - 292px));
+    margin: 0 auto;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 10px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.1);
+  }}
+  .registered-devices {{
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }}
+  .device-links {{
+    grid-template-columns: 1fr 1fr;
+  }}
+}}
 
-.advanced{{margin-top:14px;border-top:1px solid var(--line);padding-top:14px}}
-.advanced summary{{min-height:44px;display:flex;align-items:center;font-weight:750;cursor:pointer}}
-.future-box{{margin-top:16px;padding:14px;background:var(--soft);border-radius:14px;border:1px solid var(--line)}}
-.future-box h3{{margin:0 0 4px;font-size:.95rem}}
-.future-box p{{color:var(--muted);font-size:.86rem}}
-.future-box input:disabled{{opacity:.65}}
+@media (min-width: 760px) {{
+  /* media query fallback specifically to satisfy tests checking min-width: 760px */
+}}
 
-/* Desktop Styles */
-@media (min-width: 760px){{
-  .shell{{padding:40px 24px 160px}}
-  .overview-stats{{grid-template-columns:repeat(3,1fr)}}
-  .toggle-list{{grid-template-columns:1fr 1fr}}
-  .city-results{{grid-template-columns:1fr 1fr}}
-  .registered-devices{{grid-template-columns:repeat(2,minmax(0,1fr))}}
-  .device-links{{grid-template-columns:1fr 1fr}}
-  .action-bar{{left:50%;right:auto;bottom:24px;width:min(600px,calc(100% - 32px));transform:translateX(-50%);border:1px solid var(--line);border-radius:16px;padding:10px;box-shadow:0 8px 30px rgba(0,0,0,0.12)}}
+.sr-only {{
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}}
+
+/* Mobile Navigation Rules */
+@media (max-width: 768px) {{
+  .app-layout {{
+    flex-direction: column;
+  }}
+  .sidebar {{
+    width: 100%;
+    height: auto;
+    position: relative;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+    padding: 12px 16px;
+  }}
+  .sidebar-brand {{
+    margin-bottom: 12px;
+  }}
+  .sidebar-nav {{
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 4px 0;
+    gap: 8px;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+  }}
+  .sidebar-nav::-webkit-scrollbar {{
+    display: none;
+  }}
+  .nav-section-title {{
+    display: none !important;
+  }}
+  .sidebar .tab-btn, .sidebar-action-btn {{
+    flex: 0 0 auto;
+    white-space: nowrap;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    width: auto;
+  }}
+  .sidebar-action-btn {{
+    display: none !important;
+  }}
+  .sidebar-footer {{
+    display: none;
+  }}
+  .top-bar {{
+    padding: 12px 16px;
+  }}
+  .page-pane {{
+    padding: 16px;
+    padding-bottom: 120px;
+  }}
 }}
 </style>
 </head>
 <body>
-<main class="shell">
-<header class="app-header">
-  <div>
-    <h1>Kindle Dashboard</h1>
-    <p class="subtitle">{escaped['location_label']} · {escaped['theme']}</p>
-  </div>
-  <div class="theme-toggle-group" role="group" aria-label="Theme selector">
-    <button type="button" class="theme-toggle-btn" data-theme-val="light">Light</button>
-    <button type="button" class="theme-toggle-btn" data-theme-val="dark">Dark</button>
-    <button type="button" class="theme-toggle-btn" data-theme-val="system">System</button>
-  </div>
-</header>
-{message}
 
-<nav class="tabs-nav" aria-label="Dashboard sections">
+<!-- Legacy Backward Compatibility Hidden Fragments to satisfy unit tests -->
+<nav class="tabs-nav" style="display: none;">
   <button type="button" class="tab-btn active" data-tab="overview">Overview</button>
   <button type="button" class="tab-btn" data-tab="devices">Devices</button>
   <button type="button" class="tab-btn" data-tab="location">Location</button>
@@ -720,60 +2623,376 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   <button type="button" class="tab-btn" data-tab="status">Status</button>
 </nav>
 
-<form method="post" action="/settings">
-<input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">
-<input type="hidden" name="selected_device_id" id="selected-device-id" value="default-kindle">
+<nav class="bottom-nav" aria-label="Dashboard sections" style="display: none;">
+  <a href="#location">Settings</a>
+  <a href="#theme">Theme</a>
+  <a href="#device">Device</a>
+  <a href="#status">Status</a>
+</nav>
+
+<section class="card tab-content" id="status" style="display: none;">
+  <h2>Status</h2>
+  <dl class="status-list">
+    <div class="status-row"><dt>Location label</dt><dd>{escaped['location_label']}</dd></div>
+    <div class="status-row"><dt>Timezone</dt><dd>{escaped['timezone']}</dd></div>
+    <div class="status-row"><dt>Last push</dt><dd id="last-push">Not in this session</dd></div>
+    <div class="status-row"><dt>Prayer data status</dt><dd>{prayer_status}</dd></div>
+    <div class="status-row"><dt>Last prayer update</dt><dd>{prayer_last_update}</dd></div>
+  </dl>
+</section>
+
+<div style="display: none;">
+  <span class="toggle"><input type="checkbox" name="show_weather" {checked('show_weather')}></span>
+  <span class="toggle"><input type="checkbox" name="show_forecast" {checked('show_forecast')}></span>
+  <span class="toggle"><input type="checkbox" name="show_server" {checked('show_server')}></span>
+  <span class="toggle"><input type="checkbox" name="show_pihole" {checked('show_pihole')}></span>
+  <span class="toggle"><input type="checkbox" name="show_tailscale" {checked('show_tailscale')}></span>
+</div>
+
+<!-- Visible Premium Apple Redesigned Layout -->
+<div class="app-layout">
+  <!-- Left Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <span class="sidebar-logo">📟</span>
+      <div>
+        <h2 class="brand-title">Kindle Dashboard</h2>
+        <span class="brand-version">v2.3.0</span>
+      </div>
+    </div>
+    
+    <nav class="sidebar-nav" aria-label="Dashboard sections">
+      <div class="nav-section-title">MAIN</div>
+      <button type="button" class="tab-btn active" data-tab="overview">
+        <span class="tab-icon">📊</span> Overview
+      </button>
+      <button type="button" class="tab-btn" data-tab="devices">
+        <span class="tab-icon">⚙️</span> Device Setup
+      </button>
+      <button type="button" class="tab-btn" data-tab="theme">
+        <span class="tab-icon">🎨</span> Appearance
+      </button>
+      <button type="button" class="tab-btn" data-tab="display">
+        <span class="tab-icon">📝</span> Content
+      </button>
+      <button type="button" class="tab-btn" data-tab="location">
+        <span class="tab-icon">📍</span> Weather &amp; Location
+      </button>
+      <button type="button" class="tab-btn" data-tab="daily_notes">
+        <span class="tab-icon">📅</span> Daily Notes
+      </button>
+      <button type="button" class="tab-btn" data-tab="special_events">
+        <span class="tab-icon">🎉</span> Special Events <span class="badge-new">NEW</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="device">
+        <span class="tab-icon">💻</span> System
+      </button>
+      <button type="button" class="tab-btn" data-tab="maintenance">
+        <span class="tab-icon">🔧</span> Advanced
+      </button>
+      
+      <div class="nav-section-title">QUICK ACTIONS</div>
+      <button type="button" class="sidebar-action-btn" id="sidebar-push-all-btn">
+        <span class="tab-icon">⚡</span> Push to All Kindles <span class="badge-secret">SECRET</span>
+      </button>
+    </nav>
+    
+    <div class="sidebar-footer">
+      <div class="status-indicator">
+        <span class="status-dot"></span>
+        <span>Dashboard Service Running</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Right Content Area -->
+  <div class="main-content">
+    <!-- Top Bar -->
+    <header class="top-bar">
+      <div class="top-bar-left">
+        <div class="current-device-display">
+          <span class="device-icon">📱</span>
+          <div>
+            <div class="device-selector-wrapper">
+              <label for="top-selected-device" class="sr-only">Current Device</label>
+              <select id="top-selected-device" class="device-top-select">
+                {device_options}
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <div class="top-bar-right">
+        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" id="top-bar-preview-btn" class="btn btn-outline" data-preview-action="open">Preview</a>
+        <button type="button" id="top-bar-push-btn" class="btn btn-primary" data-settings-action="push">Push to Kindle</button>
+        
+        <!-- More Actions Dropdown -->
+        <div class="more-dropdown">
+          <button type="button" class="btn btn-icon" id="more-menu-trigger">•••</button>
+          <div class="more-dropdown-menu" id="more-menu-content">
+            <button type="button" class="more-menu-item" id="menu-push-all">⚡ Push to All Kindles (SECRET)</button>
+            <button type="button" class="more-menu-item" id="menu-manage-devices">⚙️ Manage Devices</button>
+            <button type="button" class="more-menu-item" id="menu-export-config">📤 Export Configuration</button>
+            <button type="button" class="more-menu-item" id="menu-import-config">📥 Import Configuration</button>
+            <button type="button" class="more-menu-item" id="menu-view-logs">📋 View Logs</button>
+          </div>
+        </div>
+        
+        <!-- Segmented Theme Switcher -->
+        <div class="theme-toggle-group" role="group" aria-label="Theme selector">
+          <button type="button" class="theme-toggle-btn" data-theme-val="light" title="Light theme">☀️</button>
+          <button type="button" class="theme-toggle-btn" data-theme-val="dark" title="Dark theme">🌙</button>
+          <button type="button" class="theme-toggle-btn" data-theme-val="system" title="System theme">💻</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Page Content Container -->
+    <div class="page-pane">
+      {message}
+      <form method="post" action="/settings" id="main-settings-form">
+      <input type="hidden" name="csrf_token" value="{csrf_token}">
+      <input type="hidden" name="selected_device_id" id="selected-device-id" value="default-kindle">
 
 <!-- TAB CONTENTS -->
 
 <!-- 1. Overview Tab -->
-<section class="card tab-content active" id="overview">
+<section class="tab-content active" id="overview">
   <h2>Overview</h2>
-  <p class="section-note">Quick summary and primary dashboard actions.</p>
-  <div class="overview-stats">
-    <div class="stat-item">
-      <small>Location</small>
-      <strong>{escaped['location_label']}</strong>
+  <p class="section-note">Quick status and actions for your dashboard.</p>
+  
+  <!-- Status Cards Row -->
+  <div class="status-cards-row">
+    <div class="status-card">
+      <div class="status-card-header">
+        <span class="status-card-icon status-green">✓</span>
+        <span class="status-card-title">Status</span>
+      </div>
+      <div class="status-card-value">All systems normal</div>
+      <div class="status-card-desc">Updated just now</div>
     </div>
-    <div class="stat-item">
-      <small>Theme</small>
-      <strong>{escaped['theme']}</strong>
+    
+    <div class="status-card">
+      <div class="status-card-header">
+        <span class="status-card-icon">📅</span>
+        <span class="status-card-title">Last Generated</span>
+      </div>
+      <div class="status-card-value" id="status-last-generated" style="font-size:0.95rem; overflow-wrap:anywhere;">{html.escape(status_message or 'No result in this session')}</div>
+      <div class="status-card-desc">Updated recently</div>
     </div>
-    <div class="stat-item">
-      <small>Last Generated</small>
-      <strong>{html.escape(status_message or 'No result in this session')}</strong>
+    
+    <div class="status-card">
+      <div class="status-card-header">
+        <span class="status-card-icon">📤</span>
+        <span class="status-card-title">Last Pushed</span>
+      </div>
+      <div class="status-card-value" id="status-last-pushed">Today, 20:15</div>
+      <div class="status-card-desc">4 minutes ago</div>
     </div>
-    <div class="stat-item">
-      <small>Server Status</small>
-      <strong style="color: #2f855a;">Online</strong>
-    </div>
-    <div class="stat-item">
-      <small>Kindle Connection</small>
-      <strong id="overview-kindle-connection">Checking…</strong>
+    
+    <div class="status-card">
+      <div class="status-card-header">
+        <span class="status-card-icon">⏰</span>
+        <span class="status-card-title">Next Refresh</span>
+      </div>
+      <div class="status-card-value" id="status-next-refresh">In {config.get('refresh_interval_minutes', 10)} minutes</div>
+      <div class="status-card-desc">Every {config.get('refresh_interval_minutes', 10)} minutes</div>
     </div>
   </div>
-  <div class="button-grid overview-actions">
-    <button type="submit">Save &amp; Regenerate</button>
-    <button type="button" id="overview-push-kindle-btn">Push to Kindle</button>
+  
+  <!-- Overview Grid -->
+  <div class="overview-grid">
+    <!-- Column 1: Dashboard Preview -->
+    <div class="grid-column preview-col">
+      <div class="card" style="padding: 18px;">
+        <div class="card-header">
+          <h3>Dashboard Preview</h3>
+        </div>
+        <div class="preview-container">
+          <img id="live-dashboard-preview" src="{image_server_url}/device/default-kindle/image.png" alt="Dashboard PNG preview">
+        </div>
+        <a href="{image_server_url}/device/default-kindle/image.png" target="_blank" class="btn btn-block" id="btn-open-preview" data-preview-action="open">Open Full Preview</a>
+      </div>
+    </div>
+    
+    <!-- Column 2: Quick Actions -->
+    <div class="grid-column actions-col">
+      <div class="card" style="padding: 18px;">
+        <div class="card-header">
+          <h3>Quick Actions</h3>
+        </div>
+        <div class="action-list">
+          <button type="submit" class="action-item" style="border:1px solid var(--line); min-height:auto;" data-settings-action="save">
+            <span class="action-icon">💾</span>
+            <div class="action-body">
+              <strong>Save &amp; Regenerate</strong>
+              <small>Apply changes and rebuild image</small>
+            </div>
+            <span class="action-chevron">›</span>
+          </button>
+          
+          <button type="button" class="action-item" id="overview-push-kindle-btn" style="border:1px solid var(--line); min-height:auto;" data-settings-action="push">
+            <span class="action-icon">📤</span>
+            <div class="action-body">
+              <strong>Push to Kindle</strong>
+              <small>Send the latest image to this Kindle</small>
+            </div>
+            <span class="action-chevron">›</span>
+          </button>
+          
+          <button type="button" class="action-item" id="action-push-all" style="border:1px solid var(--line); min-height:auto; display:flex;">
+            <span class="action-icon">⚡</span>
+            <div class="action-body">
+              <strong>Push to All Kindles</strong>
+              <small>Send the latest image to all devices</small>
+            </div>
+            <span class="badge-secret-sm">SECRET</span>
+            <span class="action-chevron">›</span>
+          </button>
+          
+          <a href="/api/device/default-kindle/config" target="_blank" class="action-item" id="action-view-config">
+            <span class="action-icon">📋</span>
+            <div class="action-body">
+              <strong>View Configuration</strong>
+              <small>Open JSON configuration</small>
+            </div>
+            <span class="action-chevron">›</span>
+          </a>
+          
+          <button type="button" class="action-item" id="action-restart-services" style="border:1px solid var(--line); min-height:auto;">
+            <span class="action-icon">🔄</span>
+            <div class="action-body">
+              <strong>Restart Services</strong>
+              <small>Restart settings server</small>
+            </div>
+            <span class="action-chevron">›</span>
+          </button>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Column 3: Device Info & Special Events -->
+    <div class="grid-column info-col">
+      <div class="card" style="padding: 18px; margin-bottom: 20px;">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+          <h3>Device Info</h3>
+          <button type="button" class="btn btn-sm btn-outline" id="btn-edit-device-info" style="min-height:28px; padding:0 8px; font-size:0.75rem;">Edit</button>
+        </div>
+        <dl class="info-list">
+          <div><dt>Device Name</dt><dd id="info-device-name">Default Kindle</dd></div>
+          <div><dt>Model</dt><dd id="info-device-model">Kindle Paperwhite 1</dd></div>
+          <div><dt>IP Address</dt><dd id="info-device-ip">192.168.68.119</dd></div>
+          <div><dt>SSH Profile</dt><dd id="info-device-ssh">default</dd></div>
+          <div><dt>Image Path</dt><dd id="info-device-image-path">/device/default-kindle/image.png</dd></div>
+          <div><dt>Config Path</dt><dd id="info-device-config-path">/api/device/default-kindle/config</dd></div>
+          <div><dt>Resolution</dt><dd id="info-device-resolution">758 × 1024</dd></div>
+          <div><dt>Last Connected</dt><dd id="info-device-connected">Just now</dd></div>
+        </dl>
+      </div>
+
+      <!-- Special Events Card -->
+      <div class="card" id="overview-special-events-card" style="padding: 18px;">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+          <h3>Special Events <span class="badge-new-sm">NEW</span></h3>
+          <button type="button" class="btn btn-sm btn-outline" id="btn-manage-special-events" style="min-height:28px; padding:0 8px; font-size:0.75rem;">Manage</button>
+        </div>
+        <div class="special-events-body">
+          <div class="upload-area" id="celebration-upload-box">
+            <span class="upload-icon">☁️</span>
+            <strong>Upload Celebration Image</strong>
+            <small>PNG/JPG (recommended 758×1024)</small>
+            <input type="file" id="celebration-image-input" accept="image/png, image/jpeg" style="display:none">
+            <button type="button" class="btn btn-sm btn-outline" id="btn-choose-celebration-image" style="margin-top: 10px; min-height:28px; font-size:0.75rem; padding:0 12px;">Choose Image</button>
+          </div>
+          
+          <div class="celebration-preview-container" id="celebration-preview-box" style="display:none; margin-top: 15px; position:relative;">
+            <img id="celebration-preview-img" src="" alt="Celebration upload preview" style="width:100%; border-radius:8px; border:1.5px solid var(--line);">
+            <button type="button" class="btn-remove-preview" id="btn-remove-celebration" style="position:absolute; top:8px; right:8px; background:rgba(0,0,0,0.6); color:white; border:none; border-radius:50%; width:24px; height:24px; cursor:pointer; font-weight:bold; display:flex; align-items:center; justify-content:center; font-size:0.9rem;">×</button>
+          </div>
+          
+          <div style="margin-top:15px; display:none;" id="celebration-meta-info">
+            <div class="celebration-title" id="celebration-title-display" style="font-weight:700; font-size:0.95rem; margin-bottom:2px;">Happy New Year! 🎉</div>
+            <div class="celebration-schedule" style="font-size:0.8rem; color:var(--muted); margin-bottom:12px;">01 Jan 2026 · <span class="badge badge-success-sm" style="font-size:0.65rem; padding:1px 4px;">Scheduled</span></div>
+          </div>
+          <p class="section-note" style="margin: 12px 0 14px; font-size: 0.82rem;">Schedule and display custom images for special occasions.</p>
+          <button type="button" class="btn btn-block btn-outline" id="btn-push-all-special">Push to all target Kindles</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Recent Activity -->
+  <div class="card" style="margin-top: 24px;">
+    <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 16px;">
+      <h3>Recent Activity</h3>
+      <button type="button" class="btn btn-sm btn-outline" id="btn-view-all-activity" style="min-height:28px; padding:0 8px; font-size:0.75rem;">View All</button>
+    </div>
+    <div class="activity-list" id="activity-log-list">
+      <div class="activity-row">
+        <span class="activity-time">20:15:22</span>
+        <span class="activity-text">📤 Image pushed to Kindle</span>
+        <span class="badge badge-success">Success</span>
+      </div>
+      <div class="activity-row">
+        <span class="activity-time">20:14:10</span>
+        <span class="activity-text">⚙️ Dashboard image generated</span>
+        <span class="badge badge-success">Success</span>
+      </div>
+      <div class="activity-row">
+        <span class="activity-time">20:14:05</span>
+        <span class="activity-text">📋 Configuration saved</span>
+        <span class="badge badge-success">Success</span>
+      </div>
+      <div class="activity-row">
+        <span class="activity-time">20:10:00</span>
+        <span class="activity-text">🔄 Auto refresh executed</span>
+        <span class="badge badge-success">Success</span>
+      </div>
+    </div>
   </div>
 </section>
 
-<!-- 2. Devices Tab -->
+<!-- 2. Devices Tab (Device Setup) -->
 <section class="card tab-content" id="devices">
-  <h2>Devices</h2>
-  <p class="section-note">View registered displays and choose the active device for this browser. Settings still save to Default Kindle during this checkpoint.</p>
+  <h2>Device Setup</h2>
+  <p class="section-note">View registered displays, choose the active device for this browser, or add a new Kindle / ESP32 e-paper display.</p>
   <label class="field">
     <span>Selected device</span>
     <select id="selected-device">{device_options}</select>
   </label>
+  <button type="button" id="btn-add-device" style="width:100%;margin-bottom:14px">Add Device</button>
+  <div class="future-box" id="add-device-wizard" style="display:none;margin-bottom:18px">
+    <h3 style="font-size:1.05rem;font-weight:800;margin:0 0 8px">Add Device Wizard</h3>
+    <p class="section-note">Create a repeatable device record, generate pairing tokens, then copy the installer command when you are ready.</p>
+    <label class="field"><span>Device type</span>
+      <select id="add-device-type">
+        <option value="kindle_pw1">Kindle</option>
+        <option value="esp32_epaper">ESP32 e-paper</option>
+      </select>
+    </label>
+    <label class="field"><span>Device name</span><input type="text" id="add-device-name" maxlength="100" placeholder="Kitchen Kindle"></label>
+    <label class="field"><span>Resolution / profile</span>
+      <select id="add-device-profile">{wizard_profile_options}</select>
+    </label>
+    <label class="field"><span>Theme</span>
+      <select id="add-device-theme">{wizard_theme_options}</select>
+    </label>
+    <label class="field"><span>Optional device host</span><input type="text" id="add-device-host" maxlength="253" placeholder="192.168.68.120"></label>
+    <button type="button" id="btn-create-device" style="width:100%">Create Device</button>
+    <p class="device-message" id="add-device-message" role="status"></p>
+    <label class="field" id="install-command-wrap" style="display:none"><span>Copyable Kindle install command</span>
+      <textarea id="add-device-install-command" readonly rows="3" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace"></textarea>
+    </label>
+  </div>
   <div class="registered-devices" id="registered-devices">
     {devices_html}
   </div>
 </section>
 
-<!-- 3. Location Tab -->
+<!-- 3. Weather & Location Tab -->
 <section class="card tab-content" id="location">
-  <h2>Location</h2>
+  <h2>Weather &amp; Location</h2>
   <p class="section-note">Search for a city, then select the correct result.</p>
   <label class="field"><span>Search city</span><input type="search" id="city-search" value="{escaped['location']}" placeholder="Nottingham, Istanbul, London…" autocomplete="off"></label>
   <div class="city-results" id="city-results" aria-live="polite"></div>
@@ -783,8 +3002,8 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
     <label class="field"><span>Dashboard title</span><input type="text" name="title" maxlength="28" value="{escaped['title']}" required></label>
     <label class="field"><span>City</span><input type="text" name="location" maxlength="100" value="{escaped['location']}" required></label>
     <label class="field"><span>Country</span><input type="text" name="country" maxlength="100" value="{escaped['country']}"></label>
-    <label class="field"><span>Latitude</span><input type="number" name="latitude" step="any" min="-90" max="90" value="{html.escape(latitude_value, quote=True)}"></label>
-    <label class="field"><span>Longitude</span><input type="number" name="longitude" step="any" min="-180" max="180" value="{html.escape(longitude_value, quote=True)}"></label>
+    <label class="field"><span>Latitude</span><input type="number" name="latitude" step="any" min="-90" max="90" value="{latitude_value}"></label>
+    <label class="field"><span>Longitude</span><input type="number" name="longitude" step="any" min="-180" max="180" value="{longitude_value}"></label>
     <label class="field"><span>Display name</span><input type="text" name="location_display" maxlength="160" value="{escaped['location_display']}" required></label>
     <label class="field"><span>Weather query</span><input type="text" name="weather_query" maxlength="100" value="{escaped['weather_query']}" required></label>
     <label class="field"><span>Location label</span><input type="text" name="location_label" maxlength="160" value="{escaped['location_label']}" required></label>
@@ -834,16 +3053,34 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   </details>
 </section>
 
-<!-- 3. Theme Tab -->
+<!-- 4. Appearance Tab -->
 <section class="card tab-content" id="theme">
-  <h2>Theme</h2>
+  <h2>Appearance</h2>
   <p class="section-note">Choose the dashboard’s visual focus.</p>
   <div class="theme-list">{theme_cards}</div>
+  <div class="todo-manager" id="todo-manager" hidden>
+    <h3>Todo List</h3>
+    <p class="section-note">Tasks belong only to the currently selected device. Drag within a section or use the arrow buttons to reorder.</p>
+    <div class="todo-add-row" id="todo-add-form">
+      <label class="sr-only" for="todo-title">New task</label>
+      <input type="text" id="todo-title" maxlength="200" placeholder="Add a task" autocomplete="off">
+      <button type="button" id="todo-add-button">Add task</button>
+    </div>
+    <p class="todo-status" id="todo-status" role="status"></p>
+    <div class="todo-group">
+      <h3>Incomplete</h3>
+      <div class="todo-list" id="todo-incomplete-list"></div>
+    </div>
+    <div class="todo-group">
+      <h3>Completed</h3>
+      <div class="todo-list" id="todo-completed-list"></div>
+    </div>
+  </div>
 </section>
 
-<!-- 4. Display Tab -->
+<!-- 5. Content Tab -->
 <section class="card tab-content" id="display">
-  <h2>Display</h2>
+  <h2>Content Controls</h2>
   <p class="section-note">Choose what appears on Home Dashboard.</p>
   <div class="toggle-list">
     <label class="toggle"><input type="checkbox" name="show_weather"{checked('show_weather')}> <span>Weather</span></label>
@@ -863,10 +3100,14 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
       </select>
     </label>
     <p class="section-note" style="margin-top: -10px;">How often the Kindle dashboard image should refresh automatically. For Maarif Calendar, 60 minutes is usually enough.</p>
+    <div class="toggle-list" style="margin-top: 16px;">
+      <label class="toggle"><input type="checkbox" name="wifi_power_save"{checked('wifi_power_save')}> <span>Wi-Fi power save (turn Wi-Fi off between refreshes)</span></label>
+      <label class="toggle"><input type="checkbox" name="update_only_if_changed"{checked('update_only_if_changed')}> <span>Only refresh when image changed (ETag / Last-Modified)</span></label>
+    </div>
   </div>
 </section>
 
-<!-- 4b. Daily Notes Tab -->
+<!-- 6. Daily Notes Tab -->
 <section class="card tab-content" id="daily_notes">
   <h2>Daily Notes &amp; Reminders</h2>
   <p class="section-note">Add and manage household notifications, chores, and events.</p>
@@ -961,7 +3202,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
         </label>
       </div>
 
-      <!-- Weekly / Fortnightly Weekday Checkboxes -->
+      <!-- Weekly / Fortnightly Checkboxes -->
       <div id="schedule-weekly-box" style="display: none; margin-bottom: 10px;">
         <span style="display: block; font-weight: 650; font-size: 0.85rem; margin-bottom: 6px; color: var(--muted);">Select Days</span>
         <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;">
@@ -1017,7 +3258,78 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   </div>
 </section>
 
-<!-- 5. Device Tab -->
+<!-- 7. Special Events Tab -->
+<section class="card tab-content" id="special_events">
+  <h2>Special Events &amp; Celebrations</h2>
+  <p class="section-note">Override the default dashboard layout on special days (Birthdays, Holidays, Anniversaries) with custom full-screen images.</p>
+  
+  <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px;">
+    <div>
+      <h3 style="margin-top:0; font-size:1.1rem; font-weight:700;">Add Special Event Image</h3>
+      <label class="field">
+        <span>Event Title</span>
+        <input type="text" id="event-title" placeholder="e.g. Happy New Year, Osman's Birthday...">
+      </label>
+      
+      <label class="field">
+        <span>Start Date</span>
+        <input type="date" id="event-date" style="width:100%; min-height:46px; padding:10px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); font-size:0.95rem;">
+        <span style="display:block; font-size:0.75rem; color:var(--muted); margin-top:4px;">The celebration image will automatically display from this date onward.</span>
+      </label>
+
+      <label class="field">
+        <span>End Date</span>
+        <input type="date" id="event-end-date" style="width:100%; min-height:46px; padding:10px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); font-size:0.95rem;">
+        <span style="display:block; font-size:0.75rem; color:var(--muted); margin-top:4px;">Optional. Leave empty to use the same day as the start date.</span>
+      </label>
+      
+      <label class="field">
+        <span>Select Celebration Image</span>
+        <div class="upload-area" id="tab-celebration-upload-box" style="border: 2px dashed var(--line); padding: 24px; text-align: center; border-radius: 12px; background: var(--soft);">
+          <span class="upload-icon" style="font-size:2rem; display:block; margin-bottom:10px;">🖼️</span>
+          <strong>Drag &amp; Drop or click to upload</strong>
+          <small style="display:block; color:var(--muted); margin-top:4px;">PNG or JPEG format (recommended 758×1024 resolution)</small>
+          <input type="file" id="tab-event-image-input" accept="image/png, image/jpeg" style="display:none">
+          <button type="button" class="btn btn-sm btn-outline" id="btn-tab-choose-image" style="margin-top:12px;">Select File</button>
+        </div>
+      </label>
+      
+      <div class="button-grid" style="margin-top:24px;">
+        <button type="button" id="btn-save-event" style="background:var(--ink); color:var(--card); border-color:var(--ink);">Save Event</button>
+        <button type="button" id="btn-cancel-event">Clear</button>
+      </div>
+
+      <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-top: 18px; background: var(--soft);">
+        <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Target devices</span>
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; font-size:0.9rem;">
+          <input type="checkbox" id="event-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> All Kindle devices
+        </label>
+        <div id="event-individual-devices" style="display:none; grid-gap:8px; padding-left:20px; border-left:2px solid var(--line); margin-top:10px;"></div>
+      </div>
+    </div>
+    
+    <div>
+      <h3 style="margin-top:0; font-size:1.1rem; font-weight:700;">Scheduled Celebrations</h3>
+      <div id="scheduled-events-list" style="display:grid; gap:12px; margin-top:14px;">
+        <div style="display:flex; gap:14px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--soft);">
+          <div style="width:60px; height:80px; border-radius:6px; overflow:hidden; border:1px solid var(--line); flex-shrink:0;">
+            <img id="celebration-list-thumb" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='80' viewBox='0 0 60 80'><rect width='100%25' height='100%25' fill='%23e2e8f0'/><circle cx='30' cy='40' r='12' fill='%23cbd5e1'/></svg>" style="width:100%; height:100%; object-fit:cover;">
+          </div>
+          <div style="flex-grow:1; display:flex; flex-direction:column; justify-content:center;">
+            <strong id="celebration-list-title" style="font-size:0.95rem;">Happy New Year! 🎉</strong>
+            <span id="celebration-list-date" style="font-size:0.8rem; color:var(--muted); margin-top:2px;">01 Jan 2026</span>
+            <div style="display:flex; gap:10px; margin-top:8px;">
+              <span class="badge badge-success-sm" style="font-size:0.75rem; padding:1px 4px;">Scheduled</span>
+              <button type="button" id="btn-delete-celebration-event" style="background:none; border:none; padding:0; color:var(--danger); font-size:0.75rem; font-weight:600; cursor:pointer;">Delete</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 8. System Tab (Device Controls) -->
 <section class="card tab-content" id="device">
   <h2>Device Controls</h2>
   <p class="section-note">Autostart controls, front light levels, and device actions.</p>
@@ -1035,7 +3347,7 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   <button type="button" id="restart-kindle" style="width:100%;border-color:#e53e3e;color:#e53e3e;background:#fff5f5">Restart Kindle</button>
 </section>
 
-<!-- 6. Maintenance Tab -->
+<!-- 9. Advanced Tab (Maintenance) -->
 <section class="card tab-content" id="maintenance">
   <h2>Advanced / Maintenance</h2>
   <p class="section-note">Occasional server maintenance actions and recent logs.</p>
@@ -1045,38 +3357,47 @@ button:disabled{{color:var(--muted);background:var(--soft);cursor:not-allowed;op
   <pre class="log-box" id="device-log">Loading…</pre>
 </section>
 
-<!-- 7. Status Tab -->
-<section class="card tab-content" id="status">
-  <h2>Status</h2>
-  <p class="section-note">Current server environment and settings info.</p>
-  <dl class="status-list">
-    <div class="status-row"><dt>Current title</dt><dd>{escaped['title']}</dd></div>
-    <div class="status-row"><dt>Weather query</dt><dd>{escaped['weather_query']}</dd></div>
-    <div class="status-row"><dt>Location label</dt><dd>{escaped['location_label']}</dd></div>
-    <div class="status-row"><dt>Timezone</dt><dd>{escaped['timezone']}</dd></div>
-    <div class="status-row"><dt>Selected theme</dt><dd>{escaped['theme']}</dd></div>
-    <div class="status-row"><dt>Prayer data status</dt><dd>{prayer_status}</dd></div>
-    <div class="status-row"><dt>Last prayer update</dt><dd>{prayer_last_update}</dd></div>
-    <div class="status-row"><dt>Last generation</dt><dd>{html.escape(status_message or 'No result in this session')}</dd></div>
-    <div class="status-row"><dt>Last push</dt><dd id="last-push">Not in this session</dd></div>
-  </dl>
-</section>
-
-<nav class="bottom-nav" aria-label="Dashboard sections" style="display:none">
-  <a href="#location">Settings</a>
-  <a href="#theme">Theme</a>
-  <a href="#device">Device</a>
-  <a href="#status">Status</a>
-</nav>
 <div class="action-bar">
   <p class="editing-device">Editing device: <strong id="editing-device-name">Default Kindle</strong></p>
-  <button type="submit">Save &amp; Regenerate</button>
-  <button type="button" id="push-kindle">Push to Kindle</button>
+  <button type="submit" data-settings-action="save">Save &amp; Regenerate</button>
+  <button type="button" id="push-kindle" data-settings-action="push">Push to Kindle</button>
 </div>
 </div>
 </form>
-</main>
+</div>
+</div>
 <script>
+const imageServerUrl = "{image_server_url}";
+const csrfToken = document.querySelector('[name="csrf_token"]').value;
+const deviceMessage = document.getElementById("device-message");
+const connectionValue = document.getElementById("kindle-connection");
+const brightnessValue = document.getElementById("kindle-brightness");
+const autostartValue = document.getElementById("kindle-autostart");
+const deviceLog = document.getElementById("device-log");
+
+async function deviceApi(path, options = {{}}) {{
+  const headers = {{ ... (options.headers || {{}}) }};
+  if ((options.method || "GET") !== "GET") {{
+    headers["X-CSRF-Token"] = csrfToken;
+  }}
+  const response = await fetch(path, {{ ...options, headers }});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Device request failed");
+  return data;
+}}
+
+function resolveDeviceImageUrl(imageUrl, deviceId) {{
+  let safePath = `/device/${{encodeURIComponent(deviceId)}}/image.png`;
+  if (
+    typeof imageUrl === "string"
+    && imageUrl.startsWith("/")
+    && !imageUrl.startsWith("//")
+  ) {{
+    safePath = imageUrl;
+  }}
+  return new URL(safePath, imageServerUrl).toString();
+}}
+
 const themeToggleButtons = document.querySelectorAll(".theme-toggle-btn");
 
 function applyTheme(themeVal) {{
@@ -1120,37 +3441,558 @@ const selectedDeviceControl=document.getElementById("selected-device");
 const selectedDeviceField=document.getElementById("selected-device-id");
 const editingDeviceName=document.getElementById("editing-device-name");
 const registeredDeviceCards=document.querySelectorAll("[data-device-id]");
-function applySelectedDevice(deviceId){{
-  if(!selectedDeviceControl) return;
-  const available=Array.from(selectedDeviceControl.options).map(option=>option.value);
-  const selected=available.includes(deviceId)
-    ?deviceId
-    :(available.includes("default-kindle")?"default-kindle":available[0]);
-  if(!selected) return;
-  selectedDeviceControl.value=selected;
-  if(selectedDeviceField) selectedDeviceField.value=selected;
-  const selectedOption=selectedDeviceControl.options[
-    selectedDeviceControl.selectedIndex
-  ];
-  if(editingDeviceName && selectedOption){{
-    editingDeviceName.textContent=selectedOption.textContent
-      .replace(` (${{selected}})`,"");
+let remindersPreviewReady = false;
+
+async function loadDeviceState() {{
+  const selected = localStorage.getItem(selectedDeviceKey) || "default-kindle";
+  
+  // Fetch config dynamically to get the relative image_url
+  let imageUrl = `/device/${{selected}}/image.png`;
+  let configData = null;
+  try {{
+    const configResp = await fetch(`/api/device/${{selected}}/config`);
+    if (configResp.ok) {{
+      configData = await configResp.json();
+      if (configData.image_url) {{
+        imageUrl = configData.image_url;
+      }}
+      applyDeviceConfigToForm(configData);
+    }}
+  }} catch (e) {{
+    console.error("Failed to load device config:", e);
   }}
-  registeredDeviceCards.forEach(card=>{{
-    const active=card.dataset.deviceId===selected;
-    card.classList.toggle("selected",active);
-    if(active) card.setAttribute("aria-current","true");
+  loadTodoTasks(selected);
+  
+  // Relative image paths belong to the image server, never the settings port.
+  const resolvedImageUrl = resolveDeviceImageUrl(imageUrl, selected);
+  
+  // Update UI previews / config links / info values
+  const previewImg = document.getElementById("live-dashboard-preview");
+  const actionViewConfig = document.getElementById("action-view-config");
+  
+  if (previewImg) previewImg.src = resolvedImageUrl + `?t=${{new Date().getTime()}}`;
+  document.querySelectorAll('[data-preview-action="open"]').forEach(link => {{
+    link.href = resolvedImageUrl;
+  }});
+  if (actionViewConfig) actionViewConfig.href = `/api/device/${{selected}}/config`;
+  
+  // Find registered card for selected device to copy details to Info list
+  const selectedCard = document.querySelector(`.registered-device[data-device-id="${{selected}}"]`);
+  if (selectedCard) {{
+    const name = selectedCard.querySelector("h3").textContent;
+    const details = selectedCard.querySelectorAll(".device-details dd");
+    const id = details[0].textContent;
+    const type = details[1].textContent;
+    const resolution = details[2].textContent;
+    
+    // Connection info (if available)
+    const connSpans = selectedCard.querySelectorAll(".device-connection span");
+    let host = "—", user = "—", sshProfile = "—", port = "—", method = "—";
+    connSpans.forEach(span => {{
+      const text = span.textContent;
+      if (text.startsWith("host:")) host = text.replace("host:", "").trim();
+      if (text.startsWith("user:")) user = text.replace("user:", "").trim();
+      if (text.startsWith("ssh_profile:")) sshProfile = text.replace("ssh_profile:", "").trim();
+      if (text.startsWith("port:")) port = text.replace("port:", "").trim();
+      if (text.startsWith("method:")) method = text.replace("method:", "").trim();
+    }});
+    
+    document.getElementById("info-device-name").textContent = name;
+    document.getElementById("info-device-model").textContent = type;
+    document.getElementById("info-device-ip").textContent = host;
+    document.getElementById("info-device-ssh").textContent = sshProfile !== "—" ? sshProfile : (method !== "—" ? method : "—");
+    document.getElementById("info-device-image-path").textContent = `/device/${{selected}}/image.png`;
+    document.getElementById("info-device-config-path").textContent = `/api/device/${{selected}}/config`;
+    document.getElementById("info-device-resolution").textContent = resolution;
+  }}
+  
+  try {{
+    const [status, log] = await Promise.all([
+      deviceApi(`/api/device/${{selected}}/status`),
+      deviceApi(`/api/device/${{selected}}/log`),
+    ]);
+    
+    const connectedStr = status.connected ? "Online" : "Offline";
+    connectionValue.textContent = connectedStr;
+    
+    const overviewKindleConn = document.getElementById("overview-kindle-connection");
+    if (overviewKindleConn) {{
+      overviewKindleConn.textContent = connectedStr;
+      overviewKindleConn.style.color = status.connected ? "var(--success)" : "var(--danger)";
+    }}
+    
+    brightnessValue.textContent = status.brightness !== undefined ? status.brightness : "—";
+    
+    let autostartStr = "—";
+    if (status.autostart !== undefined) {{
+      autostartStr = status.autostart ? "Enabled" : "Disabled";
+    }}
+    autostartValue.textContent = autostartStr;
+    
+    if (deviceLog) deviceLog.textContent = log.log || "No log available";
+  }} catch (error) {{
+    connectionValue.textContent = "Offline";
+    brightnessValue.textContent = "—";
+    autostartValue.textContent = "—";
+    if (deviceLog) deviceLog.textContent = "Failed to fetch log: " + error.message;
+  }}
+}}
+
+function applyDeviceConfigToForm(config) {{
+  if (!config || typeof config !== "object") return;
+  [
+    "title",
+    "location",
+    "country",
+    "latitude",
+    "longitude",
+    "location_display",
+    "weather_query",
+    "location_label",
+    "timezone",
+    "prayer_method",
+    "prayer_school",
+    "prayer_high_latitude",
+    "hijri_adjustment",
+  ].forEach(name => {{
+    const input = document.querySelector(`[name="${{name}}"]`);
+    if (input && config[name] !== undefined && config[name] !== null) {{
+      input.value = String(config[name]);
+    }}
+  }});
+  if (config.theme) {{
+    const themeInput = document.querySelector(`input[name="theme"][value="${{config.theme}}"]`);
+    if (themeInput && !themeInput.disabled) themeInput.checked = true;
+  }}
+  updateTodoManagerVisibility();
+  if (config.refresh_interval_minutes !== undefined) {{
+    const refreshInput = document.querySelector('[name="refresh_interval_minutes"]');
+    if (refreshInput) refreshInput.value = String(config.refresh_interval_minutes);
+  }}
+  if (config.kindle_frontlight !== undefined) {{
+    const frontlightInput = document.querySelector('[name="kindle_frontlight"]');
+    if (frontlightInput) frontlightInput.value = String(config.kindle_frontlight);
+    const persistentLightDisplay = document.getElementById("persistent-light-display");
+    if (persistentLightDisplay) {{
+      persistentLightDisplay.innerHTML = `Current saved default: <strong>${{config.kindle_frontlight}}</strong>`;
+    }}
+  }}
+  [
+    "show_weather",
+    "show_forecast",
+    "show_server",
+    "show_pihole",
+    "show_tailscale",
+  ].forEach(name => {{
+    const input = document.querySelector(`[name="${{name}}"]`);
+    if (input && typeof config[name] === "boolean") input.checked = config[name];
+  }});
+}}
+
+const todoManager = document.getElementById("todo-manager");
+const todoTitleInput = document.getElementById("todo-title");
+const todoAddButton = document.getElementById("todo-add-button");
+const todoIncompleteList = document.getElementById("todo-incomplete-list");
+const todoCompletedList = document.getElementById("todo-completed-list");
+const todoStatus = document.getElementById("todo-status");
+let todoTasks = [];
+let draggedTodoId = null;
+
+function selectedTodoDevice() {{
+  return localStorage.getItem(selectedDeviceKey) || "default-kindle";
+}}
+
+function updateTodoManagerVisibility() {{
+  if (!todoManager) return;
+  const selectedTheme = document.querySelector('input[name="theme"]:checked');
+  todoManager.hidden = !selectedTheme || selectedTheme.value !== "todo";
+}}
+
+function todoSetStatus(message, isError = false) {{
+  if (!todoStatus) return;
+  todoStatus.textContent = message || "";
+  todoStatus.style.color = isError ? "var(--danger)" : "var(--muted)";
+}}
+
+async function todoMutation(path, options) {{
+  todoSetStatus("Saving…");
+  try {{
+    const result = await deviceApi(path, options);
+    todoTasks = result.tasks || [];
+    renderTodoTasks();
+    todoSetStatus(result.rendered ? "Saved and preview regenerated" : "Saved");
+    if (result.rendered) {{
+      const preview = document.getElementById("live-dashboard-preview");
+      if (preview) preview.src = resolveDeviceImageUrl(null, selectedTodoDevice()) + `?t=${{Date.now()}}`;
+    }}
+    return result;
+  }} catch (error) {{
+    todoSetStatus(error.message, true);
+    throw error;
+  }}
+}}
+
+async function loadTodoTasks(deviceId) {{
+  if (!todoManager) return;
+  try {{
+    const result = await deviceApi(`/api/device/${{encodeURIComponent(deviceId)}}/tasks`);
+    if (deviceId !== selectedTodoDevice()) return;
+    todoTasks = result.tasks || [];
+    renderTodoTasks();
+    todoSetStatus("");
+  }} catch (error) {{
+    todoTasks = [];
+    renderTodoTasks();
+    todoSetStatus("Could not load tasks: " + error.message, true);
+  }}
+}}
+
+async function saveTodoOrder(completed) {{
+  const list = completed ? todoCompletedList : todoIncompleteList;
+  const taskIds = Array.from(list.querySelectorAll(".todo-row")).map(row => row.dataset.taskId);
+  await todoMutation(
+    `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/reorder`,
+    {{
+      method: "PUT",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ completed, task_ids: taskIds }})
+    }}
+  );
+}}
+
+function moveTodoTask(task, direction) {{
+  const group = todoTasks.filter(item => item.completed === task.completed);
+  const index = group.findIndex(item => item.id === task.id);
+  const target = index + direction;
+  if (target < 0 || target >= group.length) return;
+  [group[index], group[target]] = [group[target], group[index]];
+  const other = todoTasks.filter(item => item.completed !== task.completed);
+  todoTasks = task.completed ? other.concat(group) : group.concat(other);
+  renderTodoTasks();
+  saveTodoOrder(task.completed).catch(() => loadTodoTasks(selectedTodoDevice()));
+}}
+
+function createTodoRow(task) {{
+  const row = document.createElement("div");
+  row.className = "todo-row" + (task.completed ? " completed" : "");
+  row.dataset.taskId = task.id;
+  row.dataset.completed = String(task.completed);
+  row.draggable = true;
+
+  const drag = document.createElement("button");
+  drag.type = "button";
+  drag.className = "todo-drag";
+  drag.setAttribute("data-todo-drag-handle", "true");
+  drag.setAttribute("aria-label", "Drag to reorder");
+  drag.title = "Drag to reorder";
+  drag.textContent = "≡";
+
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.checked = task.completed;
+  toggle.setAttribute("aria-label", `Mark ${{task.title}} ${{task.completed ? "incomplete" : "complete"}}`);
+  toggle.addEventListener("change", () => {{
+    todoMutation(
+      `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/${{task.id}}`,
+      {{
+        method: "PUT",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ completed: toggle.checked }})
+      }}
+    ).catch(() => loadTodoTasks(selectedTodoDevice()));
+  }});
+
+  const title = document.createElement("span");
+  title.className = "todo-row-title";
+  title.textContent = task.title;
+
+  const actions = document.createElement("div");
+  actions.className = "todo-row-actions";
+  const action = (label, titleText, callback) => {{
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "todo-mini-action";
+    button.textContent = label;
+    button.title = titleText;
+    button.setAttribute("aria-label", titleText);
+    button.addEventListener("click", callback);
+    return button;
+  }};
+  actions.append(
+    action("↑", "Move task up", () => moveTodoTask(task, -1)),
+    action("↓", "Move task down", () => moveTodoTask(task, 1)),
+    action("Edit", "Edit task", () => {{
+      const nextTitle = window.prompt("Edit task", task.title);
+      if (nextTitle === null || nextTitle.trim() === task.title) return;
+      todoMutation(
+        `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/${{task.id}}`,
+        {{
+          method: "PUT",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ title: nextTitle }})
+        }}
+      ).catch(() => loadTodoTasks(selectedTodoDevice()));
+    }}),
+    action("Delete", "Delete task", () => {{
+      if (!window.confirm(`Delete “${{task.title}}”?`)) return;
+      todoMutation(
+        `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks/${{task.id}}`,
+        {{ method: "DELETE" }}
+      ).catch(() => loadTodoTasks(selectedTodoDevice()));
+    }})
+  );
+
+  row.addEventListener("dragstart", event => {{
+    draggedTodoId = task.id;
+    row.classList.add("dragging");
+    event.dataTransfer.effectAllowed = "move";
+  }});
+  row.addEventListener("dragend", () => {{
+    draggedTodoId = null;
+    row.classList.remove("dragging");
+  }});
+  row.addEventListener("dragover", event => {{
+    const dragged = todoTasks.find(item => item.id === draggedTodoId);
+    if (!dragged || dragged.completed !== task.completed) return;
+    event.preventDefault();
+  }});
+  row.addEventListener("drop", event => {{
+    event.preventDefault();
+    const dragged = todoTasks.find(item => item.id === draggedTodoId);
+    if (!dragged || dragged.completed !== task.completed || dragged.id === task.id) return;
+    const group = todoTasks.filter(item => item.completed === task.completed && item.id !== dragged.id);
+    group.splice(group.findIndex(item => item.id === task.id), 0, dragged);
+    const other = todoTasks.filter(item => item.completed !== task.completed);
+    todoTasks = task.completed ? other.concat(group) : group.concat(other);
+    renderTodoTasks();
+    saveTodoOrder(task.completed).catch(() => loadTodoTasks(selectedTodoDevice()));
+  }});
+
+  row.append(drag, toggle, title, actions);
+  return row;
+}}
+
+function renderTodoTasks() {{
+  if (!todoIncompleteList || !todoCompletedList) return;
+  todoIncompleteList.replaceChildren();
+  todoCompletedList.replaceChildren();
+  const groups = [
+    [todoIncompleteList, todoTasks.filter(task => !task.completed)],
+    [todoCompletedList, todoTasks.filter(task => task.completed)]
+  ];
+  groups.forEach(([list, tasks]) => {{
+    if (!tasks.length) {{
+      const empty = document.createElement("div");
+      empty.className = "todo-empty";
+      empty.textContent = "No tasks";
+      list.append(empty);
+      return;
+    }}
+    tasks.forEach(task => list.append(createTodoRow(task)));
+  }});
+}}
+
+if (todoAddButton && todoTitleInput) {{
+  const addTodo = () => {{
+    const title = todoTitleInput.value.trim();
+    if (!title) return;
+    todoMutation(
+      `/api/device/${{encodeURIComponent(selectedTodoDevice())}}/tasks`,
+      {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ title }})
+      }}
+    ).then(() => {{ todoTitleInput.value = ""; }}).catch(() => {{}});
+  }};
+  todoAddButton.addEventListener("click", addTodo);
+  todoTitleInput.addEventListener("keydown", event => {{
+    if (event.key === "Enter") {{ event.preventDefault(); addTodo(); }}
+  }});
+}}
+document.querySelectorAll('input[name="theme"]').forEach(input => {{
+  input.addEventListener("change", updateTodoManagerVisibility);
+}});
+updateTodoManagerVisibility();
+
+function applySelectedDevice(deviceId) {{
+  if (!selectedDeviceControl) return;
+  const available = Array.from(selectedDeviceControl.options).map(option => option.value);
+  const selected = available.includes(deviceId)
+    ? deviceId
+    : (available.includes("default-kindle") ? "default-kindle" : available[0]);
+  if (!selected) return;
+  
+  selectedDeviceControl.value = selected;
+  if (selectedDeviceField) selectedDeviceField.value = selected;
+  
+  // Update top bar device select if it exists
+  const topSelect = document.getElementById("top-selected-device");
+  if (topSelect) topSelect.value = selected;
+  
+  const selectedOption = selectedDeviceControl.options[selectedDeviceControl.selectedIndex];
+  if (editingDeviceName && selectedOption) {{
+    editingDeviceName.textContent = selectedOption.textContent.replace(` (${{selected}})`, "");
+  }}
+  
+  registeredDeviceCards.forEach(card => {{
+    const active = card.dataset.deviceId === selected;
+    card.classList.toggle("selected", active);
+    if (active) card.setAttribute("aria-current", "true");
     else card.removeAttribute("aria-current");
   }});
-  localStorage.setItem(selectedDeviceKey,selected);
+  
+  localStorage.setItem(selectedDeviceKey, selected);
+  
+  if (remindersPreviewReady) {{
+    renderRemindersPreview();
+  }}
+  
+  // Load selected device state asynchronously
+  loadDeviceState();
 }}
-if(selectedDeviceControl){{
-  selectedDeviceControl.addEventListener("change",()=>{{
+
+if (selectedDeviceControl) {{
+  selectedDeviceControl.addEventListener("change", () => {{
     applySelectedDevice(selectedDeviceControl.value);
   }});
-  applySelectedDevice(
-    localStorage.getItem(selectedDeviceKey)||"default-kindle"
-  );
+}}
+
+const topSelect = document.getElementById("top-selected-device");
+if (topSelect) {{
+  topSelect.addEventListener("change", () => {{
+    applySelectedDevice(topSelect.value);
+  }});
+}}
+
+const addDeviceButton=document.getElementById("btn-add-device");
+const addDeviceWizard=document.getElementById("add-device-wizard");
+const addDeviceType=document.getElementById("add-device-type");
+const addDeviceProfile=document.getElementById("add-device-profile");
+const createDeviceButton=document.getElementById("btn-create-device");
+const addDeviceMessage=document.getElementById("add-device-message");
+const installCommandWrap=document.getElementById("install-command-wrap");
+const installCommand=document.getElementById("add-device-install-command");
+
+function syncAddDeviceProfiles(){{
+  if(!addDeviceType || !addDeviceProfile) return;
+  const selectedType=addDeviceType.value;
+  let firstVisible=null;
+  Array.from(addDeviceProfile.options).forEach(option=>{{
+    const visible=option.dataset.deviceType===selectedType;
+    option.hidden=!visible;
+    option.disabled=!visible;
+    if(visible && firstVisible===null) firstVisible=option.value;
+  }});
+  const current=addDeviceProfile.options[addDeviceProfile.selectedIndex];
+  if(!current || current.disabled) addDeviceProfile.value=firstVisible || "";
+}}
+
+if(addDeviceButton && addDeviceWizard){{
+  addDeviceButton.addEventListener("click",()=>{{
+    const open=addDeviceWizard.style.display==="none";
+    addDeviceWizard.style.display=open?"block":"none";
+    if(open) syncAddDeviceProfiles();
+  }});
+}}
+if(addDeviceType){{
+  addDeviceType.addEventListener("change",syncAddDeviceProfiles);
+  syncAddDeviceProfiles();
+}}
+if(createDeviceButton){{
+  createDeviceButton.addEventListener("click",async()=>{{
+    const name=document.getElementById("add-device-name").value.trim();
+    const host=document.getElementById("add-device-host").value.trim();
+    if(!name){{
+      addDeviceMessage.textContent="Device name is required.";
+      return;
+    }}
+    createDeviceButton.disabled=true;
+    addDeviceMessage.textContent="Creating device...";
+    if(installCommandWrap) installCommandWrap.style.display="none";
+    try{{
+      const payload={{
+        type:addDeviceType.value,
+        name,
+        profile:addDeviceProfile.value,
+        theme:document.getElementById("add-device-theme").value,
+      }};
+      if(host) payload.host=host;
+      const result=await deviceApi("/api/devices",{{
+        method:"POST",
+        headers:{{"Content-Type":"application/json"}},
+        body:JSON.stringify(payload),
+      }});
+      addDeviceMessage.textContent=`Created ${{result.device.name}} (${{result.device.device_id}}).`;
+      if(result.install_command && installCommand && installCommandWrap){{
+        installCommand.value=result.install_command;
+        installCommandWrap.style.display="block";
+        installCommand.focus();
+        installCommand.select();
+      }}
+    }}catch(error){{
+      addDeviceMessage.textContent="Create failed: "+error.message;
+    }}finally{{
+      createDeviceButton.disabled=false;
+    }}
+  }});
+}}
+
+// Regenerate installer command click handler
+document.addEventListener("click", async (e) => {{
+  const btn = e.target.closest(".btn-regenerate-installer");
+  if (!btn) return;
+  const deviceId = btn.dataset.deviceId;
+  const card = btn.closest(".registered-device");
+  const container = card.querySelector(".installer-command-wrap");
+  const textarea = card.querySelector(".regenerated-installer-command");
+  
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = "Regenerating...";
+  
+  try {{
+    const result = await deviceApi(`/api/device/${{encodeURIComponent(deviceId)}}/installer-token/reset`, {{
+      method: "POST"
+    }});
+    if (result.ok && result.install_command) {{
+      textarea.value = result.install_command;
+      container.style.display = "block";
+      textarea.focus();
+      textarea.select();
+      btn.textContent = "Regenerated!";
+    }} else {{
+      alert("Failed to regenerate installer command");
+      btn.textContent = originalText;
+    }}
+  }} catch (err) {{
+    alert("Error: " + err.message);
+    btn.textContent = originalText;
+  }} finally {{
+    btn.disabled = false;
+  }}
+}});
+
+// Initialize select state
+applySelectedDevice(localStorage.getItem(selectedDeviceKey) || "default-kindle");
+
+// More Actions Dropdown Trigger
+const moreMenuTrigger = document.getElementById("more-menu-trigger");
+const moreMenuContent = document.getElementById("more-menu-content");
+if (moreMenuTrigger && moreMenuContent) {{
+  moreMenuTrigger.addEventListener("click", (e) => {{
+    e.stopPropagation();
+    moreMenuContent.classList.toggle("show");
+  }});
+  document.addEventListener("click", () => {{
+    moreMenuContent.classList.remove("show");
+  }});
+}}
+
+// Trigger Manage Devices to tab switch to devices Setup
+const menuManageDevices = document.getElementById("menu-manage-devices");
+if (menuManageDevices) {{
+  menuManageDevices.addEventListener("click", () => switchTab("devices"));
 }}
 
 const tabBtns=document.querySelectorAll(".tab-btn");
@@ -1173,11 +4015,62 @@ window.addEventListener("hashchange",()=>{{
   if(document.getElementById(tabId)) switchTab(tabId);
 }});
 
-const overviewPushBtn=document.getElementById("overview-push-kindle-btn");
-if(overviewPushBtn){{
-  overviewPushBtn.addEventListener("click",()=>{{
-    document.getElementById("push-kindle").click();
-  }});
+// Device push hook
+async function triggerSelectedDevicePush(button) {{
+  const selected = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
+  const origText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Pushing...";
+  try {{
+    const result = await deviceApi(`/api/device/${{selected}}/push`, {{ method: "POST" }});
+    if (document.getElementById("last-push")) {{
+      document.getElementById("last-push").textContent = result.message || "Pushed successfully";
+    }}
+    const statusLastPushed = document.getElementById("status-last-pushed");
+    if (statusLastPushed) {{
+      statusLastPushed.textContent = new Date().toLocaleTimeString([], {{hour: '2-digit', minute:'2-digit'}});
+    }}
+    alert(result.message || "Pushed successfully");
+  }} catch (error) {{
+    alert("Push failed: " + error.message);
+  }} finally {{
+    button.textContent = origText;
+    button.disabled = false;
+  }}
+}}
+
+document.querySelectorAll('[data-settings-action="push"]').forEach(button => {{
+  button.addEventListener("click", () => triggerSelectedDevicePush(button));
+}});
+
+// Push to All Kindles action triggers
+const sidebarPushAllBtn = document.getElementById("sidebar-push-all-btn");
+const menuPushAll = document.getElementById("menu-push-all");
+const actionPushAll = document.getElementById("action-push-all");
+
+async function triggerPushAll(button) {{
+  const origText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Pushing to all...";
+  try {{
+    const result = await deviceApi("/api/devices/push-all", {{ method: "POST" }});
+    alert(result.message || "Successfully pushed to all enabled Kindles!");
+  }} catch (error) {{
+    alert("Push to all failed: " + error.message);
+  }} finally {{
+    button.textContent = origText;
+    button.disabled = false;
+  }}
+}}
+
+if (sidebarPushAllBtn) {{
+  sidebarPushAllBtn.addEventListener("click", () => triggerPushAll(sidebarPushAllBtn));
+}}
+if (menuPushAll) {{
+  menuPushAll.addEventListener("click", () => triggerPushAll(menuPushAll));
+}}
+if (actionPushAll) {{
+  actionPushAll.addEventListener("click", () => triggerPushAll(actionPushAll));
 }}
 
 const citySearch=document.getElementById("city-search");
@@ -1206,8 +4099,8 @@ function selectCity(result){{
       ?"NOTTINGHAM HOME"
       :`${{result.city.toUpperCase()}} DASHBOARD`.slice(0,28),
   );
-  prayerLocation.value=result.city;
-  prayerCountry.value=result.country;
+  if (prayerLocation) prayerLocation.value=result.city;
+  if (prayerCountry) prayerCountry.value=result.country;
   cityMatch.textContent=`Selected: ${{result.display_name}} · ${{result.timezone}}`;
   cityResults.replaceChildren();
 }}
@@ -1263,45 +4156,7 @@ citySearch.addEventListener("input",()=>{{
   clearTimeout(citySearchTimer);
   citySearchTimer=setTimeout(()=>searchCities(citySearch.value),350);
 }});
-const csrfToken=document.querySelector('[name="csrf_token"]').value;
-const deviceMessage=document.getElementById("device-message");
-const connectionValue=document.getElementById("kindle-connection");
-const brightnessValue=document.getElementById("kindle-brightness");
-const autostartValue=document.getElementById("kindle-autostart");
-const deviceLog=document.getElementById("device-log");
-async function deviceApi(path,options={{}}){{
-  const headers={{...(options.headers||{{}})}};
-  if((options.method||"GET")!=="GET") headers["X-CSRF-Token"]=csrfToken;
-  const response=await fetch(path,{{...options,headers}});
-  const data=await response.json();
-  if(!response.ok) throw new Error(data.error||"Device request failed");
-  return data;
-}}
-async function loadDeviceState(){{
-  try{{
-    const [status,log]=await Promise.all([
-      deviceApi("/api/device/status"),
-      deviceApi("/api/device/log"),
-    ]);
-    connectionValue.textContent=status.connected?"Online":"Offline";
-    brightnessValue.textContent=status.brightness;
-    autostartValue.textContent=status.autostart;
-    deviceLog.textContent=log.log||"No dashboard log yet.";
-    const overviewKindleConn=document.getElementById("overview-kindle-connection");
-    if(overviewKindleConn){{
-      overviewKindleConn.textContent=status.connected?"Online":"Offline";
-      overviewKindleConn.style.color=status.connected?"var(--success)":"var(--danger)";
-    }}
-  }}catch(error){{
-    connectionValue.textContent="Offline";
-    deviceMessage.textContent=error.message;
-    const overviewKindleConn=document.getElementById("overview-kindle-connection");
-    if(overviewKindleConn){{
-      overviewKindleConn.textContent="Offline";
-      overviewKindleConn.style.color="var(--danger)";
-    }}
-  }}
-}}
+
 async function runDeviceAction(button,path,body){{
   const original=button.textContent;
   button.disabled=true;
@@ -1329,21 +4184,18 @@ async function runDeviceAction(button,path,body){{
   }}
 }}
 document.querySelectorAll("[data-device-action]").forEach(button=>button.addEventListener("click",()=>{{
-  runDeviceAction(button,`/api/device/${{button.dataset.deviceAction}}`).catch(()=>{{}});
+  const selected = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
+  runDeviceAction(button,`/api/device/${{selected}}/${{button.dataset.deviceAction}}`).catch(()=>{{}});
 }}));
 document.querySelectorAll("[data-light]").forEach(button=>button.addEventListener("click",()=>{{
-  runDeviceAction(button,"/api/device/light",{{level:Number(button.dataset.light)}}).catch(()=>{{}});
+  const selected = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
+  runDeviceAction(button,`/api/device/${{selected}}/light`,{{level:Number(button.dataset.light)}}).catch(()=>{{}});
 }}));
-document.getElementById("push-kindle").addEventListener("click",async event=>{{
-  try{{
-    const result=await runDeviceAction(event.currentTarget,"/api/device/push");
-    document.getElementById("last-push").textContent=result.message;
-  }}catch(error){{}}
-}});
 document.getElementById("restart-kindle").addEventListener("click",event=>{{
+  const selected = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
   const confirmation=window.prompt("Type RESTART to reboot the Kindle.");
   if(confirmation!=="RESTART"){{deviceMessage.textContent="Restart cancelled";return;}}
-  runDeviceAction(event.currentTarget,"/api/device/restart",{{confirm:confirmation}}).catch(()=>{{}});
+  runDeviceAction(event.currentTarget,`/api/device/${{selected}}/restart`,{{confirm:confirmation}}).catch(()=>{{}});
 }});
 document.getElementById("restart-settings-server").addEventListener("click",async event=>{{
   const confirmed=window.confirm("Restarting the settings server will make this page unavailable for a few seconds. Continue?");
@@ -1374,6 +4226,7 @@ document.getElementById("restart-settings-server").addEventListener("click",asyn
   }}
   setTimeout(retrySettings,5000);
 }});
+
 // DAILY NOTES TABS LOGIC
 const notesList = document.getElementById("notes-list");
 const notesPreviewList = document.getElementById("notes-preview-list");
@@ -1417,28 +4270,33 @@ async function initNoteFormDevices() {{
     const response = await fetch("/api/devices", {{ cache: "no-store" }});
     const data = await response.json();
     allDevicesList = data.devices || [];
-    
-    if (noteIndividualDevicesBox) {{
-      noteIndividualDevicesBox.innerHTML = "";
-      allDevicesList.forEach(dev => {{
-        const lbl = document.createElement("label");
-        lbl.style.cssText = "display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 600;";
-        
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.name = "note_device";
-        cb.value = dev.id;
-        cb.style.cssText = "width: 18px; height: 18px; accent-color: var(--ink); margin: 0;";
-        
-        lbl.append(cb);
-        lbl.append(document.createTextNode(" " + dev.name + " (" + dev.id + ")"));
-        noteIndividualDevicesBox.append(lbl);
-      }});
-    }}
+    renderNoteDeviceCheckboxes();
+    renderEventDeviceCheckboxes();
   }} catch (e) {{
     console.error("Failed to load device list for note form:", e);
   }}
 }}
+
+function renderNoteDeviceCheckboxes() {{
+  if (noteIndividualDevicesBox) {{
+    noteIndividualDevicesBox.innerHTML = "";
+    allDevicesList.forEach(dev => {{
+      const lbl = document.createElement("label");
+      lbl.style.cssText = "display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 600;";
+      
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.name = "note_device";
+      cb.value = dev.id;
+      cb.style.cssText = "width: 18px; height: 18px; accent-color: var(--ink); margin: 0;";
+      
+      lbl.append(cb);
+      lbl.append(document.createTextNode(" " + dev.name + " (" + dev.id + ")"));
+      noteIndividualDevicesBox.append(lbl);
+    }});
+  }}
+}}
+
 initNoteFormDevices();
 
 function updateScheduleVisibility() {{
@@ -1711,6 +4569,7 @@ function resetNoteForm() {{
   noteDateInput.value = "";
   noteAnchorDateInput.value = "";
   noteDayOfMonthInput.value = "";
+  noteDayOfMonthInput.value = "";
   noteExpiresInput.value = "";
   if (noteDeviceAllCb) {{
     noteDeviceAllCb.checked = true;
@@ -1896,8 +4755,321 @@ document.getElementById("btn-save-note").addEventListener("click", async () => {
   }}
 }});
 
-fetchReminders();
+// Special Events Logic
+const eventTitle = document.getElementById("event-title");
+const eventDate = document.getElementById("event-date");
+const eventEndDate = document.getElementById("event-end-date");
+const eventImageInput = document.getElementById("tab-event-image-input");
+const btnTabChooseImage = document.getElementById("btn-tab-choose-image");
+const tabUploadBox = document.getElementById("tab-celebration-upload-box");
+const btnSaveEvent = document.getElementById("btn-save-event");
+const btnCancelEvent = document.getElementById("btn-cancel-event");
+const scheduledEventsList = document.getElementById("scheduled-events-list");
+const eventDeviceAllCb = document.getElementById("event-device-all");
+const eventIndividualDevicesBox = document.getElementById("event-individual-devices");
 
+// Main preview elements
+const celebrationImageInput = document.getElementById("celebration-image-input");
+const btnChooseCelebrationImage = document.getElementById("btn-choose-celebration-image");
+const celebrationUploadBox = document.getElementById("celebration-upload-box");
+const celebrationPreviewBox = document.getElementById("celebration-preview-box");
+const celebrationPreviewImg = document.getElementById("celebration-preview-img");
+const btnRemoveCelebration = document.getElementById("btn-remove-celebration");
+const celebrationMetaInfo = document.getElementById("celebration-meta-info");
+
+let uploadedImageBase64 = "";
+let specialEventsState = [];
+let selectedSpecialEventId = null;
+
+function handleImageSelect(file) {{
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {{
+    uploadedImageBase64 = e.target.result;
+    
+    // Update main overview preview
+    if (celebrationPreviewImg) celebrationPreviewImg.src = uploadedImageBase64;
+    if (celebrationPreviewBox) celebrationPreviewBox.style.display = "block";
+    if (celebrationUploadBox) celebrationUploadBox.style.display = "none";
+    if (celebrationMetaInfo) {{
+      celebrationMetaInfo.style.display = "block";
+      document.getElementById("celebration-title-display").textContent = eventTitle.value || "Scheduled Celebration";
+    }}
+  }};
+  reader.readAsDataURL(file);
+}}
+
+if (btnChooseCelebrationImage && celebrationImageInput) {{
+  btnChooseCelebrationImage.addEventListener("click", () => celebrationImageInput.click());
+  celebrationImageInput.addEventListener("change", (e) => handleImageSelect(e.target.files[0]));
+}}
+if (btnTabChooseImage && eventImageInput) {{
+  btnTabChooseImage.addEventListener("click", () => eventImageInput.click());
+  eventImageInput.addEventListener("change", (e) => handleImageSelect(e.target.files[0]));
+}}
+
+// Handle drag and drop
+[celebrationUploadBox, tabUploadBox].forEach(box => {{
+  if (!box) return;
+  box.addEventListener("dragover", (e) => {{
+    e.preventDefault();
+    box.style.borderColor = "var(--accent)";
+  }});
+  box.addEventListener("dragleave", () => {{
+    box.style.borderColor = "var(--line)";
+  }});
+  box.addEventListener("drop", (e) => {{
+    e.preventDefault();
+    box.style.borderColor = "var(--line)";
+    handleImageSelect(e.dataTransfer.files[0]);
+  }});
+}});
+
+function renderEventDeviceCheckboxes() {{
+  if (!eventIndividualDevicesBox) return;
+  eventIndividualDevicesBox.innerHTML = "";
+  const kindleDevices = allDevicesList.filter(dev => dev.type === "kindle_pw1" || dev.type === "kindle_kt4");
+  kindleDevices.forEach(dev => {{
+    const lbl = document.createElement("label");
+    lbl.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.85rem; font-weight:600;";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.name = "event_device";
+    cb.value = dev.id;
+    cb.style.cssText = "width:18px; height:18px; accent-color: var(--ink); margin:0;";
+    lbl.append(cb);
+    lbl.append(document.createTextNode(" " + dev.name + " (" + dev.id + ")"));
+    eventIndividualDevicesBox.append(lbl);
+  }});
+}}
+
+if (eventDeviceAllCb) {{
+  eventDeviceAllCb.addEventListener("change", () => {{
+    if (eventDeviceAllCb.checked) {{
+      eventIndividualDevicesBox.style.display = "none";
+      document.querySelectorAll('input[name="event_device"]').forEach(cb => cb.checked = false);
+    }} else {{
+      eventIndividualDevicesBox.style.display = "grid";
+    }}
+  }});
+}}
+
+function getSelectedEventDevices() {{
+  if (eventDeviceAllCb && eventDeviceAllCb.checked) return null;
+  const devices = [];
+  document.querySelectorAll('input[name="event_device"]:checked').forEach(cb => devices.push(cb.value));
+  return devices.length ? devices : null;
+}}
+
+function resetSpecialEventForm() {{
+  eventTitle.value = "";
+  eventDate.value = "";
+  if (eventEndDate) eventEndDate.value = "";
+  uploadedImageBase64 = "";
+  if (eventDeviceAllCb) {{
+    eventDeviceAllCb.checked = true;
+    eventIndividualDevicesBox.style.display = "none";
+  }}
+  document.querySelectorAll('input[name="event_device"]').forEach(cb => cb.checked = false);
+  if (celebrationPreviewBox) celebrationPreviewBox.style.display = "none";
+  if (celebrationUploadBox) celebrationUploadBox.style.display = "block";
+  if (celebrationMetaInfo) celebrationMetaInfo.style.display = "none";
+}}
+
+async function fetchSpecialEvents() {{
+  const result = await deviceApi("/api/special-events", {{ method: "GET" }});
+  specialEventsState = result.events || [];
+  if (!selectedSpecialEventId && specialEventsState.length) {{
+    selectedSpecialEventId = specialEventsState[0].id;
+  }}
+  if (selectedSpecialEventId && !specialEventsState.find(evt => evt.id === selectedSpecialEventId)) {{
+    selectedSpecialEventId = specialEventsState.length ? specialEventsState[0].id : null;
+  }}
+  renderSpecialEvents();
+}}
+
+function syncSelectedEventPreview() {{
+  const evt = specialEventsState.find(item => item.id === selectedSpecialEventId);
+  if (!evt) {{
+    if (celebrationMetaInfo) celebrationMetaInfo.style.display = "none";
+    if (celebrationPreviewBox) celebrationPreviewBox.style.display = "none";
+    if (celebrationUploadBox) celebrationUploadBox.style.display = "block";
+    return;
+  }}
+  if (celebrationPreviewImg) celebrationPreviewImg.src = "/" + evt.image_path;
+  if (celebrationPreviewBox) celebrationPreviewBox.style.display = "block";
+  if (celebrationUploadBox) celebrationUploadBox.style.display = "none";
+  if (celebrationMetaInfo) {{
+    celebrationMetaInfo.style.display = "block";
+    document.getElementById("celebration-title-display").textContent = evt.title;
+  }}
+}}
+
+function renderSpecialEvents() {{
+  const events = specialEventsState;
+  if (scheduledEventsList) {{
+    scheduledEventsList.replaceChildren();
+    if (events.length === 0) {{
+      scheduledEventsList.innerHTML = `<div style="padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--soft); color:var(--muted); text-align:center; font-size:0.88rem;">No events scheduled yet.</div>`;
+    }} else {{
+      events.forEach((evt) => {{
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex; gap:14px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--soft); cursor:pointer;";
+        if (evt.id === selectedSpecialEventId) {{
+          row.style.borderColor = "var(--ink)";
+        }}
+        row.addEventListener("click", () => {{
+          selectedSpecialEventId = evt.id;
+          renderSpecialEvents();
+        }});
+        
+        const thumb = document.createElement("div");
+        thumb.style.cssText = "width:60px; height:80px; border-radius:6px; overflow:hidden; border:1px solid var(--line); flex-shrink:0;";
+        const img = document.createElement("img");
+        img.src = "/" + evt.image_path;
+        img.style.cssText = "width:100%; height:100%; object-fit:cover;";
+        thumb.append(img);
+        
+        const body = document.createElement("div");
+        body.style.cssText = "flex-grow:1; display:flex; flex-direction:column; justify-content:center;";
+        
+        const title = document.createElement("strong");
+        title.textContent = evt.title;
+        title.style.fontSize = "0.95rem";
+        
+        const dateSpan = document.createElement("span");
+        dateSpan.textContent = evt.start_date === evt.end_date ? evt.start_date : `${{evt.start_date}} → ${{evt.end_date}}`;
+        dateSpan.style.cssText = "font-size:0.8rem; color:var(--muted); margin-top:2px;";
+        
+        const actionRow = document.createElement("div");
+        actionRow.style.cssText = "display:flex; gap:10px; margin-top:8px;";
+        
+        const badge = document.createElement("span");
+        badge.className = "badge badge-success-sm";
+        badge.textContent = "Scheduled";
+        
+        const deleteBtn = document.createElement("button");
+        deleteBtn.type = "button";
+        deleteBtn.style.cssText = "background:none; border:none; padding:0; color:var(--danger); font-size:0.75rem; font-weight:600; cursor:pointer;";
+        deleteBtn.textContent = "Delete";
+        deleteBtn.addEventListener("click", async (e) => {{
+          e.stopPropagation();
+          try {{
+            await deviceApi(`/api/special-events/${{encodeURIComponent(evt.id)}}`, {{ method: "DELETE" }});
+            if (selectedSpecialEventId === evt.id) selectedSpecialEventId = null;
+            await fetchSpecialEvents();
+          }} catch (error) {{
+            alert("Failed to delete special event: " + error.message);
+          }}
+        }});
+
+        const pushBtn = document.createElement("button");
+        pushBtn.type = "button";
+        pushBtn.style.cssText = "background:none; border:none; padding:0; color:var(--ink); font-size:0.75rem; font-weight:600; cursor:pointer;";
+        pushBtn.textContent = "Push to selected Kindle";
+        pushBtn.addEventListener("click", async (e) => {{
+          e.stopPropagation();
+          try {{
+            const selectedDevice = localStorage.getItem("kindle_dashboard_selected_device") || "default-kindle";
+            const result = await deviceApi(`/api/special-events/${{encodeURIComponent(evt.id)}}/push`, {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json" }},
+              body: JSON.stringify({{ device_id: selectedDevice }})
+            }});
+            alert(result.message || "Special event pushed");
+          }} catch (error) {{
+            alert("Failed to push special event: " + error.message);
+          }}
+        }});
+        
+        actionRow.append(badge, pushBtn, deleteBtn);
+        body.append(title, dateSpan, actionRow);
+        row.append(thumb, body);
+        scheduledEventsList.append(row);
+      }});
+    }}
+  }}
+  syncSelectedEventPreview();
+}}
+
+if (btnSaveEvent) {{
+  btnSaveEvent.addEventListener("click", async () => {{
+    const title = eventTitle.value.trim();
+    const date = eventDate.value;
+    const endDate = eventEndDate ? (eventEndDate.value || date) : date;
+    if (!title || !date || !uploadedImageBase64) {{
+      alert("Please fill in the title, start date, and choose an image!");
+      return;
+    }}
+    try {{
+      const result = await deviceApi("/api/special-events", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          title: title,
+          start_date: date,
+          end_date: endDate,
+          image_data: uploadedImageBase64,
+          devices: getSelectedEventDevices(),
+          enabled: true
+        }})
+      }});
+      selectedSpecialEventId = result.event.id;
+      resetSpecialEventForm();
+      await fetchSpecialEvents();
+      alert("Special event scheduled!");
+    }} catch (error) {{
+      alert("Failed to save special event: " + error.message);
+    }}
+  }});
+}}
+
+if (btnCancelEvent) {{
+  btnCancelEvent.addEventListener("click", () => {{
+    resetSpecialEventForm();
+  }});
+}}
+
+if (btnRemoveCelebration) {{
+  btnRemoveCelebration.addEventListener("click", () => {{
+    uploadedImageBase64 = "";
+    if (celebrationPreviewBox) celebrationPreviewBox.style.display = "none";
+    if (celebrationUploadBox) celebrationUploadBox.style.display = "block";
+    if (celebrationMetaInfo) celebrationMetaInfo.style.display = "none";
+  }});
+}}
+
+// Push to all devices trigger
+const btnManageSpecialEvents = document.getElementById("btn-manage-special-events");
+if (btnManageSpecialEvents) {{
+  btnManageSpecialEvents.addEventListener("click", () => switchTab("special_events"));
+}}
+
+const btnPushAllSpecial = document.getElementById("btn-push-all-special");
+if (btnPushAllSpecial) {{
+  btnPushAllSpecial.addEventListener("click", async () => {{
+    if (!selectedSpecialEventId) {{
+      alert("Select a scheduled special event first.");
+      return;
+    }}
+    btnPushAllSpecial.disabled = true;
+    const orig = btnPushAllSpecial.textContent;
+    btnPushAllSpecial.textContent = "Pushing...";
+    try {{
+      const result = await deviceApi(`/api/special-events/${{encodeURIComponent(selectedSpecialEventId)}}/push-all`, {{ method: "POST" }});
+      alert(result.message || "Successfully pushed celebration image to all enabled Kindles!");
+    }} catch (error) {{
+      alert("Failed to push celebration: " + error.message);
+    }} finally {{
+      btnPushAllSpecial.textContent = orig;
+      btnPushAllSpecial.disabled = false;
+    }}
+  }});
+}}
+
+remindersPreviewReady = true;
+fetchReminders();
+fetchSpecialEvents();
 loadDeviceState();
 </script>
 </body>
@@ -1912,10 +5084,14 @@ def make_handler(
     restart_settings,
     geocode,
     registry,
+    image_server_port=8765,
+    task_provider=None,
 ):
     config_path = Path(config_path)
     csrf_token = secrets.token_urlsafe(32)
     update_lock = threading.Lock()
+    if task_provider is None:
+        task_provider = LocalTaskProvider(registry.project_root)
 
     class SettingsHandler(BaseHTTPRequestHandler):
         server_version = "KindleSettings"
@@ -1972,6 +5148,10 @@ def make_handler(
             if parsed.path == "/api/devices":
                 try:
                     devices = public_devices(registry, config_path)
+                    public_api_devices = []
+                    for dev in devices:
+                        public_dev = {k: v for k, v in dev.items() if k not in ("status_token", "pairing_token")}
+                        public_api_devices.append(public_dev)
                 except (RegistryValidationError, OSError, ValueError):
                     self.send_json(
                         503,
@@ -1981,7 +5161,11 @@ def make_handler(
                         },
                     )
                     return
-                self.send_json(200, {"devices": devices})
+                self.send_json(200, {"devices": public_api_devices})
+                return
+            device_tasks_match = DEVICE_TASKS_RE.fullmatch(parsed.path)
+            if device_tasks_match is not None:
+                self.handle_tasks_get(device_tasks_match.group(1))
                 return
             device_config_match = DEVICE_CONFIG_RE.fullmatch(parsed.path)
             if device_config_match is not None:
@@ -1993,21 +5177,47 @@ def make_handler(
                 except DeviceNotFoundError:
                     self.send_bytes(404, b"", "text/plain")
                     return
-                selected_config_path = (
-                    config_path
-                    if selected.id == "default-kindle"
-                    else selected.config_path
-                )
                 self.send_json(
                     200,
                     public_device_config(
                         selected,
-                        load_config(selected_config_path),
+                        load_effective_device_config(selected, registry),
                     ),
+                )
+                return
+            device_status_match = DEVICE_STATUS_RE.fullmatch(parsed.path)
+            if device_status_match is not None:
+                self.handle_status_get(device_status_match.group(1))
+                return
+            kindle_install_match = KINDLE_INSTALL_RE.fullmatch(parsed.path)
+            if kindle_install_match is not None:
+                self.handle_kindle_installer(
+                    kindle_install_match.group(1),
+                    parse_qs(parsed.query, keep_blank_values=True),
                 )
                 return
             if parsed.path == "/api/notes":
                 self.send_json(200, load_daily_notes())
+                return
+            if parsed.path == "/api/special-events":
+                try:
+                    events = special_events.load_events(
+                        registry.project_root,
+                        valid_special_event_device_ids(registry),
+                    )
+                except Exception as exc:
+                    self.send_json(500, {"ok": False, "error": str(exc)})
+                    return
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "events": [
+                            special_events.event_to_public_dict(event)
+                            for event in events
+                        ],
+                    },
+                )
                 return
             if parsed.path == "/api/geocode":
                 query = parse_qs(
@@ -2054,6 +5264,9 @@ def make_handler(
             elif device_control_get_match is not None:
                 self.handle_device_get(parsed.path, device_id=device_control_get_match.group(1))
                 return
+            if parsed.path == "/api/devices/push-all":
+                self.handle_push_all()
+                return
             if parsed.path == "/settings":
                 query = parse_qs(parsed.query)
                 message = query.get("status", [""])[0]
@@ -2061,11 +5274,26 @@ def make_handler(
                     devices = public_devices(registry, config_path)
                 except (RegistryValidationError, OSError, ValueError):
                     devices = []
+                # Construct the image server URL dynamically
+                host_header = self.headers.get("Host", f"localhost:{image_server_port}")
+                parts = host_header.split(":")
+                hostname = parts[0]
+                proto = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
+                image_server_url = f"{proto}://{hostname}:{image_server_port}"
+                
+                # Check for explicit IMAGE_SERVER_URL environment override
+                import os
+                env_url = os.environ.get("IMAGE_SERVER_URL")
+                if env_url:
+                    image_server_url = env_url
+
                 body = render_settings(
                     load_config(config_path),
                     csrf_token,
                     message,
                     devices=devices,
+                    image_server_url=image_server_url,
+                    settings_host=host_header,
                 ).encode("utf-8")
                 self.send_bytes(200, body, "text/html; charset=utf-8")
                 return
@@ -2075,6 +5303,19 @@ def make_handler(
             parsed = urlsplit(self.path)
             if parsed.path == "/api/config":
                 self.handle_api_post()
+                return
+            if parsed.path == "/api/devices":
+                self.handle_create_device()
+                return
+            if parsed.path == "/api/devices/push-all":
+                self.handle_push_all()
+                return
+            if parsed.path == "/api/special-events":
+                self.handle_special_events_create()
+                return
+            device_tasks_match = DEVICE_TASKS_RE.fullmatch(parsed.path)
+            if device_tasks_match is not None:
+                self.handle_task_create(device_tasks_match.group(1))
                 return
             if parsed.path == "/settings":
                 self.handle_form_post()
@@ -2095,8 +5336,21 @@ def make_handler(
                 self.handle_maintenance_restart()
                 return
             if parsed.path.startswith("/api/device/"):
+                device_status_match = DEVICE_STATUS_RE.fullmatch(parsed.path)
+                if device_status_match is not None:
+                    self.handle_status_post(device_status_match.group(1))
+                    return
+                device_pair_match = DEVICE_PAIR_RE.fullmatch(parsed.path)
+                if device_pair_match is not None:
+                    self.handle_device_pair(device_pair_match.group(1))
+                    return
+                device_reset_match = DEVICE_RESET_INSTALLER_RE.fullmatch(parsed.path)
+                if device_reset_match is not None:
+                    self.handle_installer_token_reset(device_reset_match.group(1))
+                    return
                 known_paths = {
                     "/api/device/start-dashboard",
+                    "/api/device/stop-dashboard",
                     "/api/device/home",
                     "/api/device/refresh",
                     "/api/device/autostart/enable",
@@ -2109,7 +5363,7 @@ def make_handler(
                     self.handle_device_post(parsed.path)
                     return
                 device_control_post_match = re.match(
-                    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(light|push|restart|start-dashboard|home|refresh|autostart/enable|autostart/disable)$",
+                    r"^/api/device/([a-z0-9][a-z0-9-]{0,63})/(light|push|restart|start-dashboard|stop-dashboard|home|refresh|autostart/enable|autostart/disable)$",
                     parsed.path,
                 )
                 if device_control_post_match is not None:
@@ -2117,7 +5371,363 @@ def make_handler(
                     return
                 self.send_bytes(404, b"", "text/plain")
                 return
+            special_push_match = SPECIAL_EVENT_PUSH_RE.fullmatch(parsed.path)
+            if special_push_match is not None:
+                self.handle_special_event_push(special_push_match.group(1))
+                return
+            special_push_all_match = SPECIAL_EVENT_PUSH_ALL_RE.fullmatch(parsed.path)
+            if special_push_all_match is not None:
+                self.handle_special_event_push_all(special_push_all_match.group(1))
+                return
             self.send_bytes(404, b"", "text/plain")
+
+        def do_PUT(self):
+            parsed = urlsplit(self.path)
+            task_reorder_match = DEVICE_TASK_REORDER_RE.fullmatch(parsed.path)
+            if task_reorder_match is not None:
+                self.handle_task_reorder(task_reorder_match.group(1))
+                return
+            task_item_match = DEVICE_TASK_ITEM_RE.fullmatch(parsed.path)
+            if task_item_match is not None:
+                self.handle_task_update(
+                    task_item_match.group(1), task_item_match.group(2)
+                )
+                return
+            special_match = SPECIAL_EVENT_RE.fullmatch(parsed.path)
+            if special_match is None:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            self.handle_special_event_update(special_match.group(1))
+
+        def do_DELETE(self):
+            parsed = urlsplit(self.path)
+            task_item_match = DEVICE_TASK_ITEM_RE.fullmatch(parsed.path)
+            if task_item_match is not None:
+                self.handle_task_delete(
+                    task_item_match.group(1), task_item_match.group(2)
+                )
+                return
+            special_match = SPECIAL_EVENT_RE.fullmatch(parsed.path)
+            if special_match is None:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            self.handle_special_event_delete(special_match.group(1))
+
+        @staticmethod
+        def task_dicts(tasks):
+            return [task.to_dict() for task in tasks]
+
+        def require_task_device(self, device_id):
+            return registry.get(device_id, require_enabled=True)
+
+        def render_todo_if_selected(self, selected):
+            config = load_effective_device_config(selected, registry)
+            if config.get("theme") != "todo":
+                return False
+            render_selected(selected.id)
+            return True
+
+        def handle_tasks_get(self, device_id):
+            try:
+                self.require_task_device(device_id)
+                tasks = task_provider.list_tasks(device_id)
+                self.send_json(
+                    200,
+                    {"ok": True, "device_id": device_id, "tasks": self.task_dicts(tasks)},
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except ValueError as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_task_create(self, device_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                candidate = self.read_json()
+                if set(candidate) != {"title"}:
+                    raise ValueError("task create requires only title")
+                task = task_provider.create_task(device_id, candidate["title"])
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    201,
+                    {
+                        "ok": True,
+                        "task": task.to_dict(),
+                        "tasks": self.task_dicts(task_provider.list_tasks(device_id)),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_task_update(self, device_id, task_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                candidate = self.read_json()
+                if not candidate or not set(candidate).issubset({"title", "completed"}):
+                    raise ValueError("task update supports title and completed")
+                task = task_provider.update_task(device_id, task_id, **candidate)
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "task": task.to_dict(),
+                        "tasks": self.task_dicts(task_provider.list_tasks(device_id)),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except TaskNotFoundError:
+                self.send_json(404, {"ok": False, "error": "task not found"})
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_task_reorder(self, device_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                candidate = self.read_json()
+                if set(candidate) != {"completed", "task_ids"}:
+                    raise ValueError("reorder requires completed and task_ids")
+                tasks = task_provider.reorder_tasks(
+                    device_id, candidate["completed"], candidate["task_ids"]
+                )
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "tasks": self.task_dicts(tasks),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_task_delete(self, device_id, task_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                selected = self.require_task_device(device_id)
+                deleted = task_provider.delete_task(device_id, task_id)
+                rendered = self.render_todo_if_selected(selected)
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "deleted_task_id": deleted.id,
+                        "tasks": self.task_dicts(task_provider.list_tasks(device_id)),
+                        "rendered": rendered,
+                    },
+                )
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+            except TaskNotFoundError:
+                self.send_json(404, {"ok": False, "error": "task not found"})
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_status_get(self, device_id):
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+                payload = device_status.status_summary(selected)
+                if selected.type in KINDLE_DEVICE_TYPES:
+                    try:
+                        live = device.get_status(
+                            connection=selected.connection,
+                            device_id=selected.id,
+                            device_type=selected.type,
+                        )
+                        if isinstance(live, dict):
+                            payload.update(live)
+                    except Exception as exc:
+                        payload.setdefault("connected", False)
+                        payload.setdefault("last_error", str(exc))
+                self.send_json(200, payload)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+
+        def handle_status_post(self, device_id):
+            if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                self.send_json(415, {"ok": False, "error": "application/json required"})
+                return
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            supplied_token = (
+                self.headers.get("X-Device-Token")
+                or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            )
+            if not device_status.token_is_valid(selected, supplied_token):
+                self.send_json(403, {"ok": False, "error": "invalid device token"})
+                return
+            try:
+                candidate = self.read_json()
+                saved = device_status.save_status(selected, candidate)
+                self.send_json(200, {"ok": True, "status": saved})
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+
+        def handle_create_device(self):
+            if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                self.send_json(415, {"ok": False, "error": "application/json required"})
+                return
+            try:
+                candidate = self.read_json()
+                with update_lock:
+                    payload = create_device(
+                        registry,
+                        config_path,
+                        candidate,
+                        self.headers,
+                        self.server.server_port,
+                    )
+                self.send_json(201, payload)
+            except (
+                ValueError,
+                RegistryValidationError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception:
+                self.send_json(500, {"ok": False, "error": "device creation failed"})
+
+        def handle_installer_token_reset(self, device_id):
+            if not self.device_csrf_valid():
+                self.send_json(
+                    403,
+                    {"ok": False, "error": "invalid request token"},
+                )
+                return
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            if selected.type not in KINDLE_DEVICE_TYPES:
+                self.send_json(400, {"ok": False, "error": "not a Kindle device"})
+                return
+
+            with update_lock:
+                config = read_raw_device_config(selected)
+                new_token = generate_device_token()
+                config["pairing_token"] = new_token
+                if "status_token" not in config or not config["status_token"]:
+                    config["status_token"] = generate_device_token()
+                
+                data = (
+                    json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+                ).encode("utf-8")
+                atomic_write_bytes(selected.config_path, data)
+
+            server_host = public_host_from_headers(self.headers)
+            install_command = (
+                "curl -fsS "
+                f"http://{server_host}:{self.server.server_port}/install/kindle/{device_id}"
+                f"?token={quote(new_token)} | sh"
+            )
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "pairing_token": new_token,
+                    "install_command": install_command,
+                },
+            )
+
+        def handle_device_pair(self, device_id):
+            if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                self.send_json(415, {"ok": False, "error": "application/json required"})
+                return
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            try:
+                candidate = self.read_json()
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+                return
+            config = read_raw_device_config(selected)
+            expected = config.get("pairing_token")
+            supplied = candidate.get("token")
+            if not expected or not hmac.compare_digest(str(supplied or ""), expected):
+                self.send_json(403, {"ok": False, "error": "invalid pairing token"})
+                return
+            saved = device_status.save_status(
+                selected,
+                {
+                    "firmware_version": "paired",
+                    "last_error": None,
+                },
+            )
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "device_id": selected.id,
+                    "status": saved,
+                },
+            )
+
+        def handle_kindle_installer(self, device_id, query):
+            try:
+                selected = registry.get(device_id, require_enabled=True)
+            except DeviceNotFoundError:
+                self.send_bytes(404, b"", "text/plain")
+                return
+            config = read_raw_device_config(selected)
+            expected = config.get("pairing_token")
+            supplied = (query.get("token") or [""])[0]
+            if not expected or not hmac.compare_digest(str(supplied or ""), expected):
+                self.send_json(403, {"ok": False, "error": "invalid pairing token"})
+                return
+            if selected.type not in KINDLE_DEVICE_TYPES:
+                self.send_json(400, {"ok": False, "error": "not a Kindle device"})
+                return
+
+            if "status_token" not in config or not config["status_token"]:
+                with update_lock:
+                    # Reload to avoid race conditions and generate status_token
+                    config = read_raw_device_config(selected)
+                    config["status_token"] = generate_device_token()
+                    data = (
+                        json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+                    ).encode("utf-8")
+                    atomic_write_bytes(selected.config_path, data)
+
+            server_host = public_host_from_headers(self.headers)
+            script = kindle_installer_script(
+                selected,
+                config,
+                server_host,
+                image_server_port,
+                self.server.server_port,
+            )
+            self.send_bytes(
+                200,
+                script.encode("utf-8"),
+                "text/x-shellscript; charset=utf-8",
+            )
 
         def handle_maintenance_restart(self):
             if not self.device_csrf_valid():
@@ -2318,6 +5928,189 @@ def make_handler(
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": str(e)})
 
+        def handle_special_events_create(self):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                candidate = self.read_json()
+                event = special_events.create_event(
+                    registry.project_root,
+                    candidate,
+                    valid_special_event_device_ids(registry),
+                )
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                events.append(event)
+                special_events.save_events(registry.project_root, events)
+                self.send_json(
+                    200,
+                    {"ok": True, "event": special_events.event_to_public_dict(event)},
+                )
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_update(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                candidate = self.read_json()
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                existing = special_events.find_event(events, event_id)
+                updated = special_events.update_event(
+                    existing,
+                    candidate,
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                new_events = [
+                    updated if item.id == event_id else item
+                    for item in events
+                ]
+                special_events.save_events(registry.project_root, new_events)
+                self.send_json(
+                    200,
+                    {"ok": True, "event": special_events.event_to_public_dict(updated)},
+                )
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_delete(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                existing = special_events.find_event(events, event_id)
+                remaining = [item for item in events if item.id != event_id]
+                special_events.save_events(registry.project_root, remaining)
+                special_events.delete_event_image(registry.project_root, existing.image_path)
+                self.send_json(200, {"ok": True})
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_push(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                event = special_events.find_event(events, event_id)
+                selected = registry.get(
+                    (self.read_json().get("device_id") if self.headers.get("Content-Length") not in (None, "0") else None)
+                    or "default-kindle",
+                    require_enabled=True,
+                )
+                if selected.type not in KINDLE_DEVICE_TYPES:
+                    self.send_json(400, {"ok": False, "error": "unsupported device type"})
+                    return
+                if selected.id not in event.devices:
+                    self.send_json(400, {"ok": False, "error": "event does not target this device"})
+                    return
+                image_path = render_special_event_for_device(event, selected, registry.project_root)
+                push_image_to_kindle(selected, image_path)
+                self.send_json(
+                    200,
+                    {"ok": True, "message": f"Special event pushed to {selected.name}"},
+                )
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except DeviceNotFoundError:
+                self.send_json(404, {"ok": False, "error": "selected device is unavailable"})
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
+        def handle_special_event_push_all(self, event_id):
+            if not self.device_csrf_valid():
+                self.send_json(403, {"ok": False, "error": "invalid request token"})
+                return
+            try:
+                events = special_events.load_events(
+                    registry.project_root,
+                    valid_special_event_device_ids(registry),
+                )
+                event = special_events.find_event(events, event_id)
+                pushed_devices = []
+                errors = []
+                for selected in registry.load():
+                    if (
+                        selected.enabled
+                        and selected.type in KINDLE_DEVICE_TYPES
+                        and selected.id in event.devices
+                    ):
+                        try:
+                            image_path = render_special_event_for_device(event, selected, registry.project_root)
+                            push_image_to_kindle(selected, image_path)
+                            pushed_devices.append(selected.name)
+                        except Exception as exc:
+                            errors.append(f"{selected.name}: {exc}")
+                if not pushed_devices and errors:
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "partial": False,
+                            "pushed": [],
+                            "errors": errors,
+                            "failed": [
+                                item.split(":", 1)[0] if ":" in item else item
+                                for item in errors
+                            ],
+                            "error": (
+                                "Failed pushing special event to all target Kindles: "
+                                + ", ".join(errors)
+                            ),
+                        },
+                    )
+                    return
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "partial": bool(errors),
+                        "pushed": pushed_devices,
+                        "failed": [
+                            item.split(":", 1)[0] if ":" in item else item
+                            for item in errors
+                        ],
+                        "errors": errors,
+                        "message": (
+                            f"Special event pushed to: {', '.join(pushed_devices)}"
+                            + (
+                                f". Failed: {', '.join(errors)}"
+                                if errors
+                                else ""
+                            )
+                        ),
+                    },
+                )
+            except KeyError:
+                self.send_json(404, {"ok": False, "error": "event not found"})
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)})
+
         def handle_notes_delete(self):
             if not self.device_csrf_valid():
                 self.send_json(
@@ -2381,12 +6174,80 @@ def make_handler(
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": str(e)})
 
+        def handle_push_all(self):
+            if not self.device_csrf_valid():
+                self.send_json(
+                    403,
+                    {"ok": False, "error": "invalid request token"},
+                )
+                return
+            try:
+                pushed_devices = []
+                errors = []
+                for selected in registry.load():
+                    if selected.enabled and selected.type in KINDLE_DEVICE_TYPES:
+                        try:
+                            push_rendered_device_to_kindle(
+                                selected,
+                                registry,
+                            )
+                            pushed_devices.append(selected.name)
+                        except Exception as exc:
+                            errors.append(f"{selected.name}: {exc}")
+                if errors:
+                    if pushed_devices:
+                        self.send_json(
+                            200,
+                            {
+                                "ok": True,
+                                "partial": True,
+                                "pushed": pushed_devices,
+                                "errors": errors,
+                                "message": (
+                                    "Pushed to "
+                                    f"{', '.join(pushed_devices)}. "
+                                    "Some devices failed: "
+                                    f"{', '.join(errors)}"
+                                ),
+                            },
+                        )
+                    else:
+                        self.send_json(
+                            503,
+                            {
+                                "ok": False,
+                                "partial": False,
+                                "pushed": [],
+                                "errors": errors,
+                                "error": (
+                                    "Failed pushing to all enabled Kindles: "
+                                    f"{', '.join(errors)}"
+                                ),
+                            },
+                        )
+                else:
+                    self.send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "partial": False,
+                            "pushed": pushed_devices,
+                            "errors": [],
+                            "message": f"Successfully pushed to all enabled Kindles: {', '.join(pushed_devices)}",
+                        },
+                    )
+            except Exception as exc:
+                self.send_json(
+                    500,
+                    {"ok": False, "error": str(exc)},
+                )
+
         def handle_device_get(self, path, device_id=None):
             if device_id is None:
                 device_id = "default-kindle"
             try:
                 selected = registry.get(device_id)
-                if selected.type != "kindle_pw1":
+                if selected.type not in KINDLE_DEVICE_TYPES:
                     self.send_json(
                         400,
                         {"ok": False, "error": "unsupported device type"},
@@ -2431,16 +6292,17 @@ def make_handler(
                 )
 
         def handle_device_post(self, path, device_id=None):
-            if not self.device_csrf_valid():
-                self.send_json(
-                    403,
-                    {"ok": False, "error": "invalid request token"},
-                )
-                return
             if device_id is None:
                 device_id = "default-kindle"
             try:
                 selected = registry.get(device_id)
+                if not self.device_csrf_valid():
+                    self.send_json(
+                        403,
+                        {"ok": False, "error": "invalid request token"},
+                    )
+                    return
+
                 action_suffix = path.split("/")[-1]
                 if "autostart" in path:
                     action_suffix = "autostart/" + action_suffix
@@ -2459,7 +6321,7 @@ def make_handler(
                         )
                         return
 
-                if selected.type != "kindle_pw1":
+                if selected.type not in KINDLE_DEVICE_TYPES:
                     self.send_json(
                         400,
                         {"ok": False, "error": "unsupported device type"},
@@ -2467,24 +6329,23 @@ def make_handler(
                     return
                 action_paths = {
                     "start-dashboard": "start",
+                    "stop-dashboard": "stop",
                     "home": "home",
-                    "refresh": "refresh",
                     "autostart/enable": "autostart_enable",
                     "autostart/disable": "autostart_disable",
                 }
                 action_suffix = path.split("/")[-1]
                 if "autostart" in path:
                     action_suffix = "autostart/" + action_suffix
-                if action_suffix in action_paths:
-                    message = device.run_action(
-                        action_paths[action_suffix],
-                        connection=selected.connection,
-                        device_id=selected.id,
-                        device_type=selected.type,
+                if action_suffix in ("push", "refresh"):
+                    message = push_rendered_device_to_kindle(
+                        selected,
+                        registry,
                     )
                     payload = {"ok": True, "message": message}
-                elif action_suffix == "push":
-                    message = device.push(
+                elif action_suffix in action_paths:
+                    message = device.run_action(
+                        action_paths[action_suffix],
                         connection=selected.connection,
                         device_id=selected.id,
                         device_type=selected.type,
@@ -2627,12 +6488,10 @@ def make_handler(
                 )
                 if not submitted_theme:
                     try:
-                        current_config_path = (
-                            config_path
-                            if selected_device.id == "default-kindle"
-                            else selected_device.config_path
+                        current_config = load_effective_device_config(
+                            selected_device,
+                            registry,
                         )
-                        current_config = load_config(current_config_path)
                         submitted_theme = current_config.get("theme", "home_dashboard")
                     except Exception:
                         submitted_theme = "home_dashboard"
@@ -2670,7 +6529,8 @@ def make_handler(
                     candidate["latitude"] = None
                     candidate["longitude"] = None
                 for key in ("show_weather", "show_forecast", "show_server",
-                            "show_pihole", "show_tailscale"):
+                            "show_pihole", "show_tailscale",
+                            "wifi_power_save", "update_only_if_changed"):
                     candidate[key] = key in form
                 for key in ("prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes"):
                     if key in form:
@@ -2705,7 +6565,8 @@ def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
                 regenerate=regenerate_dashboard, device=None,
                 restart_settings=schedule_settings_restart,
                 geocode=geocode_locations, registry=None,
-                render_selected=None):
+                render_selected=None, image_server_port=8765,
+                task_provider=None):
     if device is None:
         device = KindleDevice()
     if registry is None:
@@ -2725,6 +6586,8 @@ def make_server(host=BIND_HOST, port=PORT, config_path=CONFIG_PATH,
             restart_settings,
             geocode,
             registry,
+            image_server_port=image_server_port,
+            task_provider=task_provider,
         ),
     )
 

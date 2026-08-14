@@ -17,7 +17,8 @@ DEVICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-DEVICE_TYPES = {"kindle_pw1", "esp32_epaper", "generic_png"}
+KINDLE_DEVICE_TYPES = {"kindle_pw1", "kindle_kt4"}
+DEVICE_TYPES = KINDLE_DEVICE_TYPES | {"esp32_epaper", "generic_png"}
 RECORD_FIELDS = {
     "id",
     "name",
@@ -27,8 +28,14 @@ RECORD_FIELDS = {
     "config_path",
     "image_path",
     "connection",
+    "use_screensaver_overlay",
+    "status_bar_safe_area_px",
 }
-REQUIRED_RECORD_FIELDS = RECORD_FIELDS - {"connection"}
+REQUIRED_RECORD_FIELDS = RECORD_FIELDS - {
+    "connection",
+    "use_screensaver_overlay",
+    "status_bar_safe_area_px",
+}
 KINDLE_CONNECTION_FIELDS = {"host", "user", "ssh_profile", "port"}
 ESP32_CONNECTION_FIELDS = {"method", "host", "port"}
 
@@ -51,6 +58,8 @@ class DeviceRecord:
     config_path: Path
     image_path: Path
     connection: dict | None
+    use_screensaver_overlay: bool = False
+    status_bar_safe_area_px: int = 0
 
 
 def default_device_record() -> dict:
@@ -132,7 +141,7 @@ class DeviceRegistry:
             raise RegistryValidationError(
                 "connection must be an object"
             )
-        if device_type == "kindle_pw1":
+        if device_type in KINDLE_DEVICE_TYPES:
             allowed = KINDLE_CONNECTION_FIELDS
             required = {"host", "user", "ssh_profile"}
         elif device_type == "esp32_epaper":
@@ -162,7 +171,7 @@ class DeviceRegistry:
             ):
                 raise RegistryValidationError("connection port is invalid")
 
-        if device_type == "kindle_pw1":
+        if device_type in KINDLE_DEVICE_TYPES:
             user = connection.get("user")
             profile = connection.get("ssh_profile")
             if not isinstance(user, str) or not USER_RE.fullmatch(user):
@@ -187,6 +196,8 @@ class DeviceRegistry:
             raise RegistryValidationError(
                 "device record must be an object"
             )
+        value = dict(value)
+        value.pop("native_rtc_scheduler", None)
         unknown = set(value) - RECORD_FIELDS
         missing = REQUIRED_RECORD_FIELDS - set(value)
         if unknown or missing:
@@ -229,6 +240,25 @@ class DeviceRegistry:
             raise RegistryValidationError(
                 "device enabled must be true or false"
             )
+        use_screensaver_overlay = value.get(
+            "use_screensaver_overlay",
+            False,
+        )
+        if not isinstance(use_screensaver_overlay, bool):
+            raise RegistryValidationError(
+                "device screensaver overlay flag must be true or false"
+            )
+
+        default_safe_area = 32 if (device_type == "kindle_kt4" or tuple(resolution) == (600, 800) or device_id == "kindle-131") else 0
+        status_bar_safe_area_px = value.get("status_bar_safe_area_px", default_safe_area)
+        if (
+            isinstance(status_bar_safe_area_px, bool)
+            or not isinstance(status_bar_safe_area_px, int)
+            or not 0 <= status_bar_safe_area_px <= 200
+        ):
+            raise RegistryValidationError(
+                "device status bar safe area must be an integer between 0 and 200"
+            )
 
         config_relative = f"devices/{device_id}/config.json"
         image_relative = f"devices/{device_id}/image.png"
@@ -253,6 +283,8 @@ class DeviceRegistry:
             config_path=config_path,
             image_path=image_path,
             connection=connection,
+            use_screensaver_overlay=use_screensaver_overlay,
+            status_bar_safe_area_px=status_bar_safe_area_px,
         )
 
     def validate_registry(self, value):
@@ -287,6 +319,10 @@ class DeviceRegistry:
         }
         if record.connection is not None:
             value["connection"] = dict(record.connection)
+        if record.use_screensaver_overlay:
+            value["use_screensaver_overlay"] = True
+        if record.status_bar_safe_area_px > 0:
+            value["status_bar_safe_area_px"] = record.status_bar_safe_area_px
         return value
 
     def _public_record(self, record):
@@ -299,6 +335,8 @@ class DeviceRegistry:
         }
         if record.connection is not None:
             value["connection"] = dict(record.connection)
+        value["use_screensaver_overlay"] = record.use_screensaver_overlay
+        value["status_bar_safe_area_px"] = record.status_bar_safe_area_px
         return value
 
     def _atomic_write_json(self, path, value):

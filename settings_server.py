@@ -302,6 +302,7 @@ def public_device_config(device, config):
         "refresh_interval_minutes",
         "wifi_power_save",
         "update_only_if_changed",
+        "scheduler",
         "prayer_method",
         "prayer_school",
         "prayer_high_latitude",
@@ -516,8 +517,8 @@ def update_config(config_path, candidate, regenerate):
     previous_exists = config_path.exists()
     previous_data = config_path.read_bytes() if previous_exists else None
 
-    # Preserve custom Maarif and Display fields from existing config if not in candidate
-    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes", "wifi_power_save", "update_only_if_changed"):
+    # Preserve custom Maarif, Display, and scheduler fields when omitted.
+    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes", "wifi_power_save", "update_only_if_changed", "scheduler"):
         if previous_exists and field not in candidate:
             try:
                 prev_config = json.loads(previous_data.decode("utf-8"))
@@ -572,6 +573,7 @@ def update_device_config(
         "refresh_interval_minutes",
         "wifi_power_save",
         "update_only_if_changed",
+        "scheduler",
     ):
         if field not in candidate and field in current:
             candidate[field] = current[field]
@@ -3336,7 +3338,7 @@ button:disabled {{
       <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-top: 18px; background: var(--soft);">
         <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Target devices</span>
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; font-size:0.9rem;">
-          <input type="checkbox" id="event-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> All Kindle devices
+          <input type="checkbox" id="event-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin:0;"> All Kindle devices
         </label>
         <div id="event-individual-devices" style="display:none; grid-gap:8px; padding-left:20px; border-left:2px solid var(--line); margin-top:10px;"></div>
       </div>
@@ -5856,7 +5858,7 @@ def make_handler(
                         if any(d not in valid_days for d in days):
                             self.send_json(400, {"ok": False, "error": "Invalid weekday selected"})
                             return
-                            
+                        
                         if rec_type == "fortnightly":
                             anchor_date = recurrence.get("anchor_date")
                             if not anchor_date:

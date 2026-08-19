@@ -1,0 +1,45 @@
+name: One-shot final PW1 CI fix
+
+on:
+  push:
+    branches:
+      - codex/pw1-native-mxc-rtc
+    paths:
+      - '.github/workflows/one-shot-final-ci-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/pw1-native-mxc-rtc
+          fetch-depth: 0
+      - name: Patch flaky host-sync dependency and remove this helper
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('test_kindle_scripts.py')
+          text = path.read_text(encoding='utf-8')
+          mock_line = '        self.create_mock_bin("sync", "#!/bin/sh\\nexit 0\\n")\n'
+          if mock_line not in text:
+              needle = '        self.create_mock_bin("eips", '
+              if text.count(needle) != 1:
+                  raise SystemExit(f'expected one eips setup anchor, found {text.count(needle)}')
+              start = text.index(needle)
+              line_end = text.index('\n', start) + 1
+              path.write_text(text[:line_end] + mock_line + text[line_end:], encoding='utf-8')
+          PY
+          git rm .github/workflows/one-shot-final-ci-fix.yml
+      - name: Commit and push minimal final patch
+        run: |
+          git config user.name 'openai-codex'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add test_kindle_scripts.py
+          git diff --cached --check
+          git commit -m 'test: isolate refresh overlay tests from host sync'
+          git push origin HEAD:codex/pw1-native-mxc-rtc

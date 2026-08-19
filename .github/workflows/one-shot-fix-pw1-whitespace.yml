@@ -28,13 +28,15 @@ jobs:
 
           path = Path('test_kindle_scripts.py')
           text = path.read_text(encoding='utf-8')
-          anchor = '        self.create_mock_bin("eips", "#!/bin/sh\\necho \\"eips $@\\" >> \\"$DASHBOARD_DIR/calls.log\\"\\n")\n'
-          addition = anchor + '        self.create_mock_bin("sync", "#!/bin/sh\\nexit 0\\n")\n'
-          if 'self.create_mock_bin("sync", "#!/bin/sh\\nexit 0\\n")' in text:
+          mock_line = '        self.create_mock_bin("sync", "#!/bin/sh\\nexit 0\\n")\n'
+          if mock_line in text:
               raise SystemExit('sync mock already exists; refusing unexpected duplicate')
-          if text.count(anchor) != 1:
-              raise SystemExit(f'expected one eips setup anchor, found {text.count(anchor)}')
-          path.write_text(text.replace(anchor, addition, 1), encoding='utf-8')
+          needle = '        self.create_mock_bin("eips", '
+          if text.count(needle) != 1:
+              raise SystemExit(f'expected one eips setup anchor, found {text.count(needle)}')
+          start = text.index(needle)
+          line_end = text.index('\n', start) + 1
+          path.write_text(text[:line_end] + mock_line + text[line_end:], encoding='utf-8')
           PY
       - name: Verify the previously flaky test repeatedly
         run: |

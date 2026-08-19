@@ -1,0 +1,48 @@
+name: One-shot PW1 whitespace fix
+
+on:
+  push:
+    branches:
+      - codex/pw1-native-mxc-rtc-work
+    paths:
+      - '.github/workflows/one-shot-fix-pw1-whitespace.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/pw1-native-mxc-rtc
+          fetch-depth: 0
+      - name: Remove the proven trailing whitespace defect
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('settings_server.py')
+          lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+          index = 5861 - 1
+          line = lines[index]
+          if line.strip():
+              raise SystemExit(f'line 5861 unexpectedly contains non-whitespace content: {line!r}')
+          if line in ('\n', '\r\n', ''):
+              raise SystemExit('line 5861 is already clean; refusing an unexpected no-op')
+          lines[index] = '\r\n' if line.endswith('\r\n') else '\n'
+          path.write_text(''.join(lines), encoding='utf-8')
+          PY
+      - name: Verify exact CI gate locally
+        run: |
+          git diff --check origin/main...HEAD
+          python -m py_compile settings_server.py
+      - name: Commit only the whitespace fix to the PR branch
+        run: |
+          git config user.name 'openai-codex'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add settings_server.py
+          test "$(git diff --cached --name-only)" = "settings_server.py"
+          git commit -m 'style: remove settings server trailing whitespace'
+          git push origin HEAD:codex/pw1-native-mxc-rtc

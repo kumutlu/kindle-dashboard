@@ -5858,7 +5858,7 @@ def make_handler(
                         if any(d not in valid_days for d in days):
                             self.send_json(400, {"ok": False, "error": "Invalid weekday selected"})
                             return
-                        
+
                         if rec_type == "fortnightly":
                             anchor_date = recurrence.get("anchor_date")
                             if not anchor_date:

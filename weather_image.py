@@ -71,6 +71,7 @@ DEFAULT_CONFIG = {
     "refresh_interval_minutes": 10,
     "wifi_power_save": True,
     "update_only_if_changed": True,
+    "scheduler": "kindlecron",
 }
 
 STRING_LIMITS = {
@@ -110,6 +111,7 @@ OPTIONAL_LOCATION_FIELDS = {
     "refresh_interval_minutes",
     "wifi_power_save",
     "update_only_if_changed",
+    "scheduler",
 }
 BOOLEAN_FIELDS = {
     "show_weather",
@@ -312,6 +314,11 @@ def validate_config(value):
             config[field] = val
         else:
             config[field] = default
+
+    scheduler = value.get("scheduler", "kindlecron")
+    if scheduler not in ("kindlecron", "mxc_rtc"):
+        raise ValueError("scheduler must be kindlecron or mxc_rtc")
+    config["scheduler"] = scheduler
 
     return config
 

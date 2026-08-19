@@ -2143,6 +2143,7 @@ class DeviceConfigEndpointTests(unittest.TestCase):
                 "show_pihole",
                 "show_tailscale",
                 "refresh_interval_minutes",
+                "scheduler",
                 "wifi_power_save",
                 "update_only_if_changed",
                 "kindle_frontlight",

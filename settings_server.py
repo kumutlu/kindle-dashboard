@@ -302,6 +302,7 @@ def public_device_config(device, config):
         "refresh_interval_minutes",
         "wifi_power_save",
         "update_only_if_changed",
+        "scheduler",
         "prayer_method",
         "prayer_school",
         "prayer_high_latitude",
@@ -516,8 +517,8 @@ def update_config(config_path, candidate, regenerate):
     previous_exists = config_path.exists()
     previous_data = config_path.read_bytes() if previous_exists else None
 
-    # Preserve custom Maarif and Display fields from existing config if not in candidate
-    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes", "wifi_power_save", "update_only_if_changed"):
+    # Preserve custom Maarif, Display, and scheduler fields when omitted.
+    for field in ("kindle_frontlight", "prayer_method", "prayer_school", "prayer_high_latitude", "hijri_adjustment", "refresh_interval_minutes", "wifi_power_save", "update_only_if_changed", "scheduler"):
         if previous_exists and field not in candidate:
             try:
                 prev_config = json.loads(previous_data.decode("utf-8"))
@@ -572,6 +573,7 @@ def update_device_config(
         "refresh_interval_minutes",
         "wifi_power_save",
         "update_only_if_changed",
+        "scheduler",
     ):
         if field not in candidate and field in current:
             candidate[field] = current[field]
@@ -706,6 +708,11 @@ def kindle_installer_script(device, config, server_host, image_port, settings_po
     )
     status_url = (
         f"http://{server_host}:{settings_port}/api/device/{device_id}/status"
+    )
+    scheduler_backend = (
+        "mxc_rtc"
+        if device.type == "kindle_pw1" and config.get("scheduler") == "mxc_rtc"
+        else "kindlecron"
     )
 
     def bundled_script_heredoc(script_name):
@@ -1065,11 +1072,45 @@ stop_validated "$DASHBOARD_DIR/dashboard_loop.pid" "$DASHBOARD_DIR/dashboard_loo
 exit 0
 EOF"""
 
+    if scheduler_backend == "mxc_rtc":
+        scheduler_contents = [
+            bundled_script_heredoc("mxc-rtc-scheduler.sh"),
+            bundled_script_heredoc("stop_legacy.sh"),
+            bundled_script_heredoc("start.sh"),
+            bundled_script_heredoc("stop.sh"),
+            bundled_script_heredoc("install-mxc-rtc.sh"),
+        ]
+        scheduler_chmod = (
+            'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh-once.sh" '
+            '"$DASHBOARD_DIR/mxc-rtc-scheduler.sh" "$DASHBOARD_DIR/stop_legacy.sh" '
+            '"$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" '
+            '"$DASHBOARD_DIR/install-mxc-rtc.sh" 2>/dev/null || true'
+        )
+        scheduler_install = '"$DASHBOARD_DIR/install-mxc-rtc.sh" install'
+    else:
+        scheduler_contents = [
+            refresh_sh_content,
+            refresh_once_sh_content,
+            install_kindlecron_sh_content,
+            dashboard_loop_sh_content,
+            watchdog_sh_content,
+            start_sh_content,
+            stop_sh_content,
+        ]
+        scheduler_chmod = (
+            'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" '
+            '"$DASHBOARD_DIR/refresh-once.sh" "$DASHBOARD_DIR/install-kindlecron.sh" '
+            '"$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" '
+            '"$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true'
+        )
+        scheduler_install = '"$DASHBOARD_DIR/install-kindlecron.sh" install'
+
     lines = [
         "#!/bin/sh",
         "set -eu",
         'DASHBOARD_DIR="${DASHBOARD_DIR:-/mnt/us/dashboard}"',
         "mkdir -p \"$DASHBOARD_DIR\"",
+        f'SCHEDULER_BACKEND="{scheduler_backend}"',
         f"SERVER_HOST={shell_double_quote(server_host)}",
         f"DEVICE_ID={shell_double_quote(device_id)}",
         f"STATUS_TOKEN={shell_double_quote(status_token)}",
@@ -1086,23 +1127,18 @@ EOF"""
         'IMAGE_URL="$IMAGE_URL"',
         'STATUS_URL="$STATUS_URL"',
         'CONFIG_URL="$CONFIG_URL"',
+        'SCHEDULER_BACKEND="$SCHEDULER_BACKEND"',
         f'REFRESH_INTERVAL_MINUTES="{int(config.get("refresh_interval_minutes", 60))}"',
         f'WIFI_POWER_SAVE="{"1" if config.get("wifi_power_save", True) else "0"}"',
         f'UPDATE_ONLY_IF_CHANGED="{"1" if config.get("update_only_if_changed", True) else "0"}"',
-        'NATIVE_RTC_SCHEDULER="0"',
+        f'NATIVE_RTC_SCHEDULER="{"1" if scheduler_backend == "mxc_rtc" else "0"}"',
         'LOW_POWER_MODE="0"',
         "EOF",
         'chmod 600 "$DASHBOARD_DIR/device.env" 2>/dev/null || true',
         status_sh_content,
-        refresh_sh_content,
-        refresh_once_sh_content,
-        install_kindlecron_sh_content,
-        dashboard_loop_sh_content,
-        watchdog_sh_content,
-        start_sh_content,
-        stop_sh_content,
-        'chmod +x "$DASHBOARD_DIR/status.sh" "$DASHBOARD_DIR/refresh.sh" "$DASHBOARD_DIR/refresh-once.sh" "$DASHBOARD_DIR/install-kindlecron.sh" "$DASHBOARD_DIR/dashboard_loop.sh" "$DASHBOARD_DIR/watchdog.sh" "$DASHBOARD_DIR/start.sh" "$DASHBOARD_DIR/stop.sh" 2>/dev/null || true',
-        '"$DASHBOARD_DIR/install-kindlecron.sh" install',
+        *scheduler_contents,
+        scheduler_chmod,
+        scheduler_install,
         'echo "Configured Kindle dashboard device: $DEVICE_ID"',
     ]
     return "\n".join(lines) + "\n"
@@ -3302,7 +3338,7 @@ button:disabled {{
       <div style="border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-top: 18px; background: var(--soft);">
         <span style="display: block; font-weight: 650; font-size: 0.9rem; margin-bottom: 10px;">Target devices</span>
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; font-size:0.9rem;">
-          <input type="checkbox" id="event-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin: 0;"> All Kindle devices
+          <input type="checkbox" id="event-device-all" checked style="width: 18px; height: 18px; accent-color: var(--ink); margin:0;"> All Kindle devices
         </label>
         <div id="event-individual-devices" style="display:none; grid-gap:8px; padding-left:20px; border-left:2px solid var(--line); margin-top:10px;"></div>
       </div>
@@ -5822,7 +5858,7 @@ def make_handler(
                         if any(d not in valid_days for d in days):
                             self.send_json(400, {"ok": False, "error": "Invalid weekday selected"})
                             return
-                            
+
                         if rec_type == "fortnightly":
                             anchor_date = recurrence.get("anchor_date")
                             if not anchor_date:

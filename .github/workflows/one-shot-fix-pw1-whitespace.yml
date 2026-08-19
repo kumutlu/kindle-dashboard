@@ -34,9 +34,9 @@ jobs:
           lines[index] = '\r\n' if line.endswith('\r\n') else '\n'
           path.write_text(''.join(lines), encoding='utf-8')
           PY
-      - name: Verify exact CI gate locally
+      - name: Verify working-tree change
         run: |
-          git diff --check origin/main...HEAD
+          git diff --check
           python -m py_compile settings_server.py
       - name: Commit only the whitespace fix to the PR branch
         run: |
@@ -45,4 +45,5 @@ jobs:
           git add settings_server.py
           test "$(git diff --cached --name-only)" = "settings_server.py"
           git commit -m 'style: remove settings server trailing whitespace'
+          git diff --check origin/main...HEAD
           git push origin HEAD:codex/pw1-native-mxc-rtc

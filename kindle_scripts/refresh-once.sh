@@ -26,7 +26,7 @@ IMG="$DASHBOARD_DIR/image.png"
 TMP="$DASHBOARD_DIR/image.once.$$"
 HDR_TMP="$DASHBOARD_DIR/image.once.headers.$$"
 ERR_TMP="$DASHBOARD_DIR/image.once.error.$$"
-LOCK_FILE="/tmp/kindle-refresh.lock"
+LOCK_FILE="${LOCK_FILE:-/tmp/kindle-refresh.lock}"
 ETAG_FILE="$DASHBOARD_DIR/image.etag"
 LAST_MODIFIED_FILE="$DASHBOARD_DIR/image.last_modified"
 SERVER_SHA_FILE="$DASHBOARD_DIR/image.server.sha256"
@@ -93,18 +93,22 @@ find_curl_bin() {
 
 wait_for_network() {
 	COUNT=0
-	while [ "$COUNT" -lt 20 ]; do
-		if command -v ifconfig >/dev/null 2>&1; then
-			IP=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' | head -n 1)
-			if [ -z "$IP" ]; then
-				IP=$(ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' | grep -v '^127\.' | head -n 1)
+	MAX_WAIT="${NETWORK_WAIT_TIMEOUT:-20}"
+	while [ "$COUNT" -lt "$MAX_WAIT" ]; do
+		WIFI_STATE=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null || echo "")
+		if [ -z "$WIFI_STATE" ] || [ "$WIFI_STATE" = "CONNECTED" ]; then
+			if command -v ifconfig >/dev/null 2>&1; then
+				IP=$(ifconfig wlan0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' | head -n 1)
+				if [ -z "$IP" ]; then
+					IP=$(ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' | grep -v '^127\.' | head -n 1)
+				fi
+				if [ -n "$IP" ]; then
+					return 0
+				fi
 			fi
-			if [ -n "$IP" ]; then
+			if command -v ip >/dev/null 2>&1 && ip route get 1.1.1.1 >/dev/null 2>&1; then
 				return 0
 			fi
-		fi
-		if command -v ip >/dev/null 2>&1 && ip route get 1.1.1.1 >/dev/null 2>&1; then
-			return 0
 		fi
 		COUNT=$((COUNT + 1))
 		/bin/sleep 1

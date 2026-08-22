@@ -93,6 +93,7 @@ class KindleScriptsTests(unittest.TestCase):
         self.env["EIPS_BIN"] = str(self.bin_dir / "eips")
         self.env["SLEEP_BIN"] = "sleep"
         self.env["MOCK_CURL_MODE"] = "ok"
+        self.env["LOCK_FILE"] = str(self.sandbox / "kindle-refresh.lock")
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -842,7 +843,7 @@ class KindleScriptsTests(unittest.TestCase):
                 self.assertIn("lipc-set-prop com.lab126.wifid enable 0", calls)
 
     def test_early_exit_duplicate_lock_cleanup_safety(self):
-        lock_file = Path("/tmp/kindle-refresh.lock")
+        lock_file = Path(self.env.get("LOCK_FILE", "/tmp/kindle-refresh.lock"))
         active_pid = str(os.getpid())
         lock_file.write_text(f"{active_pid}\n", encoding="utf-8")
         try:
@@ -859,7 +860,7 @@ class KindleScriptsTests(unittest.TestCase):
             lock_file.unlink(missing_ok=True)
 
     def test_ownership_duplicate_process_non_mutation(self):
-        lock_file = Path("/tmp/kindle-refresh.lock")
+        lock_file = Path(self.env.get("LOCK_FILE", "/tmp/kindle-refresh.lock"))
         parent_pid = str(os.getppid())
         lock_file.write_text(f"{parent_pid}\n", encoding="utf-8")
         try:

@@ -457,7 +457,7 @@ class PW1FailureInjectionTests(unittest.TestCase):
 
     def test_signal_during_persistence_install_rolls_back(self):
         self.script('mntroot',
-                    'if [ "$1" = rw ]; then touch "$DASHBOARD_DIR/install-paused"; /bin/sleep .5; fi')
+                    'if [ "$1" = rw ]; then touch "$DASHBOARD_DIR/install-paused"; /bin/sleep .5; fi', self.bin)
         proc = self.launch('install-mxc-rtc.sh')
         self.wait_for(lambda: (self.d / 'install-paused').exists())
         proc.terminate()

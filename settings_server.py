@@ -1074,6 +1074,7 @@ EOF"""
 
     if scheduler_backend == "mxc_rtc":
         scheduler_contents = [
+            bundled_script_heredoc("mxc-rtc-common.sh"),
             bundled_script_heredoc("mxc-rtc-scheduler.sh"),
             bundled_script_heredoc("stop_legacy.sh"),
             bundled_script_heredoc("start.sh"),

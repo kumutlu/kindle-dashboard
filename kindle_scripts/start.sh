@@ -14,37 +14,43 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [MXC-START] $1" >> "$DASHBOARD_DIR/mxc-rtc.log"
 }
 
-get_start_time() {
-    _PID="$1"
-    _SF="$PROC_DIR/$_PID/stat"
-    [ -f "$_SF" ] || return 1
-    _SL=$(cat "$_SF" 2>/dev/null) || return 1
-    _REM="${_SL##*) }"
-    [ -n "$_REM" ] || return 1
-    set -- $_REM
-    _ST="${20}"
-    case "$_ST" in
-        ""|*[!0-9]*) return 1 ;;
-        *) printf '%s\n' "$_ST" ;;
-    esac
+TX_STARTED=0
+LEGACY_TOUCHED=1
+CONTROL_LOCK_HELD=0
+. "$DASHBOARD_DIR/mxc-rtc-common.sh"
+
+finish() {
+    _EXIT_RC=$?
+    trap - EXIT HUP INT TERM
+    if [ "$_EXIT_RC" -ne 0 ] && [ "$TX_STARTED" = 1 ]; then
+        rollback_to_legacy || log_msg "ERROR: ROLLBACK FAILED; manual recovery required"
+    fi
+    if [ "$CONTROL_LOCK_HELD" = 1 ]; then
+        rmdir "$MXC_CONTROL_LOCK" || true
+    fi
+    exit "$_EXIT_RC"
 }
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
 
 verify_identity() {
-    _PID="$1"
-    _START="$2"
-    [ -d "$PROC_DIR/$_PID" ] || return 1
-    _NOW=$(get_start_time "$_PID" 2>/dev/null || true)
-    [ -n "$_NOW" ] && [ "$_NOW" = "$_START" ] || return 1
-    grep -F 'mxc-rtc-scheduler.sh' "$PROC_DIR/$_PID/cmdline" >/dev/null 2>&1
+    [ -d "$PROC_DIR/$1" ] || return 1
+    [ "$(get_start_time "$1" 2>/dev/null || true)" = "$2" ] || return 1
+    tr '\000' '\n' < "$PROC_DIR/$1/cmdline" | grep -Fx "$DASHBOARD_DIR/mxc-rtc-scheduler.sh" >/dev/null 2>&1
 }
 
-rollback_to_legacy() {
-    if [ -x "$DASHBOARD_DIR/stop.sh" ]; then
-        "$DASHBOARD_DIR/stop.sh" >/dev/null 2>&1 || true
-    fi
-    if [ -x "$DASHBOARD_DIR/start-dashboard.sh" ]; then
-        "$DASHBOARD_DIR/start-dashboard.sh" >/dev/null 2>&1 || true
-    fi
+supervise() {
+    # Monitor even an already committed process: wait(1) only handles our children.
+    rmdir "$MXC_CONTROL_LOCK"
+    CONTROL_LOCK_HELD=0
+    TX_STARTED=0
+    while verify_identity "$1" "$2"; do
+        "$SLEEP_BIN" 1
+    done
+    log_msg "ERROR: native scheduler exited; attempting recovery"
+    acquire_control_lock || exit 1
+    TX_STARTED=1
+    exit 1
 }
 
 if [ -f "$DASHBOARD_DIR/NOAUTOSTART" ]; then
@@ -52,19 +58,33 @@ if [ -f "$DASHBOARD_DIR/NOAUTOSTART" ]; then
     exit 0
 fi
 
+acquire_control_lock || exit 1
+[ -x "$DASHBOARD_DIR/stop.sh" ] && [ -x "$DASHBOARD_DIR/stop_legacy.sh" ] && [ -x "$DASHBOARD_DIR/start-dashboard.sh" ] || {
+    log_msg "ERROR: recovery scripts missing; refusing native startup"
+    exit 1
+}
+TX_STARTED=1
+persistence_ready || {
+    log_msg "ERROR: missing or invalid persistence receipt"
+    exit 1
+}
+
 if [ -f "$PID_FILE" ]; then
     _OLD_PID=$(cat "$PID_FILE" 2>/dev/null || true)
     _OLD_ST=$(get_start_time "$_OLD_PID" 2>/dev/null || true)
     _OLD_ACK=$(cat "$COMMITTED_FILE" 2>/dev/null || true)
     if [ -n "$_OLD_PID" ] && [ -n "$_OLD_ST" ] && verify_identity "$_OLD_PID" "$_OLD_ST" && [ "$_OLD_ACK" = "$_OLD_PID $_OLD_ST" ]; then
         log_msg "native scheduler already committed"
+        TX_STARTED=0
+        if [ "${1:-}" = --supervise ]; then supervise "$_OLD_PID" "$_OLD_ST"; fi
         exit 0
     fi
 fi
 
 rm -f "$ACTIVATE_FILE" "$ACTIVE_FILE" "$COMMIT_FILE" "$COMMITTED_FILE"
 if [ -x "$DASHBOARD_DIR/stop.sh" ]; then
-    "$DASHBOARD_DIR/stop.sh" >/dev/null 2>&1 || true
+    "$DASHBOARD_DIR/stop.sh" || exit 1
+    native_processes_present && exit 1
 fi
 
 [ -x "$DASHBOARD_DIR/mxc-rtc-scheduler.sh" ] || {
@@ -93,16 +113,12 @@ done
 
 if [ -z "$PID" ]; then
     log_msg "native standby identity verification failed"
-    rollback_to_legacy
     exit 1
 fi
 
-if [ -x "$DASHBOARD_DIR/stop_legacy.sh" ]; then
-    if ! "$DASHBOARD_DIR/stop_legacy.sh"; then
-        log_msg "legacy shutdown failed"
-        rollback_to_legacy
-        exit 1
-    fi
+if ! "$DASHBOARD_DIR/stop_legacy.sh" || legacy_processes_present; then
+    log_msg "legacy shutdown failed"
+    exit 1
 fi
 
 TOKEN="$PID $STARTTIME"
@@ -120,7 +136,6 @@ done
 
 if [ "$ACK" != "$TOKEN" ] || ! verify_identity "$PID" "$STARTTIME"; then
     log_msg "activation ACK failed; rolling back"
-    rollback_to_legacy
     exit 1
 fi
 
@@ -138,9 +153,10 @@ done
 
 if [ "$COMMITTED" != "$TOKEN" ] || ! verify_identity "$PID" "$STARTTIME"; then
     log_msg "commit ACK failed; rolling back"
-    rollback_to_legacy
     exit 1
 fi
 
+TX_STARTED=0
 log_msg "native scheduler committed: $TOKEN"
+if [ "${1:-}" = --supervise ]; then supervise "$PID" "$STARTTIME"; fi
 exit 0

@@ -25,6 +25,9 @@ finish() {
     if [ "$_EXIT_RC" -ne 0 ] && [ "$TX_STARTED" = 1 ]; then
         rollback_to_legacy || log_msg "ERROR: ROLLBACK FAILED; manual recovery required"
     fi
+    if [ -n "${MONITOR_TOKEN:-}" ] && [ "$(cat "$DASHBOARD_DIR/mxc-rtc.supervised" 2>/dev/null || true)" = "$MONITOR_TOKEN" ]; then
+        rm -f "$DASHBOARD_DIR/mxc-rtc.supervised"
+    fi
     if [ "$CONTROL_LOCK_HELD" = 1 ]; then
         rmdir "$MXC_CONTROL_LOCK" || true
     fi
@@ -41,14 +44,28 @@ verify_identity() {
 
 supervise() {
     # Monitor even an already committed process: wait(1) only handles our children.
+    MONITOR_TOKEN="$1 $2 $$ $(get_start_time "$$")"
+    printf '%s\n' "$MONITOR_TOKEN" > "$DASHBOARD_DIR/mxc-rtc.supervised.$$.tmp"
+    mv -f "$DASHBOARD_DIR/mxc-rtc.supervised.$$.tmp" "$DASHBOARD_DIR/mxc-rtc.supervised"
     rmdir "$MXC_CONTROL_LOCK"
     CONTROL_LOCK_HELD=0
     TX_STARTED=0
     while verify_identity "$1" "$2"; do
         "$SLEEP_BIN" 1
     done
+    if [ "$(cat "$DASHBOARD_DIR/mxc-rtc.stop-requested" 2>/dev/null || true)" = "$1 $2" ] || [ -f "$DASHBOARD_DIR/NOAUTOSTART" ]; then
+        log_msg "native scheduler deliberately stopped"
+        exit 0
+    fi
     log_msg "ERROR: native scheduler exited; attempting recovery"
     acquire_control_lock || exit 1
+    # Another monitor may already have disabled native and recovered legacy.
+    persistence_ready || exit 0
+    # A reinstall may have replaced the monitored identity in the meantime.
+    if native_processes_present; then
+        log_msg "replacement native owner present; recovery skipped"
+        exit 0
+    fi
     TX_STARTED=1
     exit 1
 }
@@ -83,7 +100,7 @@ fi
 
 rm -f "$ACTIVATE_FILE" "$ACTIVE_FILE" "$COMMIT_FILE" "$COMMITTED_FILE"
 if [ -x "$DASHBOARD_DIR/stop.sh" ]; then
-    "$DASHBOARD_DIR/stop.sh" || exit 1
+    MXC_INTERNAL_STOP=1 "$DASHBOARD_DIR/stop.sh" || exit 1
     native_processes_present && exit 1
 fi
 
@@ -92,6 +109,7 @@ fi
     exit 1
 }
 
+rm -f "$DASHBOARD_DIR/mxc-rtc.stop-requested"
 "$DASHBOARD_DIR/mxc-rtc-scheduler.sh" >> "$DASHBOARD_DIR/mxc-rtc.log" 2>&1 &
 
 PID=""

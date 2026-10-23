@@ -43,6 +43,7 @@ class PW1SettingsIntegrationTests(unittest.TestCase):
         self.assertIn('SCHEDULER_BACKEND="mxc_rtc"', script)
         self.assertIn('NATIVE_RTC_SCHEDULER="1"', script)
         for name in (
+            "mxc-rtc-common.sh",
             "mxc-rtc-scheduler.sh",
             "stop_legacy.sh",
             "start.sh",

@@ -37,8 +37,10 @@ if [ -z "$PID" ] || [ ! -d "$PROC_DIR/$PID" ]; then
 fi
 
 if ! tr '\000' '\n' < "$PROC_DIR/$PID/cmdline" | grep -Fx "$DASHBOARD_DIR/mxc-rtc-scheduler.sh" >/dev/null 2>&1; then
-    echo "ERROR: refusing to kill PID $PID; cmdline does not match mxc-rtc-scheduler.sh" >&2
-    exit 1
+    # Stale PID may name an unrelated process or an unreaped zombie. Leave it
+    # untouched; cleanup is safe only after scanning for every native owner.
+    clear_state_files || exit 1
+    exit 0
 fi
 
 START=$(get_start_time "$PID" 2>/dev/null || true)
@@ -47,6 +49,9 @@ if [ -z "$START" ]; then
     exit 1
 fi
 
+if [ "${MXC_INTERNAL_STOP:-0}" != 1 ]; then
+    printf '%s\n' "$PID $START" > "$DASHBOARD_DIR/mxc-rtc.stop-requested" || exit 1
+fi
 kill "$PID" 2>/dev/null || true
 "$SLEEP_BIN" 1
 

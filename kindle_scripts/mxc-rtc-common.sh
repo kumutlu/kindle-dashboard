@@ -6,6 +6,7 @@ MXC_CONTROL_LOCK="${MXC_CONTROL_LOCK:-/var/run/kindle-dashboard-mxc-control.lock
 MXC_SCHEDULER_LOCK="${MXC_SCHEDULER_LOCK:-/var/run/kindle-dashboard-mxc-scheduler.lock}"
 
 get_start_time() {
+    case "$1" in ""|*[!0-9]*) return 1 ;; esac
     _SF="$PROC_DIR/$1/stat"
     [ -f "$_SF" ] || return 1
     _SL=$(cat "$_SF" 2>/dev/null) || return 1
@@ -52,11 +53,11 @@ acquire_control_lock() {
 }
 
 rollback_to_legacy() {
-    rm -f "$DASHBOARD_DIR/ENABLE_MXC_RTC_AUTOSTART" || return 1
-    # Shutdown is mandatory even if flushing the disabled marker fails.
     _ROLLBACK_RC=0
+    # Always stop native, including when disabling persistence cannot be saved.
+    rm -f "$DASHBOARD_DIR/ENABLE_MXC_RTC_AUTOSTART" || _ROLLBACK_RC=1
     sync || _ROLLBACK_RC=1
-    if ! "$DASHBOARD_DIR/stop.sh"; then
+    if ! MXC_INTERNAL_STOP=1 "$DASHBOARD_DIR/stop.sh"; then
         log_msg "ERROR: native shutdown failed; refusing to start legacy"
         return 1
     fi
@@ -65,7 +66,7 @@ rollback_to_legacy() {
         return 1
     fi
     [ "${LEGACY_TOUCHED:-1}" = 1 ] || return "$_ROLLBACK_RC"
-    if ! "$DASHBOARD_DIR/stop_legacy.sh"; then
+    if ! "$DASHBOARD_DIR/stop_legacy.sh" || legacy_processes_present; then
         log_msg "ERROR: partial legacy shutdown failed during rollback"
         return 1
     fi

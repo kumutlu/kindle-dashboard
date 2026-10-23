@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pillow requests
       - name: Shell syntax
-        run: sh -n kindle_scripts/*.sh
+        run: for script in kindle_scripts/*.sh; do sh -n "$script" || exit 1; done
       - name: PW1 scheduler tests
         run: python -m unittest -v test_pw1_mxc_rtc.py
       - name: Scheduler generation tests
@@ -40,5 +40,7 @@ jobs:
         run: python -m unittest -v test_kindle_scripts.py
       - name: Settings server tests
         run: python -m unittest -v test_settings_server.py
+      - name: Full regression suite
+        run: python -m unittest discover -v
       - name: Diff whitespace
         run: git diff --check origin/main...HEAD

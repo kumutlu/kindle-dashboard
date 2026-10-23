@@ -36,7 +36,11 @@ finish() {
     trap - EXIT HUP INT TERM
     if [ "$_EXIT_RC" -ne 0 ] && [ "$TX_STARTED" = 1 ]; then
         log_msg "Rollback: incomplete native handoff"
-        rollback_to_legacy || log_msg "ERROR: ROLLBACK FAILED; manual recovery required"
+        if [ "$CONTROL_LOCK_HELD" = 1 ] || acquire_control_lock; then
+            rollback_to_legacy || log_msg "ERROR: ROLLBACK FAILED; manual recovery required"
+        else
+            log_msg "ERROR: ROLLBACK FAILED; handoff lock busy; manual recovery required"
+        fi
     fi
     restore_rootfs
     if [ "$CONTROL_LOCK_HELD" = 1 ]; then
@@ -54,7 +58,7 @@ verify_identity() {
 }
 
 stop_native_scheduler() {
-    "$DASHBOARD_DIR/stop.sh" || return 1
+    MXC_INTERNAL_STOP=1 "$DASHBOARD_DIR/stop.sh" || return 1
     ! native_processes_present
 }
 
@@ -104,7 +108,10 @@ install_native() {
     [ -x "$DASHBOARD_DIR/stop.sh" ] || fail "missing executable stop.sh"
 
     [ -x "$DASHBOARD_DIR/start-dashboard.sh" ] || fail "missing proven legacy startup path"
+    command -v nohup >/dev/null 2>&1 || fail "nohup is required for recovery monitoring"
     acquire_control_lock || exit 1
+    # Reinstall also displaces a cadence owner before legacy shutdown.
+    if native_processes_present; then LEGACY_TOUCHED=1; fi
     stop_native_scheduler || fail "previous native scheduler could not be stopped"
     TX_STARTED=1
     rm -f "$DASHBOARD_DIR/ENABLE_MXC_RTC_AUTOSTART"
@@ -115,6 +122,7 @@ install_native() {
         "$DASHBOARD_DIR/mxc-rtc.commit" \
         "$DASHBOARD_DIR/mxc-rtc.committed"
 
+    rm -f "$DASHBOARD_DIR/mxc-rtc.stop-requested"
     log_msg "Starting mxc-rtc-scheduler.sh in standby mode"
     "$DASHBOARD_DIR/mxc-rtc-scheduler.sh" >> "$DASHBOARD_DIR/mxc-rtc.log" 2>&1 &
 
@@ -204,6 +212,25 @@ install_native() {
         exit 1
     fi
 
+    # Keep a process monitor in the initial install session too. start.sh binds
+    # its readiness receipt to this native token and its own PID/starttime.
+    rmdir "$MXC_CONTROL_LOCK"
+    CONTROL_LOCK_HELD=0
+    nohup "$DASHBOARD_DIR/start.sh" --supervise >> "$DASHBOARD_DIR/mxc-rtc.log" 2>&1 &
+    MONITOR_PID=$!
+    COUNT=0
+    MONITOR_READY=0
+    while [ "$COUNT" -lt 5 ]; do
+        "$SLEEP_BIN" 1
+        MONITOR_ACK=$(cat "$DASHBOARD_DIR/mxc-rtc.supervised" 2>/dev/null || true)
+        set -- $MONITOR_ACK
+        if [ "$#" = 4 ] && [ "$1 $2" = "$TOKEN" ] && [ "$3" = "$MONITOR_PID" ] && [ "$(get_start_time "$3" 2>/dev/null || true)" = "$4" ] && verify_identity "$MXC_PID" "$MXC_START"; then
+            MONITOR_READY=1
+            break
+        fi
+        COUNT=$((COUNT + 1))
+    done
+    [ "$MONITOR_READY" = 1 ] || fail "native recovery monitor did not acknowledge readiness"
     TX_STARTED=0
     log_msg "Activation successful"
 }

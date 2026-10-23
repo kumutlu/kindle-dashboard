@@ -243,8 +243,8 @@ class PW1FailureInjectionTests(unittest.TestCase):
             if proc.stdout:
                 proc.stdout.close()
 
-    def launch(self, name):
-        proc = subprocess.Popen(['sh', str(self.d / name)], env=self.env,
+    def launch(self, name, *args):
+        proc = subprocess.Popen(['sh', str(self.d / name), *args], env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, start_new_session=True)
         self.processes.append(proc)
@@ -360,6 +360,144 @@ class PW1FailureInjectionTests(unittest.TestCase):
         self.assertNotEqual(second.returncode, 0)
         self.assertEqual((self.d / 'mxc-rtc-scheduler.pid').read_text().strip(), token.split()[0])
         self.assertIsNone(first.poll())
+
+
+    def test_successful_install_publishes_persistence_before_commit(self):
+        proc = self.launch('install-mxc-rtc.sh')
+        output = proc.communicate(timeout=8)[0]
+        self.assertEqual(proc.returncode, 0, output)
+        self.assertEqual((self.d / 'ENABLE_MXC_RTC_AUTOSTART').read_text(), 'mxc-rtc-v1\n')
+        self.assertTrue((self.upstart / 'kindle-dashboard-native.conf').exists())
+        self.assertIn('Activation successful', output)
+        self.assertNotIn('legacy-start', self.events())
+        self.assertTrue((self.d / 'mxc-rtc.committed').exists())
+
+    def test_sync_failure_never_acknowledges_or_suspends(self):
+        self.persist()
+        proc, token = self.activate()
+        (self.d / 'fail-sync').touch()
+        (self.d / 'mxc-rtc.commit').write_text(token + '\n')
+        proc.wait(timeout=4)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.d / 'mxc-rtc.committed').exists())
+        self.assertEqual(self.rtc.read_text(), '0')
+        self.assertEqual(self.power.read_text(), 'mem\n')
+
+    def test_rtc_readback_mismatch_never_acknowledges_or_suspends(self):
+        self.persist()
+        proc, token = self.activate()
+        self.script('cat', 'if [ "$1" = "$RTC_WAKEUP" ]; then echo stale; else exec /bin/cat "$@"; fi', self.bin)
+        (self.d / 'mxc-rtc.commit').write_text(token + '\n')
+        proc.wait(timeout=4)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.d / 'mxc-rtc.committed').exists())
+        self.assertEqual(self.power.read_text(), 'mem\n')
+
+    def test_stale_commit_token_does_not_start_cadence(self):
+        self.persist()
+        proc, token = self.activate()
+        (self.d / 'mxc-rtc.commit').write_text('999999 0\n')
+        self.wait_for(lambda: not (self.d / 'mxc-rtc.commit').exists())
+        self.assertFalse((self.d / 'mxc-rtc.committed').exists())
+        self.assertNotIn('refresh', self.events())
+        (self.d / 'mxc-rtc.commit').write_text(token + '\n')
+        self.wait_for(lambda: 'refresh' in self.events())
+
+    def test_stop_recovers_missing_pid_and_stale_lock(self):
+        (self.d / 'scheduler.lock').mkdir()
+        (self.d / 'mxc-rtc.committed').write_text('999999 0\n')
+        proc = self.launch('stop.sh')
+        output = proc.communicate(timeout=4)[0]
+        self.assertEqual(proc.returncode, 0, output)
+        self.assertFalse((self.d / 'scheduler.lock').exists())
+        self.assertFalse((self.d / 'mxc-rtc.committed').exists())
+
+    def test_partial_legacy_shutdown_restarts_legacy_once(self):
+        self.script('stop_legacy.sh',
+                    'if [ ! -f "$DASHBOARD_DIR/partial-stop" ]; then\n'
+                    ' touch "$DASHBOARD_DIR/partial-stop"; exit 1\nfi\nexit 0')
+        proc = self.launch('install-mxc-rtc.sh')
+        output = proc.communicate(timeout=8)[0]
+        self.assertNotEqual(proc.returncode, 0, output)
+        self.assertEqual(self.events().count('legacy-start'), 1, output)
+        self.assertFalse((self.d / 'mxc-rtc-scheduler.pid').exists())
+
+    def test_failed_legacy_restart_is_reported(self):
+        self.persist()
+        self.script('mxc-rtc-scheduler.sh', 'exit 1')
+        self.script('start-dashboard.sh', 'exit 1')
+        proc = self.launch('start.sh')
+        proc.communicate(timeout=6)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('ROLLBACK FAILED', (self.d / 'mxc-rtc.log').read_text())
+
+    def test_reinstall_standby_failure_recovers_displaced_native_owner(self):
+        self.persist()
+        first, token = self.activate()
+        (self.d / 'mxc-rtc.commit').write_text(token + '\n')
+        self.wait_for(lambda: (self.d / 'mxc-rtc.committed').exists())
+        self.script('mxc-rtc-scheduler.sh', 'exit 1')
+        proc = self.launch('install-mxc-rtc.sh')
+        output = proc.communicate(timeout=8)[0]
+        self.assertNotEqual(proc.returncode, 0, output)
+        self.assertIn('legacy-start', self.events(), output)
+        self.assertFalse((self.d / 'mxc-rtc-scheduler.pid').exists())
+
+    def test_receipt_unlink_failure_still_attempts_native_shutdown(self):
+        # An actual directory makes rm -f fail even when tests run as root.
+        (self.d / 'ENABLE_MXC_RTC_AUTOSTART').mkdir()
+        self.script('stop.sh', 'echo native-stop >> "$DASHBOARD_DIR/events"')
+        common = self.d / 'mxc-rtc-common.sh'
+        self.script('exercise-rollback.sh',
+                    f'. "{common}"\nlog_msg() {{ echo "$1"; }}\nrollback_to_legacy')
+        proc = self.launch('exercise-rollback.sh')
+        proc.communicate(timeout=4)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('native-stop', self.events())
+
+    def test_signal_during_persistence_install_rolls_back(self):
+        self.script('mntroot',
+                    'if [ "$1" = rw ]; then touch "$DASHBOARD_DIR/install-paused"; /bin/sleep .5; fi')
+        proc = self.launch('install-mxc-rtc.sh')
+        self.wait_for(lambda: (self.d / 'install-paused').exists())
+        proc.terminate()
+        output = proc.communicate(timeout=8)[0]
+        self.assertNotEqual(proc.returncode, 0, output)
+        self.assertIn('legacy-start', self.events(), output)
+        self.assertFalse((self.d / 'mxc-rtc-scheduler.pid').exists())
+        self.assertFalse((self.d / 'ENABLE_MXC_RTC_AUTOSTART').exists())
+
+    def test_supervisor_recovers_scheduler_death_after_commit(self):
+        self.persist()
+        proc = self.launch('start.sh', '--supervise')
+        self.wait_for(lambda: (self.d / 'mxc-rtc.committed').exists())
+        pid = int((self.d / 'mxc-rtc-scheduler.pid').read_text())
+        os.kill(pid, signal.SIGKILL)
+        output = proc.communicate(timeout=8)[0]
+        self.assertNotEqual(proc.returncode, 0, output)
+        self.assertIn('legacy-start', self.events())
+        self.assertFalse((self.d / 'ENABLE_MXC_RTC_AUTOSTART').exists())
+
+    def test_installer_keeps_recovery_monitor_after_success(self):
+        proc = self.launch('install-mxc-rtc.sh')
+        output = proc.communicate(timeout=8)[0]
+        self.assertEqual(proc.returncode, 0, output)
+        pid = int((self.d / 'mxc-rtc-scheduler.pid').read_text())
+        os.kill(pid, signal.SIGKILL)
+        self.wait_for(lambda: 'legacy-start' in self.events())
+        self.assertFalse((self.d / 'ENABLE_MXC_RTC_AUTOSTART').exists())
+
+
+    def test_supervisor_respects_deliberate_stop(self):
+        self.persist()
+        proc = self.launch('start.sh', '--supervise')
+        self.wait_for(lambda: (self.d / 'mxc-rtc.committed').exists())
+        stop = self.launch('stop.sh')
+        output = stop.communicate(timeout=6)[0]
+        self.assertEqual(stop.returncode, 0, output)
+        proc.communicate(timeout=6)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn('legacy-start', self.events())
 
 
 if __name__ == "__main__":
